@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+.next/
+coverage/
+*.tsbuildinfo
+
+# Environment files (keep the example)
+.env
+.env.local
+.env.*
+!.env.example
+
+# Signing material and keys
+*.keystore
+*.jks
+*.p12
+*.pem
+
+# Android local/generated
+local.properties
+android/.gradle/
+android/build/
+android/app/build/
+*.hprof
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Editor
+.idea/
+.vscode/*
+!.vscode/extensions.json

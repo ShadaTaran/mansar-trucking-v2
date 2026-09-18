@@ -1,0 +1,28 @@
+{
+  "name": "@mansar/api-client",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Framework-independent TypeScript client for the Mansar v2 API. Intentionally minimal until the API exists.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "test": "tsc -b && vitest run",
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@mansar/types": "*"
+  },
+  "devDependencies": {
+    "@mansar/config": "*"
+  }
+}

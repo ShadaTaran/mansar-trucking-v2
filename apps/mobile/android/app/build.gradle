@@ -1,0 +1,83 @@
+apply plugin: "com.android.application"
+apply plugin: "org.jetbrains.kotlin.android"
+apply plugin: "com.facebook.react"
+
+// Resolve npm packages through Node so the root-hoisted workspace install is
+// found (the template's ../../node_modules defaults assume a standalone app).
+def nodePackageDir = { String pkg ->
+    new File(["node", "--print", "require.resolve('${pkg}/package.json')"]
+        .execute(null, rootDir).text.trim()).parentFile
+}
+
+/**
+ * This is the configuration block to customize your React Native Android app.
+ * Only the workspace-related folders are set; everything else keeps the
+ * React Native Gradle plugin defaults.
+ */
+react {
+    /* Folders */
+    //   The root of your project, i.e. where "package.json" lives.
+    root = file("../../")
+    //   The folder where the react-native NPM package is (root-hoisted).
+    reactNativeDir = nodePackageDir("react-native")
+    //   The folder where the react-native Codegen package is (root-hoisted).
+    codegenDir = nodePackageDir("@react-native/codegen")
+    //   The cli.js file which is the React Native CLI entrypoint.
+    cliFile = new File(nodePackageDir("react-native"), "cli.js")
+
+    /* Autolinking */
+    autolinkLibrariesWithApp()
+}
+
+/**
+ * Set this to true to Run Proguard on Release builds to minify the Java bytecode.
+ */
+def enableProguardInReleaseBuilds = false
+
+/**
+ * The preferred build flavor of JavaScriptCore (JSC)
+ *
+ * For example, to use the international variant, you can use:
+ * `def jscFlavor = io.github.react-native-community:jsc-android-intl:2026004.+`
+ *
+ * The international variant includes ICU i18n library and necessary data
+ * allowing to use e.g. `Date.toLocaleString` and `String.localeCompare` that
+ * give correct results when using with locales other than en-US. Note that
+ * this variant is about 6MiB larger per architecture than default.
+ */
+def jscFlavor = 'io.github.react-native-community:jsc-android:2026004.+'
+
+android {
+    ndkVersion rootProject.ext.ndkVersion
+    buildToolsVersion rootProject.ext.buildToolsVersion
+    compileSdk rootProject.ext.compileSdkVersion
+
+    namespace "com.mansar.driver"
+    defaultConfig {
+        applicationId "com.mansar.driver"
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode 1
+        versionName "1.0"
+    }
+    // Debug builds use the Android Gradle Plugin's standard debug signing
+    // (~/.android/debug.keystore, generated automatically). No keystore is
+    // stored in the repository. Release signing is configured in a later stage.
+    buildTypes {
+        release {
+            minifyEnabled enableProguardInReleaseBuilds
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+        }
+    }
+}
+
+dependencies {
+    // The version of react-native is set by the React Native Gradle Plugin
+    implementation("com.facebook.react:react-android")
+
+    if (hermesEnabled.toBoolean()) {
+        implementation("com.facebook.react:hermes-android")
+    } else {
+        implementation jscFlavor
+    }
+}

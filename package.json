@@ -11,6 +11,9 @@
     "apps/*",
     "packages/*"
   ],
+  "overrides": {
+    "react": "19.2.3"
+  },
   "scripts": {
     "typecheck": "tsc -b && npm run typecheck --workspaces --if-present",
     "lint": "eslint .",
@@ -24,6 +27,8 @@
     "eslint": "~9.39.5",
     "eslint-config-next": "16.3.5",
     "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^7.1.1",
     "prettier": "^3.9.8",
     "typescript": "~6.0.3",
     "typescript-eslint": "^8.70.0",

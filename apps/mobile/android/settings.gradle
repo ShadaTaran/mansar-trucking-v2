@@ -1,0 +1,15 @@
+// This app lives in an npm workspace, so React Native's packages are hoisted
+// to the monorepo root rather than installed under apps/mobile/node_modules.
+// Resolve the Gradle plugin through Node instead of assuming a relative path.
+pluginManagement {
+  gradle.ext.reactNativeGradlePluginDir = new File(
+    ["node", "--print", "require.resolve('@react-native/gradle-plugin/package.json')"]
+      .execute(null, rootDir).text.trim()
+  ).parentFile
+  includeBuild(gradle.ext.reactNativeGradlePluginDir.toString())
+}
+plugins { id("com.facebook.react.settings") }
+extensions.configure(com.facebook.react.ReactSettingsExtension){ ex -> ex.autolinkLibrariesFromCommand() }
+rootProject.name = 'MansarDriver'
+include ':app'
+includeBuild(gradle.ext.reactNativeGradlePluginDir.toString())

@@ -1,0 +1,23 @@
+/* Minimal scaffold presentation. No design system yet. */
+
+:root {
+  color-scheme: light dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  line-height: 1.5;
+}
+
+main {
+  padding: 2rem;
+}

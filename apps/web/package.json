@@ -1,0 +1,38 @@
+{
+  "name": "@mansar/web",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Mansar Trucking Management System v2 admin web application (Next.js).",
+  "scripts": {
+    "build:deps": "tsc -b ../../packages/types",
+    "predev": "npm run build:deps",
+    "dev": "next dev",
+    "prebuild": "npm run build:deps",
+    "build": "next build",
+    "start": "next start",
+    "pretypecheck": "npm run build:deps",
+    "typecheck": "next typegen && tsc --noEmit -p tsconfig.json",
+    "lint": "eslint .",
+    "pretest": "npm run build:deps",
+    "test": "vitest run",
+    "pretest:watch": "npm run build:deps",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@mansar/types": "*",
+    "next": "16.3.5",
+    "react": "19.2.3",
+    "react-dom": "19.2.3"
+  },
+  "devDependencies": {
+    "@mansar/config": "*",
+    "@testing-library/dom": "^10.4.0",
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/react": "^16.3.0",
+    "@types/node": "^24.0.0",
+    "@types/react": "~19.2.0",
+    "@types/react-dom": "~19.2.0",
+    "jsdom": "^30.0.0",
+    "typescript": "~6.0.3"
+  }
+}

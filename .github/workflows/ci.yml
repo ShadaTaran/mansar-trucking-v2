@@ -2,21 +2,73 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+# Cancel superseded runs for the same branch/PR so only the latest commit is validated.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   quality:
-    runs-on: ubuntu-latest
+    # JS/TS validation only. The Android native build (Gradle/SDK/emulator) is
+    # deliberately not part of normal CI; it is proven separately.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CI: 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
           cache: npm
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm run lint
-      - run: npm run test
-      - run: npm run build
-      - run: npm run format:check
+          cache-dependency-path: package-lock.json
+
+      # The npm bundled with the Node distribution is not guaranteed to match
+      # the exact version this repository declares in package.json (packageManager).
+      - name: Set up npm
+        run: npm install --global npm@11.19.0
+
+      - name: Verify toolchain
+        run: |
+          node --version
+          npm --version
+          case "$(node --version)" in
+            v24.*) ;;
+            *) echo "Expected Node 24.x" >&2; exit 1 ;;
+          esac
+          if [ "$(npm --version)" != "11.19.0" ]; then
+            echo "Expected npm 11.19.0" >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm run test
+
+      - name: Build
+        run: npm run build
+
+      - name: Check formatting
+        run: npm run format:check

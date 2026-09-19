@@ -1,5 +1,5 @@
 // Prisma ORM 7 schema. The connection URL lives in prisma7.config.ts, never here.
-// Domain models arrive with their feature stages; Stage 2B is infrastructure only.
+// Domain models arrive with their feature stages.
 
 generator client {
   provider     = "prisma-client"
@@ -10,4 +10,51 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+}
+
+/// Authorization role of a login identity.
+enum UserRole {
+  ADMIN
+  DRIVER
+
+  @@map("user_role")
+}
+
+/// Authentication identity. Operational driver data lives in a later `drivers`
+/// table; no profile or business fields belong here.
+model User {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  /// Canonical (normalized) login email; normalization is application logic.
+  email        String   @unique @db.Text
+  /// Encoded password hash (salt and parameters embedded). Never plaintext.
+  passwordHash String   @map("password_hash") @db.Text
+  role         UserRole
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  auditLogs AuditLog[] @relation("AuditLogActor")
+
+  @@map("users")
+}
+
+/// Append-only record of significant actions. Survives actor deletion.
+model AuditLog {
+  id          String    @id @default(uuid(7)) @db.Uuid
+  actorUserId String?   @map("actor_user_id") @db.Uuid
+  /// Role snapshot at the time of the action; kept even if the actor is removed.
+  actorRole   UserRole? @map("actor_role")
+  action      String    @db.Text
+  entityType  String    @map("entity_type") @db.Text
+  entityId    String?   @map("entity_id") @db.Text
+  requestId   String?   @map("request_id") @db.Text
+  metadata    Json?     @db.JsonB
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  actorUser User? @relation("AuditLogActor", fields: [actorUserId], references: [id], onDelete: SetNull, onUpdate: NoAction)
+
+  @@index([actorUserId, createdAt(sort: Desc)], map: "audit_logs_actor_user_id_created_at_idx")
+  @@index([entityType, entityId, createdAt(sort: Desc)], map: "audit_logs_entity_type_entity_id_created_at_idx")
+  @@index([createdAt(sort: Desc)], map: "audit_logs_created_at_idx")
+  @@map("audit_logs")
 }

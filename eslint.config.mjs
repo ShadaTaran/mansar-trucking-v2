@@ -32,6 +32,13 @@ export default [
     files: ['apps/mobile/**/*.{js,ts,tsx}'],
     ...reactHooks.configs.flat.recommended,
   },
+  // API maintenance scripts run directly under Node (ESM).
+  {
+    files: ['apps/api/scripts/**/*.mjs'],
+    languageOptions: {
+      globals: { process: 'readonly', console: 'readonly', URL: 'readonly' },
+    },
+  },
   // React Native's tooling config files are CommonJS by convention.
   {
     files: ['apps/mobile/*.js'],

@@ -12,6 +12,8 @@
     "db:migrate:status": "prisma migrate status --config ./prisma7.config.ts",
     "db:reset": "prisma migrate reset --config ./prisma7.config.ts",
     "db:studio": "prisma studio --config ./prisma7.config.ts",
+    "db:test:migrate": "node scripts/test-db-migrate.mjs deploy",
+    "db:test:status": "node scripts/test-db-migrate.mjs status",
     "prebuild": "npm run build:deps",
     "build": "nest build",
     "prestart": "npm run build:deps",
@@ -25,7 +27,9 @@
     "pretest": "npm run build:deps",
     "test": "vitest run",
     "pretest:watch": "npm run build:deps",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "pretest:db": "npm run build:deps",
+    "test:db": "vitest run --config vitest.config.db.ts"
   },
   "dependencies": {
     "@mansar/types": "*",

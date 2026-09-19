@@ -3,6 +3,7 @@ node_modules/
 
 # Build output
 dist/
+apps/api/src/generated/
 .next/
 coverage/
 *.tsbuildinfo

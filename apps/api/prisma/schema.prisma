@@ -1,0 +1,13 @@
+// Prisma ORM 7 schema. The connection URL lives in prisma7.config.ts, never here.
+// Domain models arrive with their feature stages; Stage 2B is infrastructure only.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  runtime      = "nodejs"
+  moduleFormat = "esm"
+}
+
+datasource db {
+  provider = "postgresql"
+}

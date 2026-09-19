@@ -12,6 +12,7 @@ export default [
       '**/.next/',
       '**/next-env.d.ts',
       'apps/mobile/android/',
+      'apps/api/src/generated/',
     ],
   },
   ...base,

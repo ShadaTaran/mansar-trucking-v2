@@ -5,6 +5,7 @@ coverage/
 package-lock.json
 *.tsbuildinfo
 next-env.d.ts
+apps/api/src/generated/
 
 # Android build output (git-ignored via apps/mobile/.gitignore, which Prettier does not read)
 apps/mobile/android/.gradle/

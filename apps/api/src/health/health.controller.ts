@@ -1,11 +1,21 @@
-import { Controller, Get } from '@nestjs/common';
+import { Controller, Get, ServiceUnavailableException } from '@nestjs/common';
 import { MANSAR_PACKAGE_PROBE } from '@mansar/types';
+
+import { PrismaService } from '../database/prisma.service.js';
 
 export const SERVICE_NAME = 'mansar-api';
 
 export interface HealthResponse {
   readonly service: typeof SERVICE_NAME;
   readonly status: 'ok';
+}
+
+export interface ReadinessResponse {
+  readonly service: typeof SERVICE_NAME;
+  readonly status: 'ok' | 'unavailable';
+  readonly checks: {
+    readonly database: 'ok' | 'unavailable';
+  };
 }
 
 /**
@@ -24,8 +34,31 @@ if (MANSAR_PACKAGE_PROBE !== 'mansar-workspace-ok') {
 
 @Controller('health')
 export class HealthController {
+  constructor(private readonly prisma: PrismaService) {}
+
+  /** Process liveness only. Never touches the database. */
   @Get()
   getHealth(): HealthResponse {
     return { service: SERVICE_NAME, status: 'ok' };
+  }
+
+  /**
+   * Database readiness. Responds 503 with a fixed body when the database
+   * check fails; no connection details or driver errors are exposed.
+   */
+  @Get('ready')
+  async getReadiness(): Promise<ReadinessResponse> {
+    try {
+      await this.prisma.checkConnection();
+    } catch {
+      const body: ReadinessResponse = {
+        service: SERVICE_NAME,
+        status: 'unavailable',
+        checks: { database: 'unavailable' },
+      };
+      throw new ServiceUnavailableException(body);
+    }
+
+    return { service: SERVICE_NAME, status: 'ok', checks: { database: 'ok' } };
   }
 }

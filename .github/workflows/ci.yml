@@ -72,3 +72,79 @@ jobs:
 
       - name: Check formatting
         run: npm run format:check
+
+  database:
+    # Real PostgreSQL proof: migrations from zero, live schema diff, and the
+    # database integration tests. Runs in parallel with `quality`, which stays
+    # database-free. The service credential below is disposable and CI-only;
+    # the container is destroyed with the job and is never reachable from
+    # outside it. It is not a secret and must never be reused elsewhere.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18.6
+        env:
+          POSTGRES_USER: mansar_ci
+          POSTGRES_PASSWORD: mansar_ci_password
+          POSTGRES_DB: mansar_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mansar_ci -d mansar_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      CI: 'true'
+      DATABASE_URL: postgresql://mansar_ci:mansar_ci_password@127.0.0.1:5432/mansar_test
+      TEST_DATABASE_URL: postgresql://mansar_ci:mansar_ci_password@127.0.0.1:5432/mansar_test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Set up npm
+        run: npm install --global npm@11.19.0
+
+      - name: Verify toolchain
+        run: |
+          node --version
+          npm --version
+          case "$(node --version)" in
+            v24.*) ;;
+            *) echo "Expected Node 24.x" >&2; exit 1 ;;
+          esac
+          if [ "$(npm --version)" != "11.19.0" ]; then
+            echo "Expected npm 11.19.0" >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma Client
+        run: npm run db:generate -w @mansar/api
+
+      - name: Apply migrations from zero
+        run: npm run db:migrate:deploy -w @mansar/api
+
+      - name: Check migration status
+        run: npm run db:migrate:status -w @mansar/api
+
+      # Compares the live, freshly migrated database with the Prisma schema.
+      # Only Prisma-modelled features are compared; raw-SQL-only invariants
+      # need their own integration tests.
+      - name: Compare live database with schema
+        run: npm run db:diff:check -w @mansar/api
+
+      - name: Run database integration tests
+        run: npm run test:db -w @mansar/api

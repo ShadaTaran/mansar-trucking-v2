@@ -10,6 +10,7 @@
     "db:migrate:dev": "prisma migrate dev --config ./prisma7.config.ts",
     "db:migrate:deploy": "prisma migrate deploy --config ./prisma7.config.ts",
     "db:migrate:status": "prisma migrate status --config ./prisma7.config.ts",
+    "db:diff:check": "prisma migrate diff --config ./prisma7.config.ts --from-config-datasource --to-schema=prisma/schema.prisma --exit-code",
     "db:reset": "prisma migrate reset --config ./prisma7.config.ts",
     "db:studio": "prisma studio --config ./prisma7.config.ts",
     "db:test:migrate": "node scripts/test-db-migrate.mjs deploy",

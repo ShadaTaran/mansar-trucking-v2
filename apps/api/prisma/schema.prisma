@@ -33,7 +33,8 @@ model User {
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  auditLogs AuditLog[] @relation("AuditLogActor")
+  auditLogs       AuditLog[]       @relation("AuditLogActor")
+  refreshSessions RefreshSession[]
 
   @@map("users")
 }
@@ -57,4 +58,50 @@ model AuditLog {
   @@index([entityType, entityId, createdAt(sort: Desc)], map: "audit_logs_entity_type_entity_id_created_at_idx")
   @@index([createdAt(sort: Desc)], map: "audit_logs_created_at_idx")
   @@map("audit_logs")
+}
+
+/// Which first-party client a refresh session was issued to.
+enum RefreshClient {
+  WEB
+  MOBILE
+
+  @@map("refresh_client")
+}
+
+/// Why a refresh session stopped being usable.
+enum RefreshRevocationReason {
+  ROTATED
+  LOGOUT
+  LOGOUT_ALL
+  DEACTIVATED
+  PASSWORD_RESET
+  REUSE_DETECTED
+
+  @@map("refresh_revocation_reason")
+}
+
+/// One refresh-token session. The plaintext token is never stored; only the
+/// SHA-256 of its 256-bit random value. Rotation revokes the row (ROTATED)
+/// and creates a replacement in the same family; presenting a rotated token
+/// again is treated as reuse and revokes the whole family.
+model RefreshSession {
+  id              String                   @id @default(uuid(7)) @db.Uuid
+  userId          String                   @map("user_id") @db.Uuid
+  /// Rotation-family identifier: generated at login, copied on rotation.
+  familyId        String                   @default(uuid(7)) @map("family_id") @db.Uuid
+  tokenHash       String                   @unique(map: "refresh_sessions_token_hash_key") @map("token_hash") @db.Text
+  client          RefreshClient
+  createdAt       DateTime                 @default(now()) @map("created_at") @db.Timestamptz(3)
+  expiresAt       DateTime                 @map("expires_at") @db.Timestamptz(3)
+  /// Absolute cap for the whole family; never extended by rotation.
+  familyExpiresAt DateTime                 @map("family_expires_at") @db.Timestamptz(3)
+  lastUsedAt      DateTime?                @map("last_used_at") @db.Timestamptz(3)
+  revokedAt       DateTime?                @map("revoked_at") @db.Timestamptz(3)
+  revokedReason   RefreshRevocationReason? @map("revoked_reason")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([userId], map: "refresh_sessions_user_id_idx")
+  @@index([familyId], map: "refresh_sessions_family_id_idx")
+  @@map("refresh_sessions")
 }

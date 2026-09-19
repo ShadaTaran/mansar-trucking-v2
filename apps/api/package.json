@@ -4,6 +4,9 @@
   "private": true,
   "description": "Mansar Trucking Management System v2 backend API (NestJS).",
   "type": "module",
+  "engines": {
+    "node": "^24.20.0"
+  },
   "scripts": {
     "build:deps": "tsc -b ../../packages/types && npm run db:generate",
     "db:generate": "prisma generate --config ./prisma7.config.ts",
@@ -39,6 +42,7 @@
     "@nestjs/platform-express": "~12.0.3",
     "@prisma/adapter-pg": "7.10.0",
     "@prisma/client": "7.10.0",
+    "jose": "6.2.12",
     "pg": "8.23.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1"

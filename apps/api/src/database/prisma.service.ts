@@ -13,6 +13,9 @@ const CONNECTION_TIMEOUT_MS = 5000;
  * misconfiguration fails at startup, and disposes the pool on shutdown.
  * Prisma Client itself is the persistence API; this class adds no repository
  * abstraction.
+ *
+ * `User.passwordHash` is omitted from every query result by default; code
+ * that verifies credentials must request it with an explicit `select`.
  */
 @Injectable()
 export class PrismaService
@@ -31,6 +34,9 @@ export class PrismaService
         // pg defaults to no connection timeout; fail fast instead of hanging.
         connectionTimeoutMillis: CONNECTION_TIMEOUT_MS,
       }),
+      omit: {
+        user: { passwordHash: true },
+      },
     });
   }
 

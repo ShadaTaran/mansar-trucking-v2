@@ -1,0 +1,17 @@
+{
+  "extends": "@mansar/config/tsconfig/base.json",
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "ES2023",
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "outDir": "./dist",
+    "rootDir": ".",
+    "sourceMap": true,
+    "removeComments": true,
+    "incremental": true,
+    "types": ["node"]
+  },
+  "include": ["src", "test"]
+}

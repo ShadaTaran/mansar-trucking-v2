@@ -1,0 +1,43 @@
+{
+  "name": "@mansar/api",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Mansar Trucking Management System v2 backend API (NestJS).",
+  "type": "module",
+  "scripts": {
+    "build:deps": "tsc -b ../../packages/types",
+    "prebuild": "npm run build:deps",
+    "build": "nest build",
+    "prestart": "npm run build:deps",
+    "start": "nest start",
+    "prestart:dev": "npm run build:deps",
+    "start:dev": "nest start --watch",
+    "start:prod": "node dist/main.js",
+    "pretypecheck": "npm run build:deps",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint .",
+    "pretest": "npm run build:deps",
+    "test": "vitest run",
+    "pretest:watch": "npm run build:deps",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@mansar/types": "*",
+    "@nestjs/common": "~12.0.3",
+    "@nestjs/core": "~12.0.3",
+    "@nestjs/platform-express": "~12.0.3",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1"
+  },
+  "devDependencies": {
+    "@mansar/config": "*",
+    "@nestjs/cli": "~12.0.3",
+    "@nestjs/schematics": "~12.0.3",
+    "@nestjs/testing": "~12.0.3",
+    "@types/express": "^5.0.0",
+    "@types/node": "^24.0.0",
+    "@types/supertest": "^7.0.0",
+    "supertest": "^7.0.0",
+    "typescript": "~6.0.3"
+  }
+}

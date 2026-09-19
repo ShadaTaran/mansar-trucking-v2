@@ -12,10 +12,10 @@
     "packages/*"
   ],
   "scripts": {
-    "typecheck": "tsc -b",
+    "typecheck": "tsc -b && npm run typecheck --workspaces --if-present",
     "lint": "eslint .",
-    "test": "npm run test --workspaces --if-present",
-    "build": "npm run build --workspaces --if-present",
+    "test": "tsc -b && npm run test --workspaces --if-present",
+    "build": "tsc -b && npm run build --workspaces --if-present",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },

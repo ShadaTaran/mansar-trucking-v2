@@ -4,23 +4,38 @@ import {
   type TripStatus,
 } from '@mansar/types';
 
-/**
- * Minimal client configuration.
- *
- * Authentication, real endpoints and transport are deliberately absent;
- * they arrive with the API application in a later stage.
- */
-export interface ApiClientConfig {
-  /** Absolute base URL of the Mansar API, without a trailing slash. */
-  readonly baseUrl: string;
-}
-
-/**
- * Normalises a base URL so path joining is predictable.
- */
-export function createApiClientConfig(baseUrl: string): ApiClientConfig {
-  return { baseUrl: baseUrl.replace(/\/+$/, '') };
-}
+export {
+  API_ERROR_CODES,
+  ApiError,
+  type ApiClientConfig,
+  type ApiClientOptions,
+  type ApiErrorCode,
+  type ApiErrorKind,
+  type FetchLike,
+  type HttpRequest,
+  type HttpResponse,
+  type RequestSpec,
+  createApiClientConfig,
+  isApiError,
+  requestJson,
+  requestNoContent,
+} from './client.js';
+export {
+  AUTH_CLIENTS,
+  USER_ROLES,
+  type AuthApi,
+  type AuthClient,
+  type AuthUser,
+  type LoginInput,
+  type LoginResult,
+  type TokenPair,
+  type UserRole,
+  createAuthApi,
+  isUserRole,
+  parseAuthUser,
+  parseLoginResult,
+  parseTokenPair,
+} from './auth.js';
 
 /**
  * Runtime guard for values arriving over the wire.

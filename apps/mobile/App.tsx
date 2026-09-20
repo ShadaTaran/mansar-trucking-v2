@@ -1,43 +1,62 @@
-import { MANSAR_PACKAGE_PROBE } from '@mansar/types';
-import { StyleSheet, Text, View } from 'react-native';
+import { createApiClientConfig, createAuthApi } from '@mansar/api-client';
+import { useEffect } from 'react';
+
+import { AuthProvider, useAuthState } from './src/auth/auth-context';
+import { createKeychainSecretStore } from './src/auth/auth-secret-store';
+import {
+  createSessionManager,
+  type SessionManager,
+} from './src/auth/session-manager';
+import { API_BASE_URL } from './src/config/api';
+import {
+  BootstrapErrorScreen,
+  BootstrapScreen,
+} from './src/screens/BootstrapScreen';
+import { DriverHomeScreen } from './src/screens/DriverHomeScreen';
+import { LoginScreen } from './src/screens/LoginScreen';
 
 /**
- * Development scaffold screen.
- *
- * Proves the driver app boots on Android and consumes the `@mansar/types`
- * workspace package through Metro. Replaced by real screens in later stages.
+ * Driver app root: one session manager for the process, one screen per
+ * authentication state. Nothing renders as authenticated until the API has
+ * confirmed a DRIVER identity (login response or `/auth/me` after restore).
  */
-function App() {
-  return (
-    <View style={styles.container}>
-      <Text style={styles.title}>Mansar Trucking Management System v2</Text>
-      <Text style={styles.line}>Driver Mobile</Text>
-      <Text style={styles.line}>Development scaffold</Text>
-      <Text style={styles.line}>
-        Workspace: <Text style={styles.probe}>{MANSAR_PACKAGE_PROBE}</Text>
-      </Text>
-    </View>
-  );
+
+let defaultSession: SessionManager | null = null;
+
+function getDefaultSession(): SessionManager {
+  if (defaultSession === null) {
+    defaultSession = createSessionManager({
+      authApi: createAuthApi(createApiClientConfig(API_BASE_URL)),
+      secretStore: createKeychainSecretStore(),
+    });
+  }
+  return defaultSession;
 }
 
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    justifyContent: 'center',
-    padding: 24,
-  },
-  title: {
-    fontSize: 20,
-    fontWeight: '600',
-    marginBottom: 12,
-  },
-  line: {
-    fontSize: 16,
-    marginBottom: 4,
-  },
-  probe: {
-    fontFamily: 'monospace',
-  },
-});
+function Root() {
+  const state = useAuthState();
+  switch (state.status) {
+    case 'bootstrapping':
+      return <BootstrapScreen />;
+    case 'bootstrap_error':
+      return <BootstrapErrorScreen />;
+    case 'unauthenticated':
+      return <LoginScreen />;
+    case 'authenticated':
+      return <DriverHomeScreen user={state.user} />;
+  }
+}
+
+function App({ session }: { readonly session?: SessionManager }) {
+  const active = session ?? getDefaultSession();
+  useEffect(() => {
+    void active.bootstrap();
+  }, [active]);
+  return (
+    <AuthProvider session={active}>
+      <Root />
+    </AuthProvider>
+  );
+}
 
 export default App;

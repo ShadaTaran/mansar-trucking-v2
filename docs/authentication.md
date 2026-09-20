@@ -1,9 +1,11 @@
 # Authentication
 
 Developer reference for authentication and authorization: the API
-(sections 1–9) and the admin web BFF (section 10). The decisions behind
-them are in [ADR 0006](adr/0006-authentication-credentials-and-sessions.md)
-and [ADR 0007](adr/0007-browser-bff-authentication.md).
+(sections 1–9), the admin web BFF (section 10) and the driver mobile app
+(section 11). The decisions behind them are in
+[ADR 0006](adr/0006-authentication-credentials-and-sessions.md),
+[ADR 0007](adr/0007-browser-bff-authentication.md) and
+[ADR 0008](adr/0008-mobile-authentication.md).
 
 ## 1. Authority and clients
 
@@ -14,9 +16,9 @@ issues and verifies access tokens, and owns refresh sessions. It is a
 - Admin web app (implemented, see §10): Next.js route handlers call these
   endpoints server-side and keep both tokens in HttpOnly cookies, so browser
   JavaScript never sees them.
-- Driver mobile app (Stage 3E, not yet implemented): calls the API directly,
-  keeps the access token in memory and the refresh token in Android
-  Keystore-backed storage.
+- Driver mobile app (implemented, see §11): calls the API directly with
+  bearer tokens, keeps the access token in memory and the refresh token in
+  Android Keystore-backed storage.
 
 ## 2. Endpoints
 
@@ -232,3 +234,80 @@ Local web environment (`apps/web/.env.example`, no secrets):
 API_INTERNAL_URL=http://127.0.0.1:3001
 WEB_ORIGIN=http://localhost:3000
 ```
+
+## 11. Driver mobile app (React Native)
+
+The Android driver app calls the API directly; the shared
+`@mansar/api-client` package provides the typed `/auth` operations
+(`login`, `refresh`, `logout`, `logoutAll`, `me`) over an injected `fetch`,
+and `apps/mobile/src/auth/` owns credential custody and session state.
+
+| Credential    | Where                                                                    | Lifetime                         |
+| ------------- | ------------------------------------------------------------------------ | -------------------------------- |
+| access token  | memory only (private field of the session manager)                       | until refresh, logout or restart |
+| refresh token | `react-native-keychain`, service `com.mansar.driver.auth.refresh`        | until rotation, logout or reject |
+| password      | component state while typing; sent once with `client: "MOBILE"`; dropped | submit only                      |
+
+The Keychain entry is AES-GCM ciphertext whose key lives in the Android
+Keystore (`STORAGE_TYPE.AES_GCM_NO_AUTH`, minimum
+`SECURITY_LEVEL.SECURE_SOFTWARE`; hardware-backed when the device provides
+it). No biometric prompt is used. AsyncStorage is never used for
+credentials, enforced by an ESLint rule scoped to `apps/mobile/src/auth/**`.
+
+Session lifecycle (`session-manager.ts`):
+
+- **Start-up**: state `bootstrapping` (a neutral screen, never the login
+  form). No stored token → `unauthenticated`. A stored token is rotated
+  through `POST /auth/refresh`; the new refresh token is written to the
+  Keychain before anything else, then `GET /auth/me` must return a `DRIVER`
+  before the state becomes `authenticated`. Only the API's explicit verdict
+  ends the stored session: refresh `401 invalid_refresh_token` (or `/auth/me`
+  `401 unauthorized`) → token cleared, `unauthenticated`. Every other
+  outcome — transport failure, 5xx, 429, any other 4xx (400, 403, 404, 405,
+  408, …), a malformed 200 body — is recoverable: `bootstrap_error` with a
+  retry button and the stored token kept.
+- **Login**: `POST /auth/login` with `client: "MOBILE"`. A non-DRIVER
+  account is revoked best-effort via `/auth/logout` and shown
+  "This account cannot use the driver app." A Keychain write failure also
+  revokes the new session and reports an error; the app never runs on an
+  unpersisted refresh token. Only after the write succeeds does the session
+  become authenticated. Error text is generic (`invalid_credentials` →
+  "Invalid email or password."; `account_inactive` → "This account is
+  inactive."; network → "Unable to reach the server. Try again."); API
+  bodies are never displayed.
+- **Refresh**: single-flight per process — concurrent callers share one
+  in-flight `POST /auth/refresh`; the rotated token is persisted before the
+  new access token is published. Persistence failure revokes the new token,
+  clears storage and forces a new login. The same classification applies:
+  only `401 invalid_refresh_token` ends the session; anything else is
+  reported as `unavailable` and leaves both tokens in place.
+- **Credential mutations are serialized**: every read, write and clear of
+  the Keychain entry runs through one in-process queue, one at a time, and
+  each write or clear is guarded inside that critical section by the
+  session generation it belongs to. An operation from an older generation
+  (a late rotation, a failed-rotation cleanup, a login answered after
+  logout) can never write or erase a newer generation's credential; it can
+  only revoke its own token at the API. There is no read → compare → clear
+  anywhere.
+- **Authenticated requests** (`createAuthenticatedFetch`): the bearer goes
+  in `Authorization` only; a 401 triggers the shared refresh and exactly one
+  retry; a second 401 is returned unchanged. A refresh rejected with
+  `401 invalid_refresh_token` ends the session; any other refresh failure
+  keeps it, and the original 401 is returned without further retries.
+- **Logout**: memory and Keychain are cleared first, always;
+  `POST /auth/logout` with the captured refresh token is best-effort. Logout
+  and each completed login start a new session generation, so a rotation
+  that finishes after logout revokes its own new token instead of restoring
+  the session.
+- **Logout-all**: `POST /auth/logout-all` with the bearer (one refresh +
+  retry on 401), then local clear. If the API never accepts it, the app
+  falls back to ordinary logout (local clear + best-effort single
+  revocation) and reports `remoteRevoked: false`; no UI exposes it yet.
+
+Nothing in the app logs, displays or persists a token; the authenticated
+placeholder shows only the driver's email and role.
+
+Development API URL (`apps/mobile/src/config/api.ts`): the Android emulator
+reaches the host's API at `http://10.0.2.2:3001`; a physical device uses
+`adb reverse tcp:3001 tcp:3001` with `http://127.0.0.1:3001` (see
+`apps/mobile/README.md`). No production URL exists yet.

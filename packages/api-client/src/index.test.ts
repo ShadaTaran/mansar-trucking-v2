@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   API_CLIENT_PROBE,
   createApiClientConfig,
+  createAuthApi,
   isTripStatus,
 } from './index.js';
 
@@ -17,9 +18,16 @@ describe('@mansar/api-client', () => {
     expect(isTripStatus(42)).toBe(false);
   });
 
-  it('strips trailing slashes from the base URL', () => {
-    expect(createApiClientConfig('https://api.example.test///').baseUrl).toBe(
-      'https://api.example.test',
+  it('exposes the transport core and the auth operations from one entry point', () => {
+    const auth = createAuthApi(
+      createApiClientConfig('https://api.example.test'),
     );
+    expect(Object.keys(auth).sort()).toEqual([
+      'login',
+      'logout',
+      'logoutAll',
+      'me',
+      'refresh',
+    ]);
   });
 });

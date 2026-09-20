@@ -32,6 +32,41 @@ export default [
     files: ['apps/mobile/**/*.{js,ts,tsx}'],
     ...reactHooks.configs.flat.recommended,
   },
+  // Credential-storage guard (Stage 3E): the driver app's authentication
+  // code must keep the refresh token in Keystore-backed secure storage and
+  // the access token in memory. AsyncStorage is plain, unencrypted app
+  // storage, so it is forbidden here. The guard is scoped to the auth area
+  // on purpose: later offline trip/location features may legitimately use
+  // AsyncStorage for non-secret data.
+  {
+    files: ['apps/mobile/src/auth/**/*.{js,ts,tsx}'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          paths: [
+            {
+              name: '@react-native-async-storage/async-storage',
+              message:
+                'Authentication credentials must not use AsyncStorage; use the Keychain-backed AuthSecretStore.',
+            },
+          ],
+        },
+      ],
+      'no-restricted-modules': [
+        'error',
+        {
+          paths: [
+            {
+              name: '@react-native-async-storage/async-storage',
+              message:
+                'Authentication credentials must not use AsyncStorage; use the Keychain-backed AuthSecretStore.',
+            },
+          ],
+        },
+      ],
+    },
+  },
   // API maintenance scripts run directly under Node (ESM).
   {
     files: ['apps/api/scripts/**/*.mjs'],

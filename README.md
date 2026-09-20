@@ -76,4 +76,4 @@ the git-ignored `dist/` directories as a side effect; `build` does the same.
 - [Database development](docs/database.md): local PostgreSQL, Prisma,
   migrations, integration tests
 - [Authentication](docs/authentication.md): API endpoints, tokens, refresh
-  sessions, local secret setup, first admin, admin web BFF
+  sessions, local secret setup, first admin, admin web BFF, driver mobile app

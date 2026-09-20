@@ -38,3 +38,4 @@ An accepted ADR is not edited to change its decision; a new ADR supersedes it.
 | [0005](0005-public-demo-uses-synthetic-data.md)         | Public demo uses synthetic data         |
 | [0006](0006-authentication-credentials-and-sessions.md) | Authentication credentials and sessions |
 | [0007](0007-browser-bff-authentication.md)              | Browser BFF authentication              |
+| [0008](0008-mobile-authentication.md)                   | Mobile authentication                   |

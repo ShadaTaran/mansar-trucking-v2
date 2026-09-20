@@ -18,6 +18,8 @@
     "db:studio": "prisma studio --config ./prisma7.config.ts",
     "db:test:migrate": "node scripts/test-db-migrate.mjs deploy",
     "db:test:status": "node scripts/test-db-migrate.mjs status",
+    "preadmin:create": "npm run build",
+    "admin:create": "node dist/cli/create-admin.js",
     "prebuild": "npm run build:deps",
     "build": "nest build",
     "prestart": "npm run build:deps",
@@ -40,12 +42,14 @@
     "@nestjs/common": "~12.0.3",
     "@nestjs/core": "~12.0.3",
     "@nestjs/platform-express": "~12.0.3",
+    "@nestjs/throttler": "6.7.0",
     "@prisma/adapter-pg": "7.10.0",
     "@prisma/client": "7.10.0",
     "jose": "6.2.12",
     "pg": "8.23.0",
     "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.1"
+    "rxjs": "^7.8.1",
+    "zod": "4.6.5"
   },
   "devDependencies": {
     "@mansar/config": "*",

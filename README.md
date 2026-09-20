@@ -35,6 +35,7 @@ packages/
   api-client/         framework-independent API client (@mansar/api-client)
 docs/
   stage-0-architecture.md
+  authentication.md
   database.md
   security.md
   adr/                architecture decision records
@@ -74,3 +75,5 @@ the git-ignored `dist/` directories as a side effect; `build` does the same.
 - [Security and data policy](docs/security.md)
 - [Database development](docs/database.md): local PostgreSQL, Prisma,
   migrations, integration tests
+- [Authentication](docs/authentication.md): endpoints, tokens, refresh
+  sessions, local secret setup, first admin

@@ -1,6 +1,7 @@
 import { NestFactory } from '@nestjs/core';
 
 import { AppModule } from './app.module.js';
+import { configureApp } from './app.setup.js';
 import { loadLocalEnv } from './config/local-env.js';
 
 const DEFAULT_PORT = 3001;
@@ -8,7 +9,7 @@ const DEFAULT_PORT = 3001;
 async function bootstrap(): Promise<void> {
   loadLocalEnv();
 
-  const app = await NestFactory.create(AppModule);
+  const app = configureApp(await NestFactory.create(AppModule));
   // Let SIGTERM/SIGINT run module destroy hooks (Prisma pool disposal).
   app.enableShutdownHooks();
 

@@ -44,6 +44,20 @@ export type BulkRevocationReason = Extract<
 
 export const AUDIT_REFRESH_REUSE_DETECTED = 'auth.refresh.reuse_detected';
 
+/** Caller context for rotation; never an HTTP object. */
+export interface RotateOptions {
+  /** Server-generated request id for the reuse audit row, when known. */
+  readonly requestId?: string | null;
+  readonly now?: Date;
+}
+
+/** Minimal context of a session revoked by logout. */
+export interface RevokedSession {
+  readonly sessionId: string;
+  readonly familyId: string;
+  readonly userId: string;
+}
+
 type RotationOutcome =
   | { readonly kind: 'rotated'; readonly session: RotatedRefreshSession }
   | { readonly kind: 'invalid' };
@@ -116,17 +130,19 @@ export class RefreshSessionService {
    */
   async rotate(
     presentedToken: string,
-    now: Date = new Date(),
+    options: RotateOptions = {},
   ): Promise<RotatedRefreshSession> {
     const tokenBytes = parseRefreshToken(presentedToken);
     if (!tokenBytes) {
       throw new InvalidRefreshTokenError();
     }
     const tokenHash = hashRefreshToken(tokenBytes);
+    const now = options.now ?? new Date();
+    const requestId = options.requestId ?? null;
 
     const outcome = await this.prisma.$transaction(
       (tx): Promise<RotationOutcome> =>
-        this.rotateInTransaction(tx, tokenHash, now),
+        this.rotateInTransaction(tx, tokenHash, now, requestId),
     );
 
     if (outcome.kind === 'invalid') {
@@ -139,6 +155,7 @@ export class RefreshSessionService {
     tx: Prisma.TransactionClient,
     tokenHash: string,
     now: Date,
+    requestId: string | null,
   ): Promise<RotationOutcome> {
     // Atomic claim: under READ COMMITTED only one concurrent update matches.
     const claimed = await tx.refreshSession.updateManyAndReturn({
@@ -163,7 +180,7 @@ export class RefreshSessionService {
 
     const current = claimed[0];
     if (!current) {
-      return this.handleUnclaimed(tx, tokenHash, now);
+      return this.handleUnclaimed(tx, tokenHash, now, requestId);
     }
 
     const user = await tx.user.findUnique({
@@ -224,6 +241,7 @@ export class RefreshSessionService {
     tx: Prisma.TransactionClient,
     tokenHash: string,
     now: Date,
+    requestId: string | null,
   ): Promise<RotationOutcome> {
     const previous = await tx.refreshSession.findUnique({
       where: { tokenHash },
@@ -255,17 +273,16 @@ export class RefreshSessionService {
       where: { familyId: previous.familyId, revokedAt: null },
       data: { revokedAt: now, revokedReason: 'REUSE_DETECTED' },
     });
-    const user = await tx.user.findUnique({
-      where: { id: previous.userId },
-      select: { role: true },
-    });
+    // Whoever replayed the token is unknown (the owner or a thief), so the
+    // row has no actor; the affected account is the entity.
     await this.audit.record(
       {
-        actorUserId: previous.userId,
-        actorRole: user?.role ?? null,
+        actorUserId: null,
+        actorRole: null,
         action: AUDIT_REFRESH_REUSE_DETECTED,
         entityType: 'user',
         entityId: previous.userId,
+        requestId,
         metadata: {
           familyId: previous.familyId,
           sessionId: previous.id,
@@ -279,25 +296,39 @@ export class RefreshSessionService {
   }
 
   /**
-   * Logout of the presented session. Idempotent: returns true only when an
-   * active session was revoked. Malformed, unknown or already-revoked tokens
-   * change nothing and are never classified as reuse.
+   * Logout of the presented session. Idempotent: one conditional update, no
+   * pre-query, so the returned context exists only when this call actually
+   * revoked a session that was active and within both lifetimes. Malformed,
+   * unknown, already-revoked, expired or family-expired tokens change
+   * nothing, return null, and are never classified as reuse.
    */
   async revokeCurrent(
     presentedToken: string,
     tx?: SessionWriter,
     now: Date = new Date(),
-  ): Promise<boolean> {
+  ): Promise<RevokedSession | null> {
     const tokenBytes = parseRefreshToken(presentedToken);
     if (!tokenBytes) {
-      return false;
+      return null;
     }
     const writer = tx ?? this.prisma;
-    const result = await writer.refreshSession.updateMany({
-      where: { tokenHash: hashRefreshToken(tokenBytes), revokedAt: null },
+    const revoked = await writer.refreshSession.updateManyAndReturn({
+      where: {
+        tokenHash: hashRefreshToken(tokenBytes),
+        revokedAt: null,
+        expiresAt: { gt: now },
+        familyExpiresAt: { gt: now },
+      },
       data: { revokedAt: now, revokedReason: 'LOGOUT' },
+      select: { id: true, familyId: true, userId: true },
     });
-    return result.count === 1;
+    if (revoked.length > 1) {
+      throw new AuthInvariantError('refresh token hash matched several rows');
+    }
+    const row = revoked[0];
+    return row
+      ? { sessionId: row.id, familyId: row.familyId, userId: row.userId }
+      : null;
   }
 
   /**

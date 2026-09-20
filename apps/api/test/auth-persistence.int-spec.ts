@@ -32,10 +32,25 @@ describe('auth persistence integration (mansar_test)', () => {
   let service: RefreshSessionService;
   let userId: string;
 
+  async function scopedUserIds(): Promise<string[]> {
+    const users = await prisma.user.findMany({
+      where: { email: { startsWith: PREFIX } },
+      select: { id: true },
+    });
+    return users.map((u) => u.id);
+  }
+
   async function cleanup(): Promise<void> {
     const scope = { email: { startsWith: PREFIX } };
     await prisma.refreshSession.deleteMany({ where: { user: scope } });
-    await prisma.auditLog.deleteMany({ where: { actorUser: scope } });
+    await prisma.auditLog.deleteMany({
+      where: {
+        OR: [
+          { actorUser: scope },
+          { entityType: 'user', entityId: { in: await scopedUserIds() } },
+        ],
+      },
+    });
     await prisma.user.deleteMany({ where: scope });
   }
 
@@ -56,7 +71,7 @@ describe('auth persistence integration (mansar_test)', () => {
     prisma.refreshSession.count({ where: { familyId, revokedAt: null } });
   const reuseAudits = () =>
     prisma.auditLog.count({
-      where: { action: AUDIT_REFRESH_REUSE_DETECTED, actorUserId: userId },
+      where: { action: AUDIT_REFRESH_REUSE_DETECTED, entityId: userId },
     });
 
   beforeAll(async () => {
@@ -326,12 +341,16 @@ describe('auth persistence integration (mansar_test)', () => {
     expect(await reuseAudits()).toBe(1);
 
     const [row] = await prisma.auditLog.findMany({
-      where: { action: AUDIT_REFRESH_REUSE_DETECTED, actorUserId: userId },
+      where: { action: AUDIT_REFRESH_REUSE_DETECTED, entityId: userId },
     });
+    // The replayer is unknown, so the row has no actor; the account is the
+    // entity.
     expect(row).toMatchObject({
       entityType: 'user',
       entityId: userId,
-      actorRole: 'DRIVER',
+      actorUserId: null,
+      actorRole: null,
+      requestId: null,
     });
     expect(row!.metadata).toEqual({
       familyId: first.familyId,
@@ -470,10 +489,51 @@ describe('auth persistence integration (mansar_test)', () => {
     });
   });
 
+  it('O2. revokeCurrent ignores sessions at or past either lifetime boundary', async () => {
+    const now = new Date();
+    for (const patch of [
+      { expiresAt: now },
+      { expiresAt: new Date(now.getTime() - 1) },
+      { familyExpiresAt: now },
+      { familyExpiresAt: new Date(now.getTime() - 1) },
+    ]) {
+      const s = await service.create({ userId, client: 'WEB' });
+      await prisma.refreshSession.update({
+        where: { id: s.sessionId },
+        data: patch,
+      });
+      await expect(
+        service.revokeCurrent(s.refreshToken, undefined, now),
+      ).resolves.toBeNull();
+      const row = await prisma.refreshSession.findUniqueOrThrow({
+        where: { id: s.sessionId },
+      });
+      expect(row.revokedAt).toBeNull();
+      expect(row.revokedReason).toBeNull();
+    }
+    // One millisecond inside both lifetimes still revokes.
+    const live = await service.create({ userId, client: 'WEB' });
+    await prisma.refreshSession.update({
+      where: { id: live.sessionId },
+      data: {
+        expiresAt: new Date(now.getTime() + 1),
+        familyExpiresAt: new Date(now.getTime() + 1),
+      },
+    });
+    await expect(
+      service.revokeCurrent(live.refreshToken, undefined, now),
+    ).resolves.toMatchObject({ sessionId: live.sessionId });
+    expect(await reuseAudits()).toBe(0);
+  });
+
   it('O. logout and revoke-all primitives', async () => {
     const s = await service.create({ userId, client: 'WEB' });
-    await expect(service.revokeCurrent(s.refreshToken)).resolves.toBe(true);
-    await expect(service.revokeCurrent(s.refreshToken)).resolves.toBe(false);
+    await expect(service.revokeCurrent(s.refreshToken)).resolves.toEqual({
+      sessionId: s.sessionId,
+      familyId: s.familyId,
+      userId,
+    });
+    await expect(service.revokeCurrent(s.refreshToken)).resolves.toBeNull();
     expect(
       (
         await prisma.refreshSession.findUniqueOrThrow({

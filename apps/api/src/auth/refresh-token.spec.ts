@@ -7,8 +7,10 @@ import {
   REFRESH_TOKEN_LENGTH,
   generateRefreshToken,
   hashRefreshToken,
+  isCanonicalRefreshToken,
   parseRefreshToken,
 } from './refresh-token.js';
+import { noncanonicalVariant } from '../../test/support/tokens.js';
 
 describe('generateRefreshToken', () => {
   it('produces 43 unpadded base64url characters from 32 random bytes', () => {
@@ -67,5 +69,19 @@ describe('hashRefreshToken', () => {
     const b = parseRefreshToken(generateRefreshToken())!;
     expect(hashRefreshToken(a)).toBe(hashRefreshToken(a));
     expect(hashRefreshToken(a)).not.toBe(hashRefreshToken(b));
+  });
+});
+
+describe('isCanonicalRefreshToken', () => {
+  it('accepts generated tokens and rejects a same-shape noncanonical variant', () => {
+    const token = generateRefreshToken();
+    const variant = noncanonicalVariant(token);
+    expect(variant).toHaveLength(REFRESH_TOKEN_LENGTH);
+    expect(variant).toMatch(/^[A-Za-z0-9_-]{43}$/); // shape alone would pass
+    expect(isCanonicalRefreshToken(token)).toBe(true);
+    expect(isCanonicalRefreshToken(variant)).toBe(false);
+    expect(parseRefreshToken(variant)).toBeNull();
+    expect(isCanonicalRefreshToken('')).toBe(false);
+    expect(isCanonicalRefreshToken(`${token}=`)).toBe(false);
   });
 });

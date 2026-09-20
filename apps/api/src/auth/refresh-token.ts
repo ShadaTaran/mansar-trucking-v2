@@ -37,3 +37,12 @@ export function parseRefreshToken(presented: string): Buffer | null {
 export function hashRefreshToken(tokenBytes: Buffer): string {
   return createHash('sha256').update(tokenBytes).digest('hex');
 }
+
+/**
+ * True only for a canonical presented token (exact alphabet and length, 32
+ * decoded bytes, identical re-encoding). For validation boundaries that must
+ * not handle the decoded bytes.
+ */
+export function isCanonicalRefreshToken(value: string): boolean {
+  return parseRefreshToken(value) !== null;
+}

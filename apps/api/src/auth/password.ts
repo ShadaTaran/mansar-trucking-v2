@@ -237,6 +237,25 @@ export async function hashPassword(password: string): Promise<string> {
 }
 
 /**
+ * Re-hashes a password that has just verified against a stored hash, e.g. to
+ * upgrade legacy parameters. Applies NFC and the maximum only: the current
+ * new-password minimum must not stop a legacy credential from being upgraded.
+ */
+export async function hashVerifiedPassword(password: string): Promise<string> {
+  const normalized = normalizePassword(password);
+  if (countCodePoints(normalized) > PASSWORD_MAX_CODE_POINTS) {
+    throw new PasswordPolicyError('password_too_long');
+  }
+  const salt = randomBytes(PASSWORD_SALT_BYTES);
+  const tag = await deriveArgon2id({
+    ...PASSWORD_HASH_PARAMS,
+    message: normalized,
+    nonce: salt,
+  });
+  return encodePhc({ ...PASSWORD_HASH_PARAMS, salt, tag });
+}
+
+/**
  * Verifies a password against a stored PHC string. Fails closed (false) on
  * an unparsable or out-of-bounds string and on over-length input; never
  * throws for data reasons and never exposes the stored string.

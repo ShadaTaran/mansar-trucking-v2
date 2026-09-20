@@ -24,6 +24,36 @@ export class InvalidAccessTokenError extends Error {
   }
 }
 
+/** A user with this (normalized) email already exists. */
+export class DuplicateEmailError extends Error {
+  readonly code = 'duplicate_email' as const;
+
+  constructor() {
+    super('duplicate email');
+    this.name = 'DuplicateEmailError';
+  }
+}
+
+/** The target user of an administrative operation does not exist. */
+export class UserNotFoundError extends Error {
+  readonly code = 'user_not_found' as const;
+
+  constructor() {
+    super('user not found');
+    this.name = 'UserNotFoundError';
+  }
+}
+
+/** The acting principal lacks the role an operation requires. */
+export class InsufficientRoleError extends Error {
+  readonly code = 'insufficient_role' as const;
+
+  constructor() {
+    super('insufficient role');
+    this.name = 'InsufficientRoleError';
+  }
+}
+
 /** A new password violates the length policy. */
 export class PasswordPolicyError extends Error {
   constructor(readonly code: 'password_too_short' | 'password_too_long') {

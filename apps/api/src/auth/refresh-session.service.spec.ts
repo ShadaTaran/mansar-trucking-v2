@@ -130,7 +130,7 @@ describe('RefreshSessionService', () => {
     };
 
     it('rejects a malformed token before touching the database', async () => {
-      await expect(service.rotate('nope', NOW)).rejects.toThrow(
+      await expect(service.rotate('nope', { now: NOW })).rejects.toThrow(
         InvalidRefreshTokenError,
       );
       expect(prisma.$transaction).not.toHaveBeenCalled();
@@ -148,7 +148,7 @@ describe('RefreshSessionService', () => {
         expiresAt: new Date(NOW.getTime() + REFRESH_SESSION_MS),
       });
 
-      const rotated = await service.rotate(token, NOW);
+      const rotated = await service.rotate(token, { now: NOW });
 
       expect(tx.refreshSession.updateManyAndReturn).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -202,7 +202,7 @@ describe('RefreshSessionService', () => {
         expiresAt: nearCap,
       });
 
-      await service.rotate(token, NOW);
+      await service.rotate(token, { now: NOW });
 
       const create = tx.refreshSession.create.mock.calls[0]![0] as {
         data: { expiresAt: Date; familyExpiresAt: Date };
@@ -216,7 +216,7 @@ describe('RefreshSessionService', () => {
         claimedRow,
         claimedRow,
       ]);
-      await expect(service.rotate(token, NOW)).rejects.toThrow(
+      await expect(service.rotate(token, { now: NOW })).rejects.toThrow(
         AuthInvariantError,
       );
     });
@@ -231,7 +231,7 @@ describe('RefreshSessionService', () => {
       tx.refreshSession.update.mockResolvedValue({ id: SESSION_ID });
       tx.refreshSession.updateMany.mockResolvedValue({ count: 1 });
 
-      await expect(service.rotate(token, NOW)).rejects.toThrow(
+      await expect(service.rotate(token, { now: NOW })).rejects.toThrow(
         InvalidRefreshTokenError,
       );
 
@@ -256,7 +256,7 @@ describe('RefreshSessionService', () => {
       tx.refreshSession.updateManyAndReturn.mockResolvedValue([]);
       tx.refreshSession.findUnique.mockResolvedValue(null);
 
-      await expect(service.rotate(token, NOW)).rejects.toThrow(
+      await expect(service.rotate(token, { now: NOW })).rejects.toThrow(
         InvalidRefreshTokenError,
       );
       expect(tx.refreshSession.updateMany).not.toHaveBeenCalled();
@@ -274,7 +274,7 @@ describe('RefreshSessionService', () => {
         revokedReason: null,
       });
 
-      await expect(service.rotate(token, NOW)).rejects.toThrow(
+      await expect(service.rotate(token, { now: NOW })).rejects.toThrow(
         InvalidRefreshTokenError,
       );
       expect(tx.refreshSession.updateMany).not.toHaveBeenCalled();
@@ -299,7 +299,7 @@ describe('RefreshSessionService', () => {
           revokedReason: reason,
         });
 
-        await expect(service.rotate(token, NOW)).rejects.toThrow(
+        await expect(service.rotate(token, { now: NOW })).rejects.toThrow(
           InvalidRefreshTokenError,
         );
         expect(tx.refreshSession.updateMany).not.toHaveBeenCalled();
@@ -319,11 +319,10 @@ describe('RefreshSessionService', () => {
       tx.refreshSession.updateMany
         .mockResolvedValueOnce({ count: 1 }) // incident claim
         .mockResolvedValueOnce({ count: 1 }); // family revocation
-      tx.user.findUnique.mockResolvedValue({ role: 'DRIVER' });
 
-      await expect(service.rotate(token, NOW)).rejects.toThrow(
-        InvalidRefreshTokenError,
-      );
+      await expect(
+        service.rotate(token, { now: NOW, requestId: 'req-reuse-1' }),
+      ).rejects.toThrow(InvalidRefreshTokenError);
 
       expect(tx.refreshSession.updateMany).toHaveBeenNthCalledWith(1, {
         where: { id: SESSION_ID, revokedReason: 'ROTATED' },
@@ -336,11 +335,12 @@ describe('RefreshSessionService', () => {
       expect(audit.record).toHaveBeenCalledTimes(1);
       const [entry, writer] = audit.record.mock.calls[0]!;
       expect(entry).toEqual({
-        actorUserId: USER_ID,
-        actorRole: 'DRIVER',
+        actorUserId: null,
+        actorRole: null,
         action: AUDIT_REFRESH_REUSE_DETECTED,
         entityType: 'user',
         entityId: USER_ID,
+        requestId: 'req-reuse-1',
         metadata: {
           familyId: FAMILY_ID,
           sessionId: SESSION_ID,
@@ -368,7 +368,7 @@ describe('RefreshSessionService', () => {
       });
       tx.refreshSession.updateMany.mockResolvedValueOnce({ count: 0 });
 
-      await expect(service.rotate(token, NOW)).rejects.toThrow(
+      await expect(service.rotate(token, { now: NOW })).rejects.toThrow(
         InvalidRefreshTokenError,
       );
       expect(tx.refreshSession.updateMany).toHaveBeenCalledTimes(1);
@@ -385,10 +385,9 @@ describe('RefreshSessionService', () => {
         revokedReason: 'ROTATED',
       });
       tx.refreshSession.updateMany.mockResolvedValue({ count: 1 });
-      tx.user.findUnique.mockResolvedValue({ role: 'ADMIN' });
       audit.record.mockRejectedValue(new Error('audit unavailable'));
 
-      const attempt = service.rotate(token, NOW);
+      const attempt = service.rotate(token, { now: NOW });
       await expect(attempt).rejects.toThrow('audit unavailable');
       await expect(attempt).rejects.not.toBeInstanceOf(
         InvalidRefreshTokenError,
@@ -397,33 +396,76 @@ describe('RefreshSessionService', () => {
   });
 
   describe('revokeCurrent', () => {
-    it('revokes an active session as LOGOUT and reports whether a row changed', async () => {
-      prisma.refreshSession.updateMany.mockResolvedValue({ count: 1 });
-      await expect(service.revokeCurrent(token, undefined, NOW)).resolves.toBe(
-        true,
-      );
-      expect(prisma.refreshSession.updateMany).toHaveBeenCalledWith({
-        where: { tokenHash, revokedAt: null },
+    it('revokes an active session as LOGOUT and returns its context, or null', async () => {
+      prisma.refreshSession.updateManyAndReturn.mockResolvedValue([
+        { id: SESSION_ID, familyId: FAMILY_ID, userId: USER_ID },
+      ]);
+      await expect(
+        service.revokeCurrent(token, undefined, NOW),
+      ).resolves.toEqual({
+        sessionId: SESSION_ID,
+        familyId: FAMILY_ID,
+        userId: USER_ID,
+      });
+      expect(prisma.refreshSession.updateManyAndReturn).toHaveBeenCalledWith({
+        where: {
+          tokenHash,
+          revokedAt: null,
+          expiresAt: { gt: NOW },
+          familyExpiresAt: { gt: NOW },
+        },
         data: { revokedAt: NOW, revokedReason: 'LOGOUT' },
+        select: { id: true, familyId: true, userId: true },
       });
 
-      prisma.refreshSession.updateMany.mockResolvedValue({ count: 0 });
-      await expect(service.revokeCurrent(token, undefined, NOW)).resolves.toBe(
-        false,
-      );
+      prisma.refreshSession.updateManyAndReturn.mockResolvedValue([]);
+      await expect(
+        service.revokeCurrent(token, undefined, NOW),
+      ).resolves.toBeNull();
+    });
+
+    it('returns null with no mutation when nothing matched (unknown, revoked, expired, family-expired)', async () => {
+      // The single conditional update carries both lifetime predicates, so a
+      // session whose expiresAt or familyExpiresAt is <= now never matches.
+      prisma.refreshSession.updateManyAndReturn.mockResolvedValue([]);
+      await expect(
+        service.revokeCurrent(token, undefined, NOW),
+      ).resolves.toBeNull();
+      const call = prisma.refreshSession.updateManyAndReturn.mock
+        .calls[0]![0] as { where: Record<string, unknown> };
+      expect(call.where).toEqual({
+        tokenHash,
+        revokedAt: null,
+        expiresAt: { gt: NOW },
+        familyExpiresAt: { gt: NOW },
+      });
+      expect(prisma.refreshSession.updateMany).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
+    });
+
+    it('treats more than one revoked row as a server invariant failure', async () => {
+      prisma.refreshSession.updateManyAndReturn.mockResolvedValue([
+        { id: SESSION_ID, familyId: FAMILY_ID, userId: USER_ID },
+        { id: NEW_SESSION_ID, familyId: FAMILY_ID, userId: USER_ID },
+      ]);
+      await expect(
+        service.revokeCurrent(token, undefined, NOW),
+      ).rejects.toThrow(AuthInvariantError);
     });
 
     it('ignores malformed tokens without any query', async () => {
-      await expect(service.revokeCurrent('bad token')).resolves.toBe(false);
-      expect(prisma.refreshSession.updateMany).not.toHaveBeenCalled();
+      await expect(service.revokeCurrent('bad token')).resolves.toBeNull();
+      expect(prisma.refreshSession.updateManyAndReturn).not.toHaveBeenCalled();
     });
 
     it('uses the caller transaction when provided', async () => {
-      tx.refreshSession.updateMany.mockResolvedValue({ count: 1 });
+      tx.refreshSession.updateManyAndReturn.mockResolvedValue([
+        { id: SESSION_ID, familyId: FAMILY_ID, userId: USER_ID },
+      ]);
       await expect(
         service.revokeCurrent(token, tx as never, NOW),
-      ).resolves.toBe(true);
-      expect(prisma.refreshSession.updateMany).not.toHaveBeenCalled();
+      ).resolves.toMatchObject({ sessionId: SESSION_ID });
+      expect(prisma.refreshSession.updateManyAndReturn).not.toHaveBeenCalled();
     });
   });
 

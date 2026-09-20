@@ -1,6 +1,7 @@
 import { Controller, Get, ServiceUnavailableException } from '@nestjs/common';
 import { MANSAR_PACKAGE_PROBE } from '@mansar/types';
 
+import { Public } from '../auth/decorators.js';
 import { PrismaService } from '../database/prisma.service.js';
 
 export const SERVICE_NAME = 'mansar-api';
@@ -32,6 +33,7 @@ if (MANSAR_PACKAGE_PROBE !== 'mansar-workspace-ok') {
   );
 }
 
+@Public()
 @Controller('health')
 export class HealthController {
   constructor(private readonly prisma: PrismaService) {}

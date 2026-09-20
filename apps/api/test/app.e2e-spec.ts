@@ -1,10 +1,8 @@
 import { INestApplication } from '@nestjs/common';
-import { Test, TestingModule } from '@nestjs/testing';
 import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { AppModule } from '../src/app.module.js';
-import { PrismaService } from '../src/database/prisma.service.js';
+import { createTestApp } from './support/http-app.js';
 
 /**
  * Lightweight HTTP tests. PrismaService is replaced with a stub before the
@@ -16,15 +14,7 @@ describe('API (e2e)', () => {
   const prismaStub = { checkConnection: vi.fn<() => Promise<void>>() };
 
   beforeAll(async () => {
-    const moduleFixture: TestingModule = await Test.createTestingModule({
-      imports: [AppModule],
-    })
-      .overrideProvider(PrismaService)
-      .useValue(prismaStub)
-      .compile();
-
-    app = moduleFixture.createNestApplication();
-    await app.init();
+    app = await createTestApp({ prisma: prismaStub });
   });
 
   afterAll(async () => {

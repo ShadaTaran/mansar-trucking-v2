@@ -1,8 +1,9 @@
 # Authentication
 
-Developer reference for the API's authentication and authorization. The
-decisions behind it are in
-[ADR 0006](adr/0006-authentication-credentials-and-sessions.md).
+Developer reference for authentication and authorization: the API
+(sections 1–9) and the admin web BFF (section 10). The decisions behind
+them are in [ADR 0006](adr/0006-authentication-credentials-and-sessions.md)
+and [ADR 0007](adr/0007-browser-bff-authentication.md).
 
 ## 1. Authority and clients
 
@@ -10,8 +11,8 @@ The NestJS API is the only authentication authority: it verifies passwords,
 issues and verifies access tokens, and owns refresh sessions. It is a
 **bearer-token API and never sets cookies**.
 
-- Admin web app (Stage 3D, not yet implemented): a Next.js server-side layer
-  will call these endpoints and keep both tokens in HttpOnly cookies so browser
+- Admin web app (implemented, see §10): Next.js route handlers call these
+  endpoints server-side and keep both tokens in HttpOnly cookies, so browser
   JavaScript never sees them.
 - Driver mobile app (Stage 3E, not yet implemented): calls the API directly,
   keeps the access token in memory and the refresh token in Android
@@ -173,3 +174,61 @@ Routine successful refreshes are not audited. Audit metadata never contains
 passwords, hashes, tokens, token hashes, headers, cookies, IP addresses or the
 attempted email of an unknown login. Nothing in the auth code logs credentials
 or tokens.
+
+## 10. Admin web BFF (Next.js)
+
+The browser never talks to the API. It calls same-origin `/api/*` routes in
+the Next.js app, which forwards to the API at `API_INTERNAL_URL` and holds
+the credentials in two HttpOnly cookies:
+
+| Cookie      | Holds         | Path        | Lifetime                 |
+| ----------- | ------------- | ----------- | ------------------------ |
+| `mansar_at` | access token  | `/`         | `accessExpiresIn` (600s) |
+| `mansar_rt` | refresh token | `/api/auth` | until `refreshExpiresAt` |
+
+Both are `HttpOnly; SameSite=Lax`, host-only (no `Domain`), and `Secure`
+except when `NODE_ENV=development`. Nothing token-like is ever in a JSON
+body, page prop, URL or browser storage.
+
+Browser-facing routes (all unsafe methods require `Origin` = `WEB_ORIGIN`
+and, when present, `Sec-Fetch-Site: same-origin`; otherwise 403
+`invalid_origin`):
+
+| Route                       | Browser sends         | Result                                                                   |
+| --------------------------- | --------------------- | ------------------------------------------------------------------------ |
+| `POST /api/auth/login`      | `{ email, password }` | ADMIN: cookies set, `{ user }`. DRIVER: 403 `forbidden`, session revoked |
+| `POST /api/auth/refresh`    | nothing               | 204 and both cookies rotated; 401 `unauthorized` clears both             |
+| `GET /api/auth/me`          | nothing               | `{ id, email, role }`; 401 clears only `mansar_at`                       |
+| `POST /api/auth/logout`     | nothing               | always 204; cookies cleared; API revocation best-effort                  |
+| `POST /api/auth/logout-all` | nothing               | 204 and cookies cleared; 401 relayed as-is                               |
+| `/api/backend/<path>`       | normal request        | forwarded with the bearer; `auth/*` blocked; 401/upstream errors relayed |
+
+Every BFF response carries `Cache-Control: no-store` (the API's own cache
+directives are never relayed), and the BFF never follows an API redirect: a
+3xx from the API becomes `502 upstream_invalid_response`.
+
+Error bodies are `{ statusCode, message }` with these codes:
+`invalid_request`, `invalid_origin`, `unauthorized`, `invalid_credentials`,
+`account_inactive`, `forbidden`, `not_found`, `too_many_requests`,
+`upstream_unavailable`, `upstream_invalid_response`, `upstream_error`. The
+API's bodies are never relayed verbatim.
+
+The BFF never refreshes on the server's behalf. The browser helper
+`authenticatedFetch` (`src/lib/client/authenticated-fetch.ts`) retries a 401
+once after a refresh that is serialized across tabs with the Web Lock
+`mansar-auth-refresh` (probe `/api/auth/me` first, refresh only if still 401) and single-flighted per tab. Browsers without Web Locks get the per-tab
+guard only; a genuine cross-tab race there trips the API's reuse detection
+and requires a new login.
+
+Because `mansar_rt` is scoped to `/api/auth`, page requests cannot tell
+whether a session is refreshable: protected pages are never redirected to
+`/login` for a missing access cookie. `AuthBoundary` asks the BFF and
+redirects only when that fails; `proxy.ts` only sends `/login` visitors
+with an access cookie to `/dashboard`.
+
+Local web environment (`apps/web/.env.example`, no secrets):
+
+```
+API_INTERNAL_URL=http://127.0.0.1:3001
+WEB_ORIGIN=http://localhost:3000
+```

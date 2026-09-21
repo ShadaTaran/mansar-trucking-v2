@@ -24,6 +24,13 @@ react {
     codegenDir = nodePackageDir("@react-native/codegen")
     //   The cli.js file which is the React Native CLI entrypoint.
     cliFile = new File(nodePackageDir("react-native"), "cli.js")
+    //   The Hermes compiler used to bundle JS into non-debug variants
+    //   (staging, release). The plugin's default looks under apps/mobile's
+    //   own node_modules; the workspace hoists hermes-compiler to the root.
+    hermesCommand = new File(
+        nodePackageDir("hermes-compiler"),
+        "hermesc/%OS-BIN%/" + (System.getProperty("os.name").toLowerCase().contains("windows") ? "hermesc.exe" : "hermesc")
+    ).path
 
     /* Autolinking */
     autolinkLibrariesWithApp()
@@ -60,13 +67,46 @@ android {
         versionCode 1
         versionName "1.0"
     }
+    // The API endpoint is build-time configuration (not a secret) exposed to
+    // JavaScript through BuildConfig.MANSAR_API_BASE_URL and the MansarConfig
+    // native module. Each build type fixes its own value; there is no
+    // runtime override and no production endpoint yet.
+    buildFeatures {
+        buildConfig true
+    }
     // Debug builds use the Android Gradle Plugin's standard debug signing
     // (~/.android/debug.keystore, generated automatically). No keystore is
     // stored in the repository. Release signing is configured in a later stage.
     buildTypes {
+        debug {
+            // Local development: the Android emulator reaches the host's API
+            // through 10.0.2.2. Plain HTTP is allowed here only (the React
+            // Native Gradle plugin sets usesCleartextTraffic=true for debug).
+            buildConfigField "String", "MANSAR_API_BASE_URL", '"http://10.0.2.2:3001"'
+        }
         release {
             minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+            // No approved production endpoint exists: an empty value makes the
+            // app fail closed (no API client, no network) instead of inheriting
+            // the development or staging URL. Release remains unsigned.
+            buildConfigField "String", "MANSAR_API_BASE_URL", '""'
+        }
+        // Staging: a release-like, non-debuggable build that carries its own
+        // JS bundle (no Metro), installs beside the debug app under its own
+        // application id, talks HTTPS only, and is signed with the automatic
+        // debug keystore because it is never distributed.
+        staging {
+            initWith release
+            debuggable false
+            signingConfig signingConfigs.debug
+            applicationIdSuffix ".staging"
+            versionNameSuffix "-staging"
+            matchingFallbacks = ["release"]
+            // The React Native Gradle plugin only sets this placeholder for
+            // debug/release; a custom build type must set it explicitly.
+            manifestPlaceholders = [usesCleartextTraffic: "false"]
+            buildConfigField "String", "MANSAR_API_BASE_URL", '"https://mansar-api-staging.up.railway.app"'
         }
     }
 }

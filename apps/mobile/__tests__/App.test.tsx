@@ -5,7 +5,7 @@ import {
   waitFor,
 } from '@testing-library/react-native';
 
-import App from '../App';
+import App, { resetDefaultSessionForTests } from '../App';
 import {
   createKeychainSecretStore,
   REFRESH_TOKEN_SERVICE,
@@ -31,6 +31,9 @@ jest.mock('react-native-keychain');
 const { __keychainFake: keychain } = jest.requireMock<
   typeof import('../__mocks__/react-native-keychain')
 >('react-native-keychain');
+const { __mansarConfigFake: nativeConfig } = jest.requireMock<
+  typeof import('../src/specs/__mocks__/NativeMansarConfig')
+>('../src/specs/NativeMansarConfig');
 
 const PASSWORD = 'synthetic password value';
 
@@ -60,6 +63,8 @@ function renderedText(): string {
 
 beforeEach(() => {
   keychain.reset();
+  nativeConfig.reset();
+  resetDefaultSessionForTests();
   api = createFakeAuthApi();
   session = newSession();
 });
@@ -240,5 +245,81 @@ describe('App', () => {
       await screen.findByRole('button', { name: 'Sign in' }),
     ).toBeOnTheScreen();
     expect(keychain.entries.size).toBe(0);
+  });
+});
+
+describe('App without an injected session (build configuration)', () => {
+  it('debug configuration creates a session against the emulator endpoint and bootstraps', async () => {
+    // The default session uses the real api-client over global fetch; stub
+    // it so no network is touched and observe the endpoint it targets.
+    const fetchMock = jest.fn<Promise<Response>, [string, unknown]>(
+      async () =>
+        ({ status: 200, text: async () => '{}' }) as unknown as Response,
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      await render(<App />);
+      // No stored token → straight to the login screen, no network call.
+      expect(
+        await screen.findByRole('button', { name: 'Sign in' }),
+      ).toBeOnTheScreen();
+      expect(fetchMock).not.toHaveBeenCalled();
+      // A login attempt goes to the debug endpoint exactly.
+      await signIn('driver@example.test');
+      await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+      expect(String(fetchMock.mock.calls[0]![0])).toBe(
+        'http://10.0.2.2:3001/auth/login',
+      );
+    } finally {
+      delete (globalThis as { fetch?: unknown }).fetch;
+    }
+  });
+
+  it('staging configuration targets the HTTPS staging endpoint exactly', async () => {
+    nativeConfig.apiBaseUrl = 'https://mansar-api-staging.up.railway.app';
+    const fetchMock = jest.fn<Promise<Response>, [string, unknown]>(
+      async () =>
+        ({ status: 200, text: async () => '{}' }) as unknown as Response,
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      await render(<App />);
+      await screen.findByRole('button', { name: 'Sign in' });
+      await signIn('driver@example.test');
+      await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+      expect(String(fetchMock.mock.calls[0]![0])).toBe(
+        'https://mansar-api-staging.up.railway.app/auth/login',
+      );
+    } finally {
+      delete (globalThis as { fetch?: unknown }).fetch;
+    }
+  });
+
+  it('an empty (release) configuration fails closed: no session, no network, no auth UI', async () => {
+    nativeConfig.apiBaseUrl = '';
+    const fetchMock = jest.fn();
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      await render(<App />);
+      expect(
+        screen.getByText('This build has no API endpoint configured.'),
+      ).toBeOnTheScreen();
+      expect(screen.queryByRole('button', { name: 'Sign in' })).toBeNull();
+      expect(screen.queryByLabelText('Checking your session')).toBeNull();
+      expect(fetchMock).not.toHaveBeenCalled();
+      // Nothing touched the Keychain either.
+      expect(keychain.calls).toEqual([]);
+    } finally {
+      delete (globalThis as { fetch?: unknown }).fetch;
+    }
+  });
+
+  it('a plain-HTTP public endpoint is refused like an empty one', async () => {
+    nativeConfig.apiBaseUrl = 'http://mansar-api-staging.up.railway.app';
+    await render(<App />);
+    expect(
+      screen.getByText('This build has no API endpoint configured.'),
+    ).toBeOnTheScreen();
+    expect(keychain.calls).toEqual([]);
   });
 });

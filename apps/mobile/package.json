@@ -9,6 +9,8 @@
     "start": "react-native start",
     "preandroid": "npm run build:deps",
     "android": "react-native run-android",
+    "preandroid:staging": "npm run build:deps",
+    "android:staging": "react-native run-android --mode staging --appIdSuffix staging --no-packager",
     "pretypecheck": "npm run build:deps",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint .",
@@ -44,5 +46,13 @@
   },
   "engines": {
     "node": "^24.3.0"
+  },
+  "codegenConfig": {
+    "name": "MansarDriverSpec",
+    "type": "modules",
+    "jsSrcsDir": "src/specs",
+    "android": {
+      "javaPackageName": "com.mansar.driver.specs"
+    }
   }
 }

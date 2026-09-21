@@ -7,28 +7,37 @@ import {
   createSessionManager,
   type SessionManager,
 } from './src/auth/session-manager';
-import { API_BASE_URL } from './src/config/api';
+import { getApiBaseUrl } from './src/config/api';
 import {
   BootstrapErrorScreen,
   BootstrapScreen,
 } from './src/screens/BootstrapScreen';
 import { DriverHomeScreen } from './src/screens/DriverHomeScreen';
 import { LoginScreen } from './src/screens/LoginScreen';
+import { UnconfiguredBuildScreen } from './src/screens/UnconfiguredBuildScreen';
 
 /**
  * Driver app root: one session manager for the process, one screen per
  * authentication state. Nothing renders as authenticated until the API has
  * confirmed a DRIVER identity (login response or `/auth/me` after restore).
+ *
+ * The API endpoint is fixed by the Android build type. A build without a
+ * usable endpoint (release, until a production endpoint is approved) gets
+ * no session manager and no API client at all: it fails closed.
  */
 
-let defaultSession: SessionManager | null = null;
+let defaultSession: SessionManager | null | undefined;
 
-function getDefaultSession(): SessionManager {
-  if (defaultSession === null) {
-    defaultSession = createSessionManager({
-      authApi: createAuthApi(createApiClientConfig(API_BASE_URL)),
-      secretStore: createKeychainSecretStore(),
-    });
+function getDefaultSession(): SessionManager | null {
+  if (defaultSession === undefined) {
+    const apiBaseUrl = getApiBaseUrl();
+    defaultSession =
+      apiBaseUrl === null
+        ? null
+        : createSessionManager({
+            authApi: createAuthApi(createApiClientConfig(apiBaseUrl)),
+            secretStore: createKeychainSecretStore(),
+          });
   }
   return defaultSession;
 }
@@ -47,16 +56,29 @@ function Root() {
   }
 }
 
-function App({ session }: { readonly session?: SessionManager }) {
-  const active = session ?? getDefaultSession();
+/** The app once a session manager exists; hooks run unconditionally here. */
+function ConfiguredApp({ session }: { readonly session: SessionManager }) {
   useEffect(() => {
-    void active.bootstrap();
-  }, [active]);
+    void session.bootstrap();
+  }, [session]);
   return (
-    <AuthProvider session={active}>
+    <AuthProvider session={session}>
       <Root />
     </AuthProvider>
   );
+}
+
+function App({ session }: { readonly session?: SessionManager }) {
+  const active = session ?? getDefaultSession();
+  if (active === null) {
+    return <UnconfiguredBuildScreen />;
+  }
+  return <ConfiguredApp session={active} />;
+}
+
+/** Test hook: forget the lazily created default session. */
+export function resetDefaultSessionForTests(): void {
+  defaultSession = undefined;
 }
 
 export default App;

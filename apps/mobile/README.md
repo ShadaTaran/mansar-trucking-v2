@@ -62,22 +62,44 @@ AsyncStorage must never hold credentials; an ESLint rule scoped to
 `react-native-keychain` is linked through React Native autolinking; no manual
 registration in `MainApplication.kt`.
 
-## API base URL (development)
+## API endpoint per build variant
 
-`src/config/api.ts` points the app at `http://10.0.2.2:3001`, the Android
-emulator's alias for the host machine, where the API runs locally on port
-3001 (`npm run start:dev -w @mansar/api`). Plain HTTP is permitted in debug
-builds only.
+The API base URL is build-time configuration (never a secret, never
+user-editable). Each Android build type fixes `BuildConfig.MANSAR_API_BASE_URL`
+in `android/app/build.gradle`; the small `MansarConfig` native module
+(`android/app/src/main/java/com/mansar/driver/config/`, spec
+`src/specs/NativeMansarConfig.ts`) hands it to JavaScript, and
+`src/config/api.ts` validates it:
 
-For a physical device connected over USB, forward the port instead and change
-the URL to `http://127.0.0.1:3001`:
+| Variant   | Endpoint                                    | App id                      | Cleartext | JS bundle      | Signing             |
+| --------- | ------------------------------------------- | --------------------------- | --------- | -------------- | ------------------- |
+| `debug`   | `http://10.0.2.2:3001`                      | `com.mansar.driver`         | allowed   | Metro (dev)    | automatic debug key |
+| `staging` | `https://mansar-api-staging.up.railway.app` | `com.mansar.driver.staging` | disabled  | bundled in APK | automatic debug key |
+| `release` | _empty_ → fails closed                      | `com.mansar.driver`         | disabled  | bundled in APK | none (unsigned)     |
+
+The resolver accepts an HTTPS origin, or plain HTTP only for the local
+development hosts (`10.0.2.2`, `127.0.0.1`, `localhost`); anything else —
+empty, malformed, a path/query/fragment/credentials, plain HTTP to a public
+host — resolves to nothing and the app renders "This build has no API
+endpoint configured." without creating a session, API client or network
+request. There is no production endpoint yet, so `release` fails closed on
+purpose; it also stays unsigned until the release stage.
+
+Debug and staging install side by side (different application ids). Android
+sandboxes Keystore/Keychain storage per application, so the fixed Keychain
+service `com.mansar.driver.auth.refresh` needs no change and the two installs
+never share a refresh token.
+
+### Local debug (unchanged)
+
+`npm run android -w @mansar/mobile` builds and installs the debug app; the
+Android emulator reaches the host's API at `http://10.0.2.2:3001`
+(`npm run start:dev -w @mansar/api`). For a physical device over USB, forward
+the port and use `http://127.0.0.1:3001` in the debug `buildConfigField`:
 
 ```bash
 adb reverse tcp:3001 tcp:3001
 ```
-
-There is no production URL or deployment yet; the base URL is configuration,
-not a secret, and no credential is built into the app.
 
 On an Android 17 emulator the debug app must hold the local-network runtime
 permission (`ACCESS_LOCAL_NETWORK`, prompted by React Native's dev tooling as
@@ -87,6 +109,33 @@ and the API unreachable from the app. Accept the prompt, or grant it once:
 ```bash
 adb shell pm grant com.mansar.driver android.permission.ACCESS_LOCAL_NETWORK
 ```
+
+### Staging
+
+```bash
+npm run android:staging -w @mansar/mobile
+```
+
+runs `react-native run-android --mode staging --appIdSuffix staging
+--no-packager`: builds the `staging` variant (its Hermes bundle is created
+by Gradle, so no Metro is needed at runtime), installs
+`com.mansar.driver.staging` and launches it against the staging API over
+HTTPS. The native APK alone:
+
+```bash
+cd apps/mobile/android && .\gradlew.bat assembleStaging
+```
+
+→ `android/app/build/outputs/apk/staging/app-staging.apk` (git-ignored;
+never commit build output). The public Railway host needs no local-network
+permission.
+
+Note for existing checkouts: the app's own codegen spec (`src/specs/`) is
+compiled into `libappmodules.so` from a CMake source glob. A native build
+configured before the spec existed keeps a stale graph and the module is
+then missing at runtime ("'MansarConfig' could not be found"). Run
+`.\gradlew.bat clean` (or delete `android/app/.cxx`) once after pulling
+this change; fresh clones and CI are unaffected.
 
 ## Testing
 

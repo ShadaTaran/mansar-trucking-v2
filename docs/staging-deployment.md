@@ -115,6 +115,19 @@ traffic only when PostgreSQL is reachable.
 `next start` on Railway's `PORT` is the accepted deployment; `standalone`
 output is not used unless the platform proves it necessary.
 
+## 5a. Mobile staging build (`apps/mobile`)
+
+The driver app is not a Railway service. Its `staging` Android build type
+(`android/app/build.gradle`) fixes the API endpoint at build time through
+`BuildConfig.MANSAR_API_BASE_URL = https://mansar-api-staging.up.railway.app`,
+installs as `com.mansar.driver.staging` beside the local debug app, carries
+its own JS bundle, is non-debuggable, disables cleartext traffic and is
+signed with the automatic debug keystore (never distributed). Build and run
+with `npm run android:staging -w @mansar/mobile` or
+`gradlew assembleStaging`; details in `apps/mobile/README.md`. The `release`
+build type has an empty endpoint and fails closed until a production
+endpoint is approved.
+
 ## 6. Environment variables
 
 Values are set in Railway's service variables. **Secrets are never written
@@ -263,7 +276,7 @@ Web (ADMIN)
 - [ ] unsafe request with a foreign `Origin` → 403 `invalid_origin`
 - [ ] no token in `document.cookie`, `localStorage`, `sessionStorage`
 
-Mobile (DRIVER, staging build, HTTPS)
+Mobile (DRIVER, `staging` build variant, HTTPS)
 
 - [ ] login → authenticated placeholder
 - [ ] force-stop + relaunch → session restored (old session `ROTATED`, new `ACTIVE`)

@@ -77,3 +77,5 @@ the git-ignored `dist/` directories as a side effect; `build` does the same.
   migrations, integration tests
 - [Authentication](docs/authentication.md): API endpoints, tokens, refresh
   sessions, local secret setup, first admin, admin web BFF, driver mobile app
+- [Staging deployment](docs/staging-deployment.md): Railway staging topology,
+  service settings, environment variables, migration order, smoke checklist

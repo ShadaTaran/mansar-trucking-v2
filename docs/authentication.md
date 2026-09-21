@@ -128,6 +128,24 @@ duplicate email, requires an interactive terminal for the hidden prompt, and
 never prints the password or hash. Use synthetic identities for anything
 public (`@example.test`).
 
+### Synthetic DRIVER login (staging / development)
+
+The driver app needs a DRIVER identity to sign in with. Create one the same
+way:
+
+```bash
+npm run driver:create -w @mansar/api
+```
+
+Same prompts, policy, normalization, hashing, duplicate handling and TTY
+requirement as `admin:create`; the role is fixed to DRIVER by the command and
+cannot be chosen. It creates a **login identity only** — a `users` row —
+not an operational driver record (ADR 0002: a login is not a driver; that
+entity arrives with trip management). No session or token is created. The
+audit row is `user.created` with `source: driver_cli`, `role: DRIVER`. Use
+`@example.test` identities only; there is no other way to create a DRIVER
+account before user management exists.
+
 ## 7. Password policy
 
 - New passwords: 15–128 Unicode code points after NFC normalization; no
@@ -169,7 +187,7 @@ server id. Auth audit events:
 | `auth.refresh.reuse_detected` | none          | affected user | `familyId`, `sessionId`, `revokedCount`                              |
 | `auth.logout`                 | session owner | the user      | `sessionId`, `familyId`                                              |
 | `auth.logout_all`             | the user      | the user      | `revokedCount`                                                       |
-| `user.created`                | none (CLI)    | new user      | `source`, `role`                                                     |
+| `user.created`                | none (CLI)    | new user      | `source` (`admin_cli` / `driver_cli`), `role`                        |
 | `user.password_reset`         | the admin     | target user   | `revokedCount`                                                       |
 
 Routine successful refreshes are not audited. Audit metadata never contains

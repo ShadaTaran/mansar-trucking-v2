@@ -20,6 +20,8 @@
     "db:test:status": "node scripts/test-db-migrate.mjs status",
     "preadmin:create": "npm run build",
     "admin:create": "node dist/cli/create-admin.js",
+    "predriver:create": "npm run build",
+    "driver:create": "node dist/cli/create-driver.js",
     "prebuild": "npm run build:deps",
     "build": "nest build",
     "prestart": "npm run build:deps",

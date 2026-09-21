@@ -27,11 +27,15 @@ export interface Actor {
   readonly role: UserRole;
 }
 
+/** Trusted CLI entry points that may create login identities. */
+export type UserCreationSource = 'admin_cli' | 'driver_cli';
+
 /**
  * User-management primitives available before any user-management HTTP
- * surface exists: the initial ADMIN bootstrap (CLI) and the admin password
- * reset (future endpoint). There is no self-registration and no self-service
- * reset. Argon2 work happens before each transaction.
+ * surface exists: the initial ADMIN bootstrap (CLI), the synthetic DRIVER
+ * login for staging (CLI) and the admin password reset (future endpoint).
+ * There is no self-registration and no self-service reset. Argon2 work
+ * happens before each transaction.
  */
 @Injectable()
 export class UsersService {
@@ -45,9 +49,37 @@ export class UsersService {
    * Creates an ADMIN login. Refuses a duplicate normalized email without
    * touching the existing row. Audited as `user.created` with no actor.
    */
-  async createInitialAdmin(input: {
+  createInitialAdmin(input: {
     readonly email: string;
     readonly password: string;
+  }): Promise<CreatedUser> {
+    return this.createLogin({ ...input, role: 'ADMIN', source: 'admin_cli' });
+  }
+
+  /**
+   * Creates a DRIVER login identity only: a `User` row with role DRIVER and
+   * nothing else. No operational driver record exists yet (ADR 0002: a login
+   * is not a driver); Stage 4 introduces that entity. Audited as
+   * `user.created` with no actor.
+   */
+  createDriverLogin(input: {
+    readonly email: string;
+    readonly password: string;
+  }): Promise<CreatedUser> {
+    return this.createLogin({ ...input, role: 'DRIVER', source: 'driver_cli' });
+  }
+
+  /**
+   * Shared creation primitive. The role is fixed by the trusted caller above,
+   * never taken from user input. The user row and its audit row commit in
+   * one transaction; a duplicate normalized email leaves the existing row
+   * untouched.
+   */
+  private async createLogin(input: {
+    readonly email: string;
+    readonly password: string;
+    readonly role: UserRole;
+    readonly source: UserCreationSource;
   }): Promise<CreatedUser> {
     const email = normalizeEmail(input.email);
     const passwordHash = await hashPassword(input.password);
@@ -55,7 +87,7 @@ export class UsersService {
     try {
       return await this.prisma.$transaction(async (tx) => {
         const user = await tx.user.create({
-          data: { email, passwordHash, role: 'ADMIN' },
+          data: { email, passwordHash, role: input.role },
           select: { id: true, email: true, role: true },
         });
         await this.audit.record(
@@ -66,7 +98,7 @@ export class UsersService {
             entityType: 'user',
             entityId: user.id,
             requestId: null,
-            metadata: { source: 'admin_cli', role: user.role },
+            metadata: { source: input.source, role: user.role },
           },
           tx,
         );

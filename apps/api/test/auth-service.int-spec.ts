@@ -512,6 +512,67 @@ describe('auth orchestration integration (mansar_test)', () => {
     );
   });
 
+  it('O. driver login (CLI primitive): normalized email, DRIVER only, audit driver_cli, no session, duplicate refused', async () => {
+    const driverEmail = `${PREFIX}staging-driver@example.test`;
+    const driver = await users.createDriverLogin({
+      email: ` ${PREFIX}Staging-Driver@Example.TEST `,
+      password: 'synthetic staging driver pw',
+    });
+    expect(driver).toEqual({
+      id: driver.id,
+      email: driverEmail,
+      role: 'DRIVER',
+    });
+    const stored = await prisma.user.findUniqueOrThrow({
+      where: { id: driver.id },
+      select: { role: true, isActive: true, passwordHash: true },
+    });
+    expect(stored.role).toBe('DRIVER');
+    expect(stored.isActive).toBe(true);
+    expect(parsePhc(stored.passwordHash)).toMatchObject(PASSWORD_HASH_PARAMS);
+    await expect(
+      verifyPassword('synthetic staging driver pw', stored.passwordHash),
+    ).resolves.toBe(true);
+    expect(await activeSessions(driver.id)).toBe(0);
+    expect(
+      await prisma.refreshSession.count({ where: { userId: driver.id } }),
+    ).toBe(0);
+    const rows = await audits(AUDIT_USER_CREATED, driver.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      actorUserId: null,
+      actorRole: null,
+      requestId: null,
+    });
+    expect(rows[0]!.metadata).toEqual({ source: 'driver_cli', role: 'DRIVER' });
+    expect(JSON.stringify(rows)).not.toContain('synthetic staging driver pw');
+    expect(JSON.stringify(rows)).not.toContain(stored.passwordHash);
+
+    await expect(
+      users.createDriverLogin({
+        email: driverEmail.toUpperCase(),
+        password: 'another synthetic password',
+      }),
+    ).rejects.toThrow(DuplicateEmailError);
+    expect(await prisma.user.count({ where: { email: driverEmail } })).toBe(1);
+    expect(await audits(AUDIT_USER_CREATED, driver.id)).toHaveLength(1);
+
+    // The identity works for the mobile client and is refused nothing else.
+    const login = await auth.login(
+      {
+        email: driverEmail,
+        password: 'synthetic staging driver pw',
+        client: 'MOBILE',
+      },
+      REQUEST_ID,
+    );
+    expect(login.user).toEqual({
+      id: driver.id,
+      email: driverEmail,
+      role: 'DRIVER',
+    });
+  });
+
   it('N. initial admin: normalized email, valid hash, audit, duplicate refused', async () => {
     const admin = await users.createInitialAdmin({
       email: ` ${PREFIX}Admin@Example.TEST `,

@@ -137,13 +137,14 @@ or GitHub Actions.** The example files (`apps/api/.env.example`,
 
 ### API
 
-| Variable                    | Class    | Staging value                                                |
-| --------------------------- | -------- | ------------------------------------------------------------ |
-| `DATABASE_URL`              | secret   | reference to the Railway PostgreSQL service variable         |
-| `JWT_ACCESS_SECRET`         | secret   | freshly generated for staging (base64url, ≥ 32 random bytes) |
-| `TRUST_PROXY_HOPS`          | config   | the verified ingress hop count — see §7                      |
-| `PORT`                      | platform | injected by Railway; not set manually                        |
-| `RAILPACK_NODE_NPM_INSTALL` | build    | `npm ci`                                                     |
+| Variable                      | Class    | Staging value                                                                               |
+| ----------------------------- | -------- | ------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`                | secret   | reference to the Railway PostgreSQL service variable                                        |
+| `JWT_ACCESS_SECRET`           | secret   | freshly generated for staging (base64url, ≥ 32 random bytes)                                |
+| `TRUST_PROXY_HOPS`            | config   | `0`, deliberately — see §7                                                                  |
+| `RATE_LIMIT_CLIENT_IP_SOURCE` | config   | `railway-x-real-ip` once the §7 live verification has passed; unset (= `socket`) until then |
+| `PORT`                        | platform | injected by Railway; not set manually                                                       |
+| `RAILPACK_NODE_NPM_INSTALL`   | build    | `npm ci`                                                                                    |
 
 `TEST_DATABASE_URL` is local/CI only and is not set in staging.
 
@@ -167,26 +168,75 @@ learn the API origin or hold a bearer token. Both hosts must be HTTPS:
 `WEB_ORIGIN` is compared exactly against the browser's `Origin`, and the
 auth cookies are `Secure` whenever `NODE_ENV` is not `development`.
 
-## 7. Trusted proxy (`TRUST_PROXY_HOPS`)
+## 7. Rate-limit client identity (`RATE_LIMIT_CLIENT_IP_SOURCE`, `TRUST_PROXY_HOPS`)
 
-Login and refresh rate limiting key on the client IP that Express derives
-from `X-Forwarded-For` for the configured number of trusted hops. The value
-is **not** hard-coded anywhere and no provider hop count is assumed:
+Login and refresh rate limiting key on a client identity chosen by
+`RATE_LIMIT_CLIENT_IP_SOURCE` (`apps/api/src/config/rate-limit-client-ip.ts`,
+`apps/api/src/auth/client-ip-tracker.ts`). It is a closed enumeration: no
+header name can be made trusted through configuration.
 
-> `TRUST_PROXY_HOPS` must be determined and verified against the actual
-> deployed Railway ingress path.
+| Value               | Tracker                                                                    | Where                               |
+| ------------------- | -------------------------------------------------------------------------- | ----------------------------------- |
+| `socket` (default)  | Express `req.ip`, normalised (IPv6 to its /64) — the package default       | local development, CI               |
+| `railway-x-real-ip` | the single `X-Real-IP` header value, validated with `net.isIP`, normalised | Railway staging, after verification |
 
-Too low and every client shares the proxy's address (one throttle bucket for
-everyone); too high and a client can spoof its identity with a forged
-forwarded header. The staging smoke test therefore proves both:
+With `railway-x-real-ip`, a request whose `X-Real-IP` is missing, empty,
+malformed, repeated/joined (`a, b`) or otherwise ambiguous is counted in one
+constant shared bucket (`untrusted-client`). There is no fallback to the
+socket address and caller input never becomes a key: the failure mode is
+over-throttling, never a fresh bucket.
 
-- login attempts from client A and client B do **not** collapse into one
-  throttle bucket;
-- a client-supplied spoofed forwarded-IP header does not trivially change
-  the limiter identity.
+**Why not a trusted hop count.** `TRUST_PROXY_HOPS` is Express `trust proxy`
+and stays `0` on Railway, deliberately. Stage 3F.5 measured the limiter on
+staging with `0`: ten `{}` login requests from one unchanged public address
+did not accumulate (`X-RateLimit-Remaining` kept resetting to 9), an 11th
+same-network request was still `400` rather than `429`, while Railway's own
+HTTP logs recorded one stable `srcIp` for that network. The socket peer the
+API sees behind Railway's edge is therefore not a client identity. A hop
+count would not fix that either: Railway documents `X-Real-IP` as the header
+"for identifying client's remote IP" but does not list `X-Forwarded-For`, its
+chain shape has been observed to change over time, and Express's numeric
+trust picks a fixed position in that chain. Client identity on Railway is
+taken from `X-Real-IP` explicitly, and the previous guidance to "verify a hop
+count" is withdrawn.
 
-If correct operation on the platform turned out to require a different proxy
-trust model, that is a reviewed change to the API, not a configuration tweak.
+**What Railway does and does not promise.** Its networking specs identify
+`X-Real-IP` as the remote client IP; they do not document whether a
+caller-supplied `X-Real-IP` is replaced, and nothing is signed. The header
+is only usable because the edge is the sole path to the API's public domain
+and the private network carries no untrusted peers. Whether the edge
+replaces a forged value must be **proven by the staged smoke below, not
+assumed** — until it has passed, staging keeps the variable unset (`socket`)
+and this section is _pending live verification_.
+
+**Web BFF path — not verified.** The web service calls the API's public
+domain (`API_INTERNAL_URL`), so once `railway-x-real-ip` is enabled Railway
+may attach an `X-Real-IP` representing the web service's outbound identity.
+Whether that value is stable across requests is NOT VERIFIED. For staging a
+single stable shared bucket for all browser logins is acceptable; a bucket
+that rotates per request is not, and the BFF check below exists to tell the
+two apart. The BFF sends no client-IP header of its own: `callNest` in
+`apps/web/src/lib/server/nest-api.ts` sets only `Accept`, `Content-Type` and
+the bearer.
+
+**Live verification (Stage 3F.6, `{}` bodies only, no credentials, no
+`/auth/refresh` load).** Deploy the code with the variable unset (no
+behaviour change), then set `RATE_LIMIT_CLIENT_IP_SOURCE=railway-x-real-ip`
+and prove, after 70 s of idle:
+
+- direct API path: network A sends 10 → all `400` with `remaining` 9→0; the
+  11th from A → `429`; a genuinely different network B in the same window →
+  `400` with `remaining: 9`; from A, a forged `X-Real-IP` and a forged
+  `X-Forwarded-For` → still `429` (no fresh bucket: the edge replaced them);
+- BFF path: repeated same-origin `POST /api/auth/login` with
+  `{"email":"","password":""}` (passes the BFF's shape check, fails Nest
+  validation, can never create a session) → `400 invalid_request` ten times,
+  then `429 too_many_requests` — proving the BFF bucket accumulates;
+- recovery: `/health` → `200`, and one `{}` login → `400` after the window.
+
+Any other reading — B throttled with A, an 11th `400` from A, a forged
+header answered `400`, or a BFF 11th still `400` — means stop and roll back
+by removing the variable (redeploys with `socket`, i.e. today's behaviour).
 
 ## 8. Database
 
@@ -290,10 +340,14 @@ Cross-role
 - [ ] ADMIN rejected by the mobile app (session revoked)
 - [ ] DRIVER rejected by the admin web app (403, no cookies)
 
-Proxy
+Rate-limit client identity (§7; pending live verification)
 
-- [ ] distinct external clients have distinct throttle identities
-- [ ] forwarded-IP spoof attempt does not bypass the limiter
+- [ ] `TRUST_PROXY_HOPS=0`, `RATE_LIMIT_CLIENT_IP_SOURCE=railway-x-real-ip`
+- [ ] one external network: 10 `{}` logins → `400`, `remaining` 9→0; 11th → `429`
+- [ ] a different external network in the same window → `400`, `remaining: 9`
+- [ ] forged `X-Real-IP` and forged `X-Forwarded-For` do not obtain a fresh bucket
+- [ ] BFF `POST /api/auth/login` with `{"email":"","password":""}` accumulates: 10 × `400`, then `429`
+- [ ] after the window: `/health` `200`, one `{}` login `400`
 
 Auth failure
 

@@ -96,6 +96,7 @@ intentionally; presenting those tokens is simply rejected.
 ```
 JWT_ACCESS_SECRET=<your private value>
 TRUST_PROXY_HOPS=0
+RATE_LIMIT_CLIENT_IP_SOURCE=socket
 ```
 
 Generate the secret yourself and paste the output into `.env`:
@@ -109,9 +110,15 @@ at least 32 bytes. Never commit it, paste it into chat or put it in
 documentation; `.env.example` holds a placeholder only. Automated tests
 generate their own throwaway secret and never read yours.
 
-`TRUST_PROXY_HOPS` is the number of reverse-proxy hops whose
-`X-Forwarded-For` may be trusted for client IPs (0–10). Keep `0` locally;
-a deployment sets the verified count for its topology.
+`TRUST_PROXY_HOPS` is Express `trust proxy`: the number of reverse-proxy
+hops whose `X-Forwarded-For` is trusted when computing `req.ip` (0–10).
+Keep `0` locally; the Railway staging deployment also keeps `0`,
+deliberately (see §8 and `docs/staging-deployment.md` §7).
+
+`RATE_LIMIT_CLIENT_IP_SOURCE` chooses the client identity the login/refresh
+rate limiter keys on: `socket` (unset/empty is the same) or
+`railway-x-real-ip`. Any other value — including a bare header name — is a
+startup error. Keep `socket` locally and in CI.
 
 ## 6. Creating the first admin
 
@@ -165,14 +172,38 @@ account before user management exists.
 ## 8. Rate limiting
 
 `@nestjs/throttler` with in-memory storage, bound only to the two
-credential-guessing endpoints, keyed by client IP:
+credential-guessing endpoints, keyed by a client identity (the throttler
+"tracker"):
 
 - `POST /auth/login`: 10 requests / 60 s
 - `POST /auth/refresh`: 60 requests / 60 s
 
-Limits count every request, including ones that fail validation. Storage is
-per process: this is a single-instance limit, not a distributed one, and
-correct client IPs behind a proxy depend on `TRUST_PROXY_HOPS`.
+Limits count every request, including ones that fail validation (the guard
+runs before the validation pipe). Storage is per process: this is a
+single-instance limit, not a distributed one. Login and refresh buckets are
+independent; no other route is throttled.
+
+The tracker is selected once at bootstrap by `RATE_LIMIT_CLIENT_IP_SOURCE`
+(`src/config/rate-limit-client-ip.ts`, `src/auth/client-ip-tracker.ts`) and
+wired through `ThrottlerModule.forRootAsync`'s module-level `getTracker`;
+`AuthController` and the limits are untouched by it:
+
+| Source              | Tracker                                                                                    |
+| ------------------- | ------------------------------------------------------------------------------------------ |
+| `socket` (default)  | `normalizeIp(req.ip, 64)` — the package default: IPv4 as-is, IPv6 aggregated to its /64    |
+| `railway-x-real-ip` | `req.headers['x-real-ip']` only: one string, one valid IP (`net.isIP`), then `normalizeIp` |
+
+Under `railway-x-real-ip` a missing, empty, malformed, repeated/joined or
+array-valued header resolves to the constant `untrusted-client` tracker, so
+all such requests share one bucket. Nothing falls back to `req.ip`, nothing
+derived from caller input becomes a key, and no header or address is logged.
+The header is trusted only because, on Railway, the edge is the sole path
+to the API's public domain and its networking specs identify `X-Real-IP` as
+the remote client IP; Railway does not document spoof/overwrite semantics,
+so that property is established by the staging smoke, not assumed (see
+`docs/staging-deployment.md` §7 — pending live verification). In the local
+test harness a caller-supplied `X-Real-IP` _is_ the tracker, which is what
+the e2e tests exercise.
 
 ## 9. Request ids and audit
 

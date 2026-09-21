@@ -454,7 +454,7 @@ describe('auth HTTP contracts (e2e, DB-free)', () => {
 });
 
 describe('rate limiting (e2e, DB-free, fresh app per case)', () => {
-  async function fresh() {
+  async function fresh(rateLimitClientIpSource?: string) {
     const auth = makeAuthStub();
     auth.login.mockResolvedValue({
       accessToken: 'a',
@@ -474,7 +474,11 @@ describe('rate limiting (e2e, DB-free, fresh app per case)', () => {
       email: LOGIN.email,
       role: 'ADMIN',
     });
-    const app = await createTestApp({ prisma: {}, authService: auth });
+    const app = await createTestApp({
+      prisma: {},
+      authService: auth,
+      rateLimitClientIpSource,
+    });
     return { app, auth };
   }
 
@@ -538,6 +542,262 @@ describe('rate limiting (e2e, DB-free, fresh app per case)', () => {
     } finally {
       await app.close();
     }
+  });
+
+  // RFC 5737 / RFC 3849 documentation addresses; never real clients.
+  const CLIENT_A = '203.0.113.10';
+  const CLIENT_B = '203.0.113.11';
+  const CLIENT_C = '203.0.113.12';
+  const CLIENT_V6 = '2001:db8:1:2:aaaa::1';
+  const CLIENT_V6_SAME_64 = '2001:db8:1:2:bbbb::1';
+  const CLIENT_V6_OTHER_64 = '2001:db8:1:3::1';
+
+  function login(app: INestApplication, headers: Record<string, string> = {}) {
+    return request(app.getHttpServer())
+      .post('/auth/login')
+      .set(headers)
+      .send(LOGIN);
+  }
+
+  function refresh(
+    app: INestApplication,
+    headers: Record<string, string> = {},
+  ) {
+    return request(app.getHttpServer())
+      .post('/auth/refresh')
+      .set(headers)
+      .send({ refreshToken: REFRESH_TOKEN });
+  }
+
+  describe('socket source (default): caller headers never matter', () => {
+    it('rotating X-Real-IP and X-Forwarded-For values share the socket bucket', async () => {
+      const { app } = await fresh();
+      try {
+        for (let i = 0; i < 10; i += 1) {
+          const res = await login(app, {
+            'X-Real-IP': `203.0.113.${i + 1}`,
+            'X-Forwarded-For': `198.51.100.${i + 1}`,
+          }).expect(200);
+          expect(res.headers['x-ratelimit-remaining']).toBe(String(9 - i));
+        }
+        await login(app, {
+          'X-Real-IP': '203.0.113.99',
+          'X-Forwarded-For': '198.51.100.99',
+        }).expect(429);
+      } finally {
+        await app.close();
+      }
+    });
+
+    it('an explicit "socket" value behaves exactly like unset', async () => {
+      const { app } = await fresh('socket');
+      try {
+        for (let i = 0; i < 10; i += 1) {
+          await login(app, { 'X-Real-IP': CLIENT_A }).expect(200);
+        }
+        await login(app, { 'X-Real-IP': CLIENT_B }).expect(429);
+      } finally {
+        await app.close();
+      }
+    });
+  });
+
+  describe('railway-x-real-ip source', () => {
+    const ambientSource = process.env.RATE_LIMIT_CLIENT_IP_SOURCE;
+
+    async function freshRailway() {
+      const created = await fresh('railway-x-real-ip');
+      // The harness must not leave its setting behind for later apps.
+      expect(process.env.RATE_LIMIT_CLIENT_IP_SOURCE).toBe(ambientSource);
+      return created;
+    }
+
+    it('same trusted IP: 1-10 allowed (remaining 9→0), the 11th is 429 with Retry-After', async () => {
+      const { app } = await freshRailway();
+      try {
+        for (let i = 0; i < 10; i += 1) {
+          const res = await login(app, { 'X-Real-IP': CLIENT_A }).expect(200);
+          expect(res.headers['x-ratelimit-limit']).toBe('10');
+          expect(res.headers['x-ratelimit-remaining']).toBe(String(9 - i));
+        }
+        const blocked = await login(app, { 'X-Real-IP': CLIENT_A }).expect(429);
+        expect(blocked.body.statusCode).toBe(429);
+        expect(blocked.headers['retry-after']).toMatch(/^\d+$/);
+      } finally {
+        await app.close();
+      }
+    });
+
+    it('a second trusted IP has an independent bucket', async () => {
+      const { app } = await freshRailway();
+      try {
+        for (let i = 0; i < 10; i += 1) {
+          await login(app, { 'X-Real-IP': CLIENT_A }).expect(200);
+        }
+        await login(app, { 'X-Real-IP': CLIENT_A }).expect(429);
+        const other = await login(app, { 'X-Real-IP': CLIENT_B }).expect(200);
+        expect(other.headers['x-ratelimit-remaining']).toBe('9');
+        await login(app, { 'X-Real-IP': CLIENT_A }).expect(429);
+      } finally {
+        await app.close();
+      }
+    });
+
+    it('changing X-Forwarded-For never changes the bucket', async () => {
+      const { app } = await freshRailway();
+      try {
+        for (let i = 0; i < 10; i += 1) {
+          await login(app, {
+            'X-Real-IP': CLIENT_A,
+            'X-Forwarded-For': `198.51.100.${i + 1}`,
+          }).expect(200);
+        }
+        await login(app, {
+          'X-Real-IP': CLIENT_A,
+          'X-Forwarded-For': '198.51.100.99, 198.51.100.100',
+        }).expect(429);
+      } finally {
+        await app.close();
+      }
+    });
+
+    it('a different caller-supplied X-Real-IP is a different tracker here: the harness has no edge in front of it, so Railway overwriting the header is proven by the staging smoke, not by this test', async () => {
+      const { app } = await freshRailway();
+      try {
+        for (let i = 0; i < 10; i += 1) {
+          await login(app, { 'X-Real-IP': CLIENT_A }).expect(200);
+        }
+        await login(app, { 'X-Real-IP': CLIENT_A }).expect(429);
+        const forged = await login(app, { 'X-Real-IP': CLIENT_C }).expect(200);
+        expect(forged.headers['x-ratelimit-remaining']).toBe('9');
+      } finally {
+        await app.close();
+      }
+    });
+
+    it('missing and malformed X-Real-IP share one untrusted bucket and never borrow req.ip', async () => {
+      const { app } = await freshRailway();
+      const malformed = [
+        '',
+        '   ',
+        'not-an-ip',
+        '203.0.113',
+        `${CLIENT_A}, ${CLIENT_B}`,
+      ];
+      try {
+        let hits = 0;
+        for (let i = 0; i < 5; i += 1) {
+          const res = await login(app).expect(200);
+          expect(res.headers['x-ratelimit-remaining']).toBe(String(9 - hits));
+          hits += 1;
+        }
+        for (const value of malformed) {
+          const res = await login(app, { 'X-Real-IP': value }).expect(200);
+          expect(res.headers['x-ratelimit-remaining']).toBe(String(9 - hits));
+          hits += 1;
+        }
+        await login(app).expect(429);
+        await login(app, { 'X-Real-IP': 'not-an-ip' }).expect(429);
+        // The socket peer (127.0.0.1) is not consulted: a trusted IP is
+        // still fresh, and the loopback address given as a header value is
+        // just another trusted value, not the untrusted bucket.
+        await login(app, { 'X-Real-IP': CLIENT_A }).expect(200);
+        await login(app, { 'X-Real-IP': '127.0.0.1' }).expect(200);
+      } finally {
+        await app.close();
+      }
+    });
+
+    it('aggregates IPv6 clients per /64 and unwraps IPv4-mapped addresses', async () => {
+      const { app } = await freshRailway();
+      try {
+        for (let i = 0; i < 10; i += 1) {
+          await login(app, {
+            'X-Real-IP': i % 2 === 0 ? CLIENT_V6 : CLIENT_V6_SAME_64,
+          }).expect(200);
+        }
+        await login(app, { 'X-Real-IP': CLIENT_V6 }).expect(429);
+        await login(app, { 'X-Real-IP': CLIENT_V6_OTHER_64 }).expect(200);
+
+        for (let i = 0; i < 10; i += 1) {
+          await login(app, { 'X-Real-IP': `::ffff:${CLIENT_B}` }).expect(200);
+        }
+        await login(app, { 'X-Real-IP': CLIENT_B }).expect(429);
+      } finally {
+        await app.close();
+      }
+    });
+
+    it('keeps login and refresh buckets independent per trusted IP', async () => {
+      const { app } = await freshRailway();
+      try {
+        for (let i = 0; i < 10; i += 1) {
+          await login(app, { 'X-Real-IP': CLIENT_A }).expect(200);
+        }
+        await login(app, { 'X-Real-IP': CLIENT_A }).expect(429);
+        const res = await refresh(app, { 'X-Real-IP': CLIENT_A }).expect(200);
+        expect(res.headers['x-ratelimit-limit']).toBe('60');
+        expect(res.headers['x-ratelimit-remaining']).toBe('59');
+      } finally {
+        await app.close();
+      }
+    });
+
+    it('refresh: 60 per minute per trusted IP, the 61st is 429, another IP is unaffected', async () => {
+      const { app } = await freshRailway();
+      try {
+        for (let i = 0; i < 60; i += 1) {
+          await refresh(app, { 'X-Real-IP': CLIENT_A }).expect(200);
+        }
+        await refresh(app, { 'X-Real-IP': CLIENT_A }).expect(429);
+        await refresh(app, { 'X-Real-IP': CLIENT_B }).expect(200);
+        // A refresh-exhausted client may still log in: separate bucket.
+        await login(app, { 'X-Real-IP': CLIENT_A }).expect(200);
+      } finally {
+        await app.close();
+      }
+    });
+
+    it('leaves health, logout, logout-all and me unthrottled, with or without the header', async () => {
+      const { app } = await freshRailway();
+      try {
+        const tokens = app.get(AccessTokenService);
+        const bearer = `Bearer ${await tokens.sign({ userId: USER_ID, role: 'ADMIN', sessionId: SESSION_ID })}`;
+        for (let i = 0; i < 70; i += 1) {
+          const headers = i % 2 === 0 ? { 'X-Real-IP': CLIENT_A } : {};
+          await request(app.getHttpServer())
+            .get('/health')
+            .set(headers)
+            .expect(200);
+          await request(app.getHttpServer())
+            .post('/auth/logout')
+            .set(headers)
+            .send({ refreshToken: REFRESH_TOKEN })
+            .expect(204);
+          await request(app.getHttpServer())
+            .get('/auth/me')
+            .set(headers)
+            .set('Authorization', bearer)
+            .expect(200);
+        }
+        await request(app.getHttpServer())
+          .post('/auth/logout-all')
+          .set('Authorization', bearer)
+          .expect(204);
+      } finally {
+        await app.close();
+      }
+    });
+
+    it.each(['x-real-ip', 'x-forwarded-for', 'Railway-X-Real-IP'])(
+      'refuses to start with RATE_LIMIT_CLIENT_IP_SOURCE=%s',
+      async (value) => {
+        await expect(fresh(value)).rejects.toThrow(
+          'RATE_LIMIT_CLIENT_IP_SOURCE',
+        );
+        expect(process.env.RATE_LIMIT_CLIENT_IP_SOURCE).toBe(ambientSource);
+      },
+    );
   });
 });
 

@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  DRIVER_STATUSES,
+  type DriverStatus,
   MANSAR_PACKAGE_PROBE,
   TRIP_STATUSES,
   type TripStatus,
+  VEHICLE_STATUSES,
+  type VehicleStatus,
 } from './index.js';
 
 describe('@mansar/types', () => {
@@ -22,6 +26,18 @@ describe('@mansar/types', () => {
   it('accepts a known TripStatus value', () => {
     const status: TripStatus = 'IN_PROGRESS';
     expect(TRIP_STATUSES).toContain(status);
+  });
+
+  it('exposes the two driver lifecycle states', () => {
+    expect(DRIVER_STATUSES).toEqual(['ACTIVE', 'INACTIVE']);
+    const status: DriverStatus = 'INACTIVE';
+    expect(DRIVER_STATUSES).toContain(status);
+  });
+
+  it('exposes the three frozen vehicle lifecycle states', () => {
+    expect(VEHICLE_STATUSES).toEqual(['ACTIVE', 'IN_MAINTENANCE', 'RETIRED']);
+    const status: VehicleStatus = 'IN_MAINTENANCE';
+    expect(VEHICLE_STATUSES).toContain(status);
   });
 
   it('exports the workspace probe constant', () => {

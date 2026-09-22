@@ -19,6 +19,8 @@ describe('database integration (mansar_test)', () => {
 
   async function cleanup(): Promise<void> {
     await prisma.auditLog.deleteMany({});
+    // Since Stage 4A a linked driver blocks its user's deletion (RESTRICT).
+    await prisma.driver.deleteMany({});
     await prisma.user.deleteMany({});
   }
 

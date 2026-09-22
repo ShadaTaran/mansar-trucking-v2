@@ -20,8 +20,8 @@ enum UserRole {
   @@map("user_role")
 }
 
-/// Authentication identity. Operational driver data lives in a later `drivers`
-/// table; no profile or business fields belong here.
+/// Authentication identity. Operational driver data lives in the `drivers`
+/// table (ADR 0002); no profile or business fields belong here.
 model User {
   id           String   @id @default(uuid(7)) @db.Uuid
   /// Canonical (normalized) login email; normalization is application logic.
@@ -35,8 +35,66 @@ model User {
 
   auditLogs       AuditLog[]       @relation("AuditLogActor")
   refreshSessions RefreshSession[]
+  /// The operational driver this login belongs to, if any (at most one).
+  driver          Driver?
 
   @@map("users")
+}
+
+/// Operational availability of a driver record; independent of the login's
+/// `is_active`.
+enum DriverStatus {
+  ACTIVE
+  INACTIVE
+
+  @@map("driver_status")
+}
+
+/// Frozen Stage 4 vehicle lifecycle.
+enum VehicleStatus {
+  ACTIVE
+  IN_MAINTENANCE
+  RETIRED
+
+  @@map("vehicle_status")
+}
+
+/// Operational driver (ADR 0002): may exist without a login; at most one login
+/// per driver and one driver per login. Rows are never hard-deleted; the
+/// lifecycle is `status`. A linked login cannot be deleted while linked.
+model Driver {
+  id            String       @id @default(uuid(7)) @db.Uuid
+  userId        String?      @unique(map: "drivers_user_id_key") @map("user_id") @db.Uuid
+  fullName      String       @map("full_name") @db.Text
+  phone         String       @db.Text
+  licenceNumber String       @map("licence_number") @db.Text
+  /// Calendar date (no time, no zone).
+  licenceExpiry DateTime?    @map("licence_expiry") @db.Date
+  status        DriverStatus @default(ACTIVE)
+  notes         String       @default("") @db.Text
+  createdAt     DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@map("drivers")
+}
+
+/// Fleet vehicle. `plate_number` is stored already normalized by the API
+/// (trim, collapse internal whitespace, upper-case) and is unique as stored.
+model Vehicle {
+  id              String        @id @default(uuid(7)) @db.Uuid
+  plateNumber     String        @unique(map: "vehicles_plate_number_key") @map("plate_number") @db.Text
+  make            String        @db.Text
+  model           String        @db.Text
+  year            Int
+  status          VehicleStatus @default(ACTIVE)
+  currentOdometer Int?          @map("current_odometer")
+  notes           String        @default("") @db.Text
+  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("vehicles")
 }
 
 /// Append-only record of significant actions. Survives actor deletion.

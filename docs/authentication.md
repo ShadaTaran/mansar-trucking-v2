@@ -200,10 +200,14 @@ derived from caller input becomes a key, and no header or address is logged.
 The header is trusted only because, on Railway, the edge is the sole path
 to the API's public domain and its networking specs identify `X-Real-IP` as
 the remote client IP; Railway does not document spoof/overwrite semantics,
-so that property is established by the staging smoke, not assumed (see
-`docs/staging-deployment.md` §7 — pending live verification). In the local
-test harness a caller-supplied `X-Real-IP` _is_ the tracker, which is what
-the e2e tests exercise.
+so that property was established empirically by the staging smoke, not
+assumed: forged `X-Real-IP` and `X-Forwarded-For` values stayed in the
+sender's exhausted bucket (`429`) while a second external network received
+its own fresh bucket (see `docs/staging-deployment.md` §7 — live-verified on
+API commit `b84861d1…`; an observation of the current platform, not a
+guarantee across future Railway changes). In the local test harness a
+caller-supplied `X-Real-IP` _is_ the tracker, which is what the e2e tests
+exercise.
 
 ## 9. Request ids and audit
 

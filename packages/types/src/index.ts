@@ -37,6 +37,42 @@ export const VEHICLE_STATUSES = [
 
 export type VehicleStatus = (typeof VEHICLE_STATUSES)[number];
 
+/** One page of a listing endpoint. */
+export interface Page<T> {
+  readonly items: readonly T[];
+  readonly page: number;
+  readonly pageSize: number;
+  readonly total: number;
+}
+
+/**
+ * The login account linked to a driver, as the drivers API exposes it.
+ * Never carries credentials, sessions or any other account internals.
+ */
+export interface DriverUser {
+  readonly id: string;
+  readonly email: string;
+  readonly isActive: boolean;
+}
+
+/**
+ * Operational driver as the API returns it. Dates are strings on the wire:
+ * `licenceExpiry` is a calendar date (`YYYY-MM-DD`), the timestamps are ISO
+ * 8601 in UTC.
+ */
+export interface Driver {
+  readonly id: string;
+  readonly fullName: string;
+  readonly phone: string;
+  readonly licenceNumber: string;
+  readonly licenceExpiry: string | null;
+  readonly status: DriverStatus;
+  readonly notes: string;
+  readonly user: DriverUser | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
 /**
  * Temporary workspace-resolution probe.
  *

@@ -7,6 +7,7 @@ import { AppModule } from '../../src/app.module.js';
 import { configureApp } from '../../src/app.setup.js';
 import { AuthService } from '../../src/auth/auth.service.js';
 import { PrismaService } from '../../src/database/prisma.service.js';
+import { DriversService } from '../../src/drivers/drivers.service.js';
 
 /**
  * DB-free HTTP harness. Installs a synthetic per-process JWT secret (never
@@ -28,6 +29,7 @@ const RATE_LIMIT_SOURCE_VAR = 'RATE_LIMIT_CLIENT_IP_SOURCE';
 export interface TestAppOptions {
   readonly prisma?: object;
   readonly authService?: object;
+  readonly driversService?: object;
   readonly trustProxyHops?: number;
   /** Raw RATE_LIMIT_CLIENT_IP_SOURCE value for this app; omitted = unset. */
   readonly rateLimitClientIpSource?: string;
@@ -51,6 +53,11 @@ export async function createTestApp(
       builder = builder
         .overrideProvider(AuthService)
         .useValue(options.authService);
+    }
+    if (options.driversService) {
+      builder = builder
+        .overrideProvider(DriversService)
+        .useValue(options.driversService);
     }
     const moduleRef = await builder.compile();
     const app = configureApp(moduleRef.createNestApplication(), {

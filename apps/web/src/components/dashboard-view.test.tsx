@@ -66,21 +66,19 @@ describe('DashboardView', () => {
     );
   });
 
-  it('logout posts to the BFF and returns to /login', async () => {
-    const calls = installFetch((url) =>
-      url === '/api/auth/logout'
-        ? new Response(null, { status: 204 })
-        : new Response(JSON.stringify(USER), { status: 200 }),
-    );
+  it('leaves the single-session logout to AdminNav', async () => {
+    installFetch(() => new Response(JSON.stringify(USER), { status: 200 }));
     render(
       <AuthBoundary>
         <DashboardView />
       </AuthBoundary>,
     );
-    fireEvent.click(await screen.findByRole('button', { name: 'Logout' }));
-    await waitFor(() => expect(replace).toHaveBeenCalledWith('/login'));
-    expect(calls).toContain('POST /api/auth/logout');
-    expect(refresh).toHaveBeenCalled();
+    await screen.findByText('admin@example.test');
+    // Exactly one logout control here, and it is the everywhere variant.
+    expect(screen.queryByRole('button', { name: 'Logout' })).toBeNull();
+    expect(
+      screen.getByRole('button', { name: 'Logout all sessions' }),
+    ).toBeInTheDocument();
   });
 
   it('logout-all goes through authenticatedFetch and returns to /login', async () => {
@@ -99,5 +97,6 @@ describe('DashboardView', () => {
     );
     await waitFor(() => expect(replace).toHaveBeenCalledWith('/login'));
     expect(calls).toContain('POST /api/auth/logout-all');
+    expect(refresh).toHaveBeenCalled();
   });
 });

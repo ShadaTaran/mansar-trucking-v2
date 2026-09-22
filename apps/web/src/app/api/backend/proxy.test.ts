@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildUpstreamUrl } from '@/lib/server/backend-proxy';
 import { ACCESS, REFRESH, bffRequest, installEnv, mockFetch } from '@/test/bff';
 
-import { DELETE, GET, POST } from './[...path]/route';
+import { DELETE, GET, PATCH, POST } from './[...path]/route';
 
 const ctx = (...path: string[]) => ({ params: Promise.resolve({ path }) });
 
@@ -160,6 +160,81 @@ describe('/api/backend/[...path]', () => {
     );
     expect(res.status).toBe(404);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('forwards the Stage 4 admin methods and paths unchanged', async () => {
+    const fetchMock = mockFetch(() => new Response(null, { status: 200 }));
+    const driverId = '019a0000-0000-7000-8000-00000000000d';
+    const vehicleId = '019a0000-0000-7000-8000-00000000000e';
+
+    await PATCH(
+      bffRequest(`/api/backend/drivers/${driverId}`, {
+        method: 'PATCH',
+        cookies: { mansar_at: ACCESS },
+        json: { phone: '0999' },
+      }),
+      ctx('drivers', driverId),
+    );
+    await POST(
+      bffRequest(`/api/backend/drivers/${driverId}/link-user`, {
+        cookies: { mansar_at: ACCESS },
+        json: { email: 'driver@example.test' },
+      }),
+      ctx('drivers', driverId, 'link-user'),
+    );
+    await POST(
+      bffRequest(`/api/backend/drivers/${driverId}/unlink-user`, {
+        cookies: { mansar_at: ACCESS },
+        json: {},
+      }),
+      ctx('drivers', driverId, 'unlink-user'),
+    );
+    await POST(
+      bffRequest(`/api/backend/vehicles/${vehicleId}/status`, {
+        cookies: { mansar_at: ACCESS },
+        json: { status: 'RETIRED' },
+      }),
+      ctx('vehicles', vehicleId, 'status'),
+    );
+    await GET(
+      bffRequest('/api/backend/vehicles?q=syn&status=ACTIVE&page=2', {
+        method: 'GET',
+        origin: null,
+        cookies: { mansar_at: ACCESS },
+      }),
+      ctx('vehicles'),
+    );
+
+    expect(
+      fetchMock.mock.calls.map(([url, init]) => `${init!.method} ${url}`),
+    ).toEqual([
+      `PATCH http://127.0.0.1:3001/drivers/${driverId}`,
+      `POST http://127.0.0.1:3001/drivers/${driverId}/link-user`,
+      `POST http://127.0.0.1:3001/drivers/${driverId}/unlink-user`,
+      `POST http://127.0.0.1:3001/vehicles/${vehicleId}/status`,
+      'GET http://127.0.0.1:3001/vehicles?q=syn&status=ACTIVE&page=2',
+    ]);
+  });
+
+  it('never forwards a browser-supplied client-IP header', async () => {
+    const fetchMock = mockFetch(() => new Response(null, { status: 200 }));
+    await GET(
+      bffRequest('/api/backend/drivers', {
+        method: 'GET',
+        origin: null,
+        cookies: { mansar_at: ACCESS },
+        headers: {
+          'x-real-ip': '203.0.113.10',
+          'x-forwarded-for': '203.0.113.10',
+          forwarded: 'for=203.0.113.10',
+        },
+      }),
+      ctx('drivers'),
+    );
+    const headers = fetchMock.mock.calls[0]![1]!.headers as Headers;
+    expect(headers.get('x-real-ip')).toBeNull();
+    expect(headers.get('x-forwarded-for')).toBeNull();
+    expect(headers.get('forwarded')).toBeNull();
   });
 
   it('network failure: safe 502 body', async () => {

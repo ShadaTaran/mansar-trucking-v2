@@ -9,7 +9,9 @@ import { useSessionUser } from './auth-boundary';
 
 /**
  * Stage 3D placeholder: proves an authenticated ADMIN session and offers
- * logout. Operational dashboard content arrives in a later stage.
+ * the logout-everywhere action. Signing out of this session alone lives in
+ * AdminNav, the one place that offers it. Operational dashboard content
+ * arrives in a later stage.
  */
 export function DashboardView() {
   const user = useSessionUser();
@@ -20,20 +22,6 @@ export function DashboardView() {
   const finish = () => {
     router.replace('/login');
     router.refresh();
-  };
-
-  const logout = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      // Always clears the browser cookies, whatever the API says.
-      await fetch('/api/auth/logout', {
-        method: 'POST',
-        credentials: 'same-origin',
-      });
-    } finally {
-      finish();
-    }
   };
 
   const logoutAll = async () => {
@@ -63,9 +51,6 @@ export function DashboardView() {
         Signed in as <strong>{user.email}</strong>
       </p>
       <p>
-        <button type="button" onClick={logout} disabled={busy}>
-          Logout
-        </button>{' '}
         <button type="button" onClick={logoutAll} disabled={busy}>
           Logout all sessions
         </button>

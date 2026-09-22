@@ -74,6 +74,23 @@ export interface Driver {
 }
 
 /**
+ * Fleet vehicle as the API returns it. `plateNumber` is the canonical
+ * normalized value the database stores; the timestamps are ISO 8601 in UTC.
+ */
+export interface Vehicle {
+  readonly id: string;
+  readonly plateNumber: string;
+  readonly make: string;
+  readonly model: string;
+  readonly year: number;
+  readonly status: VehicleStatus;
+  readonly currentOdometer: number | null;
+  readonly notes: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+/**
  * Temporary workspace-resolution probe.
  *
  * Consumed by other workspaces (api-client now; web/mobile once scaffolded)

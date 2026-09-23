@@ -76,6 +76,7 @@ model Driver {
   updatedAt     DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   user User? @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  trips Trip[]
 
   @@map("drivers")
 }
@@ -94,7 +95,65 @@ model Vehicle {
   createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt       DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
 
+  trips Trip[]
+
   @@map("vehicles")
+}
+
+/// Frozen trip lifecycle (Stage 0, ADR 0003). Mirrors the shared tuple
+/// `TRIP_STATUSES` in @mansar/types; the API asserts the two stay identical.
+enum TripStatus {
+  DRAFT
+  ASSIGNED
+  IN_PROGRESS
+  COMPLETED
+  VERIFIED
+  CLOSED
+  CANCELLED
+
+  @@map("trip_status")
+}
+
+/// A haulage job. Rows are never hard-deleted; `status` is the lifecycle.
+/// Ownership is the operational `Driver` (ADR 0002) — a trip never snapshots a
+/// login identity.
+///
+/// The scheduled window is half-open `[scheduledStartAt, scheduledEndAt)`, so
+/// back-to-back trips do not overlap. Six PostgreSQL-native invariants are
+/// added by hand in the migration and are invisible to `db:diff:check`
+/// (docs/database.md §15), so `test/trips-persistence.int-spec.ts` proves each
+/// one against a real database:
+///   - `trips_schedule_order`              end is after start when both exist
+///   - `trips_assignment_complete`         past DRAFT/CANCELLED the driver,
+///                                         vehicle and window are all present
+///   - `trips_driver_schedule_excl`        no overlapping windows per driver
+///   - `trips_vehicle_schedule_excl`       no overlapping windows per vehicle
+///   - `trips_one_in_progress_per_driver`  at most one running trip per driver
+///   - `trips_one_in_progress_per_vehicle` at most one running trip per vehicle
+model Trip {
+  id               String     @id @default(uuid(7)) @db.Uuid
+  status           TripStatus @default(DRAFT)
+  driverId         String?    @map("driver_id") @db.Uuid
+  vehicleId        String?    @map("vehicle_id") @db.Uuid
+  origin           String     @db.Text
+  destination      String     @db.Text
+  /// Planned window; nullable only while the trip is DRAFT or CANCELLED.
+  scheduledStartAt DateTime?  @map("scheduled_start_at") @db.Timestamptz(3)
+  scheduledEndAt   DateTime?  @map("scheduled_end_at") @db.Timestamptz(3)
+  /// Actual instants, written by the trip state machine in a later substage.
+  startedAt        DateTime?  @map("started_at") @db.Timestamptz(3)
+  completedAt      DateTime?  @map("completed_at") @db.Timestamptz(3)
+  notes            String     @default("") @db.Text
+  createdAt        DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  driver  Driver?  @relation(fields: [driverId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  vehicle Vehicle? @relation(fields: [vehicleId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@index([status, scheduledStartAt, id], map: "trips_status_scheduled_start_at_id_idx")
+  @@index([driverId, scheduledStartAt, id], map: "trips_driver_id_scheduled_start_at_id_idx")
+  @@index([vehicleId, scheduledStartAt, id], map: "trips_vehicle_id_scheduled_start_at_id_idx")
+  @@map("trips")
 }
 
 /// Append-only record of significant actions. Survives actor deletion.

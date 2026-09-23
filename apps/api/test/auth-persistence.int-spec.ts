@@ -192,13 +192,16 @@ describe('auth persistence integration (mansar_test)', () => {
     expect(fk?.def).toContain('REFERENCES users(id) ON DELETE CASCADE');
     expect(fk?.def).not.toContain('ON UPDATE CASCADE');
 
+    // No database-side magic behind refresh sessions. `btree_gist` left
+    // this list in Stage 5A: it is installed on purpose for the trips
+    // exclusion constraints and is asserted by trips-persistence.int-spec.ts.
     const [guards] = await prisma.$queryRaw<
       { checks: number; triggers: number; ext: number }[]
     >`
       SELECT
         (SELECT count(*)::int FROM pg_constraint WHERE contype = 'c' AND conrelid = 'public.refresh_sessions'::regclass) AS checks,
         (SELECT count(*)::int FROM pg_trigger WHERE tgrelid = 'public.refresh_sessions'::regclass AND NOT tgisinternal) AS triggers,
-        (SELECT count(*)::int FROM pg_extension WHERE extname IN ('citext', 'btree_gist', 'uuid-ossp', 'pgcrypto')) AS ext`;
+        (SELECT count(*)::int FROM pg_extension WHERE extname IN ('citext', 'uuid-ossp', 'pgcrypto')) AS ext`;
     expect(guards).toEqual({ checks: 0, triggers: 0, ext: 0 });
   });
 

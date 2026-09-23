@@ -19,7 +19,9 @@ describe('database integration (mansar_test)', () => {
 
   async function cleanup(): Promise<void> {
     await prisma.auditLog.deleteMany({});
-    // Since Stage 4A a linked driver blocks its user's deletion (RESTRICT).
+    // Referential order: a trip blocks its driver (Stage 5A) and a linked
+    // driver blocks its user (Stage 4A); both foreign keys are RESTRICT.
+    await prisma.trip.deleteMany({});
     await prisma.driver.deleteMany({});
     await prisma.user.deleteMany({});
   }

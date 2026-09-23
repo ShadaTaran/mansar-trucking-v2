@@ -366,6 +366,55 @@ Auth failure
 
 - [ ] wrong password → 401 `invalid_credentials`; unknown email indistinguishable
 
+## 12a. Stage 4 deployment checklist (to perform after the Stage 4 push)
+
+Not yet performed. Every box below is unticked on purpose: it is run once the
+four Stage 4 commits are pushed and Railway has deployed them, and the result
+is recorded only after it actually happens. Synthetic data only, no token or
+password ever printed.
+
+Pipeline, against the exact pushed commit SHA
+
+- [ ] the GitHub Actions run for that SHA succeeds
+- [ ] `mansar-api` deploys that SHA; the pre-deploy migration command runs
+- [ ] `npm run db:migrate:status -w @mansar/api` against staging: all three
+      migrations applied, none pending
+- [ ] `GET /health/ready` → 200 with `checks.database = ok`
+- [ ] `mansar-web` deploys that same SHA
+
+Admin web, signed in as the synthetic staging ADMIN
+
+- [ ] `/dashboard` loads
+- [ ] `/drivers` loads
+- [ ] create a synthetic driver
+- [ ] edit that driver
+- [ ] link the synthetic `DRIVER` login to it
+- [ ] deactivate the linked driver; confirm the documented result — driver
+      `INACTIVE`, that login's refresh sessions revoked (`DEACTIVATED`), the
+      user account itself unchanged (see
+      [drivers-vehicles.md](drivers-vehicles.md) §6)
+- [ ] reactivate the driver
+- [ ] unlink the login
+- [ ] `/vehicles` loads
+- [ ] create a synthetic vehicle using non-canonical plate input
+      (e.g. leading/trailing spaces, doubled spaces, lower case)
+- [ ] the returned plate is the canonical form
+- [ ] edit that vehicle
+- [ ] move it through `ACTIVE`, `IN_MAINTENANCE` and `RETIRED`, and back
+
+Authorization
+
+- [ ] a `DRIVER` principal cannot reach the ADMIN management endpoints
+      (403 `forbidden`)
+
+Cleanup
+
+- [ ] remove the synthetic smoke records where that is safe and appropriate
+
+Production
+
+- [ ] the `production` environment remains untouched throughout
+
 ## 13. Not in scope for staging
 
 Config-as-code (`railway.toml`, Dockerfile), custom domains, HA/replicas,

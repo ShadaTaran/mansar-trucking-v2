@@ -152,8 +152,9 @@ a production admin tool.
 
 ## 13. Current schema
 
-Two migrations exist: `init_users_audit` (users, audit_logs) and
-`add_refresh_sessions`. Tables:
+Three migrations exist: `init_users_audit` (users, audit_logs),
+`add_refresh_sessions`, and `20260922105701_add_drivers_vehicles` (Stage 4:
+drivers, vehicles). Tables:
 
 - `users`: login identity; `password_hash` holds a self-describing Argon2id
   PHC string and is omitted from every Prisma result unless a query selects
@@ -171,6 +172,36 @@ Two migrations exist: `init_users_audit` (users, audit_logs) and
 `id` and `family_id` have no database default; Prisma generates both.
 Rotation, concurrent-rotation and reuse-detection behaviour is proven by
 `test/auth-persistence.int-spec.ts` against real PostgreSQL.
+
+Stage 4 added two operational tables and their enums
+(`driver_status` = `ACTIVE | INACTIVE`, `vehicle_status` =
+`ACTIVE | IN_MAINTENANCE | RETIRED`):
+
+- `drivers`: operational driver records, separate from login identities
+  ([ADR 0002](adr/0002-users-and-drivers-are-separate.md)). `user_id` is
+  nullable and unique (`drivers_user_id_key`), so a driver may exist without
+  a login and a login belongs to at most one driver; many drivers may have
+  no link at all, because PostgreSQL treats NULLs as distinct in a unique
+  index. Its foreign key to `users(id)` is **`ON DELETE RESTRICT ON UPDATE NO
+ACTION`**: a login that is still linked cannot be deleted, so history is
+  never silently detached — unlink first. `licence_expiry` is a `DATE`
+  (calendar date, no time or zone), `licence_number` is deliberately not
+  unique, and `notes` is `NOT NULL DEFAULT ''`.
+- `vehicles`: fleet records. `plate_number` is unique
+  (`vehicles_plate_number_key`) on the value as stored; the API canonicalizes
+  the plate (trim → collapse internal whitespace → upper-case, punctuation
+  preserved) before writing, so equivalent spellings collide at the database
+  level. `current_odometer` is a nullable integer and `notes` is
+  `NOT NULL DEFAULT ''`.
+
+Beyond the two primary keys and those two unique indexes, Stage 4A added
+**no indexes**: no speculative status or search indexes exist, because at
+fleet scale they are not justified. Constraints, referential actions and
+defaults are proven by `test/drivers-vehicles-persistence.int-spec.ts`;
+behaviour by `test/drivers-api.int-spec.ts` and
+`test/vehicles-api.int-spec.ts`. Driver and vehicle rows are never deleted by
+the application: `status` is the lifecycle, documented in
+[drivers-vehicles.md](drivers-vehicles.md).
 
 ## 14. Conventions
 

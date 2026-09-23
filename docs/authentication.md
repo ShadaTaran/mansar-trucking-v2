@@ -89,6 +89,26 @@ token twice (the web layer and the mobile app single-flight their refreshes).
 Logging out, logout-all, deactivation and password reset revoke sessions
 intentionally; presenting those tokens is simply rejected.
 
+### 4a. Driver deactivation (Stage 4)
+
+A `User` is a login identity; a `Driver` is an operational record. They are
+separate concepts ([ADR 0002](adr/0002-users-and-drivers-are-separate.md)),
+and deactivating a driver is not an account action. Deactivating a driver
+that is linked to a login:
+
+- **does not** set `users.is_active = false` — the account is untouched;
+- **revokes** every active refresh session of the currently linked user, with
+  reason `DEACTIVATED`, in the same transaction as the status change;
+- **does not** retroactively invalidate already-issued access tokens, which
+  stay valid for their normal short lifetime (§3);
+- therefore leaves a still-active user able to **log in again**, unless that
+  account is separately deactivated.
+
+Unlinking a login from a driver revokes **no** sessions and changes no
+account: it only clears the link. The full semantics, including the
+concurrency invariant that no inactive driver can keep a linked login with
+live sessions, are in [drivers-vehicles.md](drivers-vehicles.md).
+
 ## 5. Local setup
 
 `apps/api/.env` (git-ignored) needs, in addition to the database URLs:

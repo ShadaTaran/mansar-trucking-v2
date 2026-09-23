@@ -7,7 +7,8 @@ and active-trip location tracking.
 ## Status
 
 **Under development.** The web, API, mobile, and database foundations are in
-place, but the system is not production-ready, deployed, or in live use.
+place, and a staging environment exists for development verification. The
+system is not production-ready or in live business use.
 
 ## What this is
 
@@ -37,7 +38,9 @@ docs/
   stage-0-architecture.md
   authentication.md
   database.md
+  drivers-vehicles.md
   security.md
+  staging-deployment.md
   adr/                architecture decision records
 ```
 
@@ -77,5 +80,7 @@ the git-ignored `dist/` directories as a side effect; `build` does the same.
   migrations, integration tests
 - [Authentication](docs/authentication.md): API endpoints, tokens, refresh
   sessions, local secret setup, first admin, admin web BFF, driver mobile app
+- [Drivers and vehicles](docs/drivers-vehicles.md): operational records,
+  ADMIN management API, admin web screens, deactivation and linking semantics
 - [Staging deployment](docs/staging-deployment.md): Railway staging topology,
   service settings, environment variables, migration order, smoke checklist

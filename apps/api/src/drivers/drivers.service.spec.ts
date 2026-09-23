@@ -19,6 +19,7 @@ import {
 const DRIVER_ID = '019a0000-0000-7000-8000-00000000000d';
 const ADMIN_ID = '019a0000-0000-7000-8000-000000000009';
 const USER_ID = '019a0000-0000-7000-8000-000000000001';
+const TRIP_ID = '019a0000-0000-7000-8000-00000000001a';
 const OTHER_USER_ID = '019a0000-0000-7000-8000-000000000002';
 const REQUEST_ID = '2b3c4d5e-1111-4222-8333-444455556666';
 const ACTOR = { userId: ADMIN_ID, role: 'ADMIN' } as const;
@@ -47,6 +48,8 @@ function knownRequestError(code: string): Prisma.PrismaClientKnownRequestError {
 }
 
 describe('DriversService', () => {
+  let rawSql: string[];
+  let rawResults: unknown[][];
   let tx: {
     driver: {
       create: ReturnType<typeof vi.fn>;
@@ -56,6 +59,8 @@ describe('DriversService', () => {
       findUnique: ReturnType<typeof vi.fn>;
     };
     user: { findUnique: ReturnType<typeof vi.fn> };
+    trip: { findFirst: ReturnType<typeof vi.fn> };
+    $queryRaw: ReturnType<typeof vi.fn>;
   };
   let prisma: {
     $transaction: ReturnType<typeof vi.fn>;
@@ -70,6 +75,8 @@ describe('DriversService', () => {
   let service: DriversService;
 
   beforeEach(() => {
+    rawSql = [];
+    rawResults = [];
     tx = {
       driver: {
         create: vi.fn(),
@@ -79,6 +86,11 @@ describe('DriversService', () => {
         findUnique: vi.fn(),
       },
       user: { findUnique: vi.fn() },
+      trip: { findFirst: vi.fn() },
+      $queryRaw: vi.fn((strings: TemplateStringsArray) => {
+        rawSql.push(strings.join('?').replace(/\s+/g, ' ').trim());
+        return Promise.resolve(rawResults.shift() ?? []);
+      }),
     };
     prisma = {
       $transaction: vi.fn(async (arg: unknown) =>
@@ -589,24 +601,38 @@ describe('DriversService', () => {
       expect(audit.record).not.toHaveBeenCalled();
     });
   });
-
   describe('unlinkUser', () => {
-    it('clears the link conditionally, audits it and revokes nothing', async () => {
-      tx.driver.findUnique
-        .mockResolvedValueOnce({ id: DRIVER_ID, userId: USER_ID })
-        .mockResolvedValueOnce(driverRow());
-      tx.driver.updateMany.mockResolvedValue({ count: 1 });
-
-      await service.unlinkUser({
+    /** Queues the row the driver-row lock returns. */
+    const lockedDriver = (
+      row: { id: string; userId: string | null } | null,
+    ) => {
+      rawResults.push(row === null ? [] : [row]);
+    };
+    const unlink = () =>
+      service.unlinkUser({
         actor: ACTOR,
         driverId: DRIVER_ID,
         requestId: REQUEST_ID,
       });
 
+    it('locks the driver row before anything else and clears the link', async () => {
+      lockedDriver({ id: DRIVER_ID, userId: USER_ID });
+      tx.trip.findFirst.mockResolvedValue(null);
+      tx.driver.updateMany.mockResolvedValue({ count: 1 });
+      tx.driver.findUnique.mockResolvedValue(driverRow());
+
+      await unlink();
+
+      // The lock is the first statement, and it is parameterized.
+      expect(rawSql).toEqual([
+        'SELECT id, user_id AS "userId" FROM drivers WHERE id = ?::uuid FOR UPDATE',
+      ]);
+      expect(tx.$queryRaw.mock.calls[0]![1]).toBe(DRIVER_ID);
       expect(tx.driver.updateMany).toHaveBeenCalledWith({
         where: { id: DRIVER_ID, userId: USER_ID },
         data: { userId: null },
       });
+      // Stage 4 rule intact: unlinking is not a revocation event.
       expect(sessions.revokeAllForUser).not.toHaveBeenCalled();
       const [entry, writer] = audit.record.mock.calls[0]!;
       expect(entry).toMatchObject({
@@ -617,48 +643,71 @@ describe('DriversService', () => {
       expect(writer).toBe(tx);
     });
 
-    it('409s when the driver has no link', async () => {
-      tx.driver.findUnique.mockResolvedValue({ id: DRIVER_ID, userId: null });
+    it('checks for a running trip while holding that lock', async () => {
+      lockedDriver({ id: DRIVER_ID, userId: USER_ID });
+      tx.trip.findFirst.mockResolvedValue(null);
+      tx.driver.updateMany.mockResolvedValue({ count: 1 });
+      tx.driver.findUnique.mockResolvedValue(driverRow());
 
-      await expect(
-        service.unlinkUser({
-          actor: ACTOR,
-          driverId: DRIVER_ID,
-          requestId: REQUEST_ID,
-        }),
-      ).rejects.toMatchObject({
+      await unlink();
+
+      expect(tx.trip.findFirst).toHaveBeenCalledWith({
+        where: { driverId: DRIVER_ID, status: 'IN_PROGRESS' },
+        select: { id: true },
+      });
+    });
+
+    it('409s driver_has_in_progress_trip and writes nothing', async () => {
+      lockedDriver({ id: DRIVER_ID, userId: USER_ID });
+      tx.trip.findFirst.mockResolvedValue({ id: TRIP_ID });
+
+      await expect(unlink()).rejects.toMatchObject({
+        status: 409,
+        message: DRIVER_ERROR.driverHasInProgressTrip,
+      });
+      expect(tx.driver.updateMany).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
+      expect(sessions.revokeAllForUser).not.toHaveBeenCalled();
+    });
+
+    it.each(['ASSIGNED', 'COMPLETED', 'VERIFIED', 'CLOSED', 'CANCELLED'])(
+      'is not blocked by a %s trip',
+      async () => {
+        lockedDriver({ id: DRIVER_ID, userId: USER_ID });
+        // Only IN_PROGRESS is queried, so any other state finds no row.
+        tx.trip.findFirst.mockResolvedValue(null);
+        tx.driver.updateMany.mockResolvedValue({ count: 1 });
+        tx.driver.findUnique.mockResolvedValue(driverRow());
+
+        await expect(unlink()).resolves.toBeDefined();
+        expect(tx.driver.updateMany).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('409s when the driver has no link', async () => {
+      lockedDriver({ id: DRIVER_ID, userId: null });
+
+      await expect(unlink()).rejects.toMatchObject({
         status: 409,
         message: DRIVER_ERROR.driverNotLinked,
       });
+      expect(tx.trip.findFirst).not.toHaveBeenCalled();
       expect(tx.driver.updateMany).not.toHaveBeenCalled();
     });
 
     it('409s when a concurrent call cleared the link first', async () => {
-      tx.driver.findUnique.mockResolvedValue({
-        id: DRIVER_ID,
-        userId: USER_ID,
-      });
+      lockedDriver({ id: DRIVER_ID, userId: USER_ID });
+      tx.trip.findFirst.mockResolvedValue(null);
       tx.driver.updateMany.mockResolvedValue({ count: 0 });
 
-      await expect(
-        service.unlinkUser({
-          actor: ACTOR,
-          driverId: DRIVER_ID,
-          requestId: REQUEST_ID,
-        }),
-      ).rejects.toBeInstanceOf(ConflictException);
+      await expect(unlink()).rejects.toBeInstanceOf(ConflictException);
       expect(audit.record).not.toHaveBeenCalled();
     });
 
     it('404s an unknown driver', async () => {
-      tx.driver.findUnique.mockResolvedValue(null);
-      await expect(
-        service.unlinkUser({
-          actor: ACTOR,
-          driverId: DRIVER_ID,
-          requestId: REQUEST_ID,
-        }),
-      ).rejects.toBeInstanceOf(NotFoundException);
+      lockedDriver(null);
+      await expect(unlink()).rejects.toBeInstanceOf(NotFoundException);
+      expect(tx.trip.findFirst).not.toHaveBeenCalled();
     });
   });
 });

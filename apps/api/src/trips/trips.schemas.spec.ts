@@ -1,9 +1,11 @@
+import { TRIP_STATUSES } from '@mansar/types';
 import { describe, expect, it } from 'vitest';
 
 import {
   assignTripSchema,
   createTripSchema,
   DESTINATION_MAX_LENGTH,
+  listDriverTripsSchema,
   listTripsSchema,
   NOTES_MAX_LENGTH,
   ORIGIN_MAX_LENGTH,
@@ -294,5 +296,70 @@ describe('listTripsSchema', () => {
     ['a date-range filter', { from: START }],
   ])('rejects %s', (_label, query) => {
     expect(listTripsSchema.safeParse(query).success).toBe(false);
+  });
+});
+
+describe('listDriverTripsSchema', () => {
+  it('accepts an empty query', () => {
+    expect(listDriverTripsSchema.safeParse({}).data).toEqual({});
+  });
+
+  it('parses the only three filters it offers', () => {
+    const result = listDriverTripsSchema.safeParse({
+      status: 'IN_PROGRESS',
+      page: '3',
+      pageSize: '10',
+    });
+    expect(result.data).toEqual({
+      status: 'IN_PROGRESS',
+      page: 3,
+      pageSize: 10,
+    });
+  });
+
+  it.each(TRIP_STATUSES)('accepts the %s status', (status) => {
+    expect(listDriverTripsSchema.safeParse({ status }).success).toBe(true);
+  });
+
+  it('accepts the page-size boundaries', () => {
+    expect(
+      listDriverTripsSchema.safeParse({ pageSize: '1' }).data?.pageSize,
+    ).toBe(1);
+    expect(
+      listDriverTripsSchema.safeParse({ pageSize: '100' }).data?.pageSize,
+    ).toBe(100);
+    expect(listDriverTripsSchema.safeParse({ page: '1' }).data?.page).toBe(1);
+  });
+
+  it.each([
+    ['an invalid status', { status: 'RUNNING' }],
+    ['a driver status', { status: 'INACTIVE' }],
+    ['page zero', { page: '0' }],
+    ['a negative page', { page: '-1' }],
+    ['a fractional page', { page: '1.5' }],
+    ['a non-numeric page', { page: 'two' }],
+    ['a page size above the maximum', { pageSize: '101' }],
+    ['page size zero', { pageSize: '0' }],
+  ])('rejects %s', (_label, query) => {
+    expect(listDriverTripsSchema.safeParse(query).success).toBe(false);
+  });
+
+  it.each([
+    ['driverId', { driverId: DRIVER_ID }],
+    ['vehicleId', { vehicleId: VEHICLE_ID }],
+    ['q', { q: 'manila' }],
+    ['a date range', { from: START, to: END }],
+    ['a sort control', { sort: 'scheduledStartAt' }],
+    ['an order control', { order: 'desc' }],
+    ['any unknown key', { anything: '1' }],
+  ])('refuses %s: the driver scope is never a query parameter', (_l, query) => {
+    expect(listDriverTripsSchema.safeParse(query).success).toBe(false);
+  });
+
+  it('offers strictly fewer filters than the admin listing', () => {
+    expect(listTripsSchema.safeParse({ q: 'manila' }).success).toBe(true);
+    expect(listDriverTripsSchema.safeParse({ q: 'manila' }).success).toBe(
+      false,
+    );
   });
 });

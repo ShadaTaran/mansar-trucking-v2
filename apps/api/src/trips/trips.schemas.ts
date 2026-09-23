@@ -156,3 +156,20 @@ export const listTripsSchema = z.strictObject({
     .optional(),
 });
 export type ListTripsQuery = z.infer<typeof listTripsSchema>;
+
+/**
+ * The driver-facing listing (Stage 5C). Deliberately much narrower than the
+ * admin one: the driver scope is the authenticated login's own operational
+ * driver, never a query parameter, so `driverId`, `vehicleId`, free-text
+ * search, date ranges and sort controls are all unknown keys here.
+ */
+export const listDriverTripsSchema = z.strictObject({
+  status: tripStatus.optional(),
+  page: positiveIntegerQuery('page', 9).optional(),
+  pageSize: positiveIntegerQuery('pageSize', 3)
+    .refine((value) => value <= MAX_PAGE_SIZE, {
+      error: `pageSize must be at most ${MAX_PAGE_SIZE}`,
+    })
+    .optional(),
+});
+export type ListDriverTripsQuery = z.infer<typeof listDriverTripsSchema>;

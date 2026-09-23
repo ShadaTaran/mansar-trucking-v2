@@ -360,6 +360,18 @@ export class DriversService {
   /**
    * Clears the link. Sessions are deliberately left alone: unlinking is an
    * administrative correction, not a revocation event.
+   *
+   * A driver who is currently running a trip cannot be unlinked (Stage 5C):
+   * the login is how that driver completes it, so removing the link mid-trip
+   * would strand the trip. Only IN_PROGRESS blocks — an ASSIGNED future trip
+   * does not, because an ADMIN may simply re-assign it, and finished or
+   * cancelled trips are history.
+   *
+   * The driver row is locked first, and it is the same row that Stage 5C's
+   * start and complete lock. That is what makes the check safe: no start can
+   * be part-way through while this transaction holds the row, so a trip
+   * cannot become IN_PROGRESS between the check and the write, and a start
+   * that arrives afterwards finds no link at all.
    */
   async unlinkUser(input: {
     readonly actor: DriverActor;
@@ -367,16 +379,24 @@ export class DriversService {
     readonly requestId: string;
   }): Promise<Driver> {
     return this.prisma.$transaction(async (tx) => {
-      const driver = await tx.driver.findUnique({
-        where: { id: input.driverId },
-        select: { id: true, userId: true },
-      });
+      const driver = await this.lockDriver(tx, input.driverId);
       if (!driver) {
         throw new NotFoundException(DRIVER_ERROR.driverNotFound);
       }
       if (driver.userId === null) {
         throw new ConflictException(DRIVER_ERROR.driverNotLinked);
       }
+
+      // Safe under the row lock: only a start can create this state, and a
+      // start has to take the same lock to do so.
+      const running = await tx.trip.findFirst({
+        where: { driverId: input.driverId, status: 'IN_PROGRESS' },
+        select: { id: true },
+      });
+      if (running) {
+        throw new ConflictException(DRIVER_ERROR.driverHasInProgressTrip);
+      }
+
       // Conditioned on that exact link, so the audited userId is the one
       // this call actually removed.
       const cleared = await tx.driver.updateMany({
@@ -396,6 +416,20 @@ export class DriversService {
       });
       return this.readInTransaction(tx, input.driverId);
     });
+  }
+
+  /**
+   * Locks one driver row. This is the serialisation point shared with Stage
+   * 5C's start and complete, which lock the same row through `user_id`.
+   */
+  private async lockDriver(
+    tx: Prisma.TransactionClient,
+    driverId: string,
+  ): Promise<{ id: string; userId: string | null } | null> {
+    const rows = await tx.$queryRaw<{ id: string; userId: string | null }[]>`
+      SELECT id, user_id AS "userId" FROM drivers
+      WHERE id = ${driverId}::uuid FOR UPDATE`;
+    return rows[0] ?? null;
   }
 
   /** Zero rows claimed: the driver is gone, or was already in that state. */

@@ -12,6 +12,7 @@ export const DRIVER_ERROR = {
   driverAlreadyLinked: 'driver_already_linked',
   driverNotLinked: 'driver_not_linked',
   driverInactive: 'driver_inactive',
+  driverHasInProgressTrip: 'driver_has_in_progress_trip',
   userNotFound: 'user_not_found',
   userNotDriver: 'user_not_driver',
   userInactive: 'user_inactive',

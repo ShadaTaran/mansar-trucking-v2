@@ -2,6 +2,7 @@ import { ConflictException, NotFoundException } from '@nestjs/common';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AuditService } from '../audit/audit.service.js';
+import { AuthInvariantError } from '../auth/errors.js';
 import type { PrismaService } from '../database/prisma.service.js';
 import { DRIVER_ERROR } from '../drivers/drivers.errors.js';
 import { Prisma } from '../generated/prisma/client.js';
@@ -11,7 +12,9 @@ import {
   AUDIT_TRIP_ASSIGNED,
   AUDIT_TRIP_CANCELLED,
   AUDIT_TRIP_CLOSED,
+  AUDIT_TRIP_COMPLETED,
   AUDIT_TRIP_CREATED,
+  AUDIT_TRIP_STARTED,
   AUDIT_TRIP_UPDATED,
   AUDIT_TRIP_VERIFIED,
   sqlState,
@@ -25,6 +28,9 @@ const VEHICLE_ID = '019a0000-0000-7000-8000-00000000000e';
 const ADMIN_ID = '019a0000-0000-7000-8000-000000000009';
 const REQUEST_ID = '2b3c4d5e-1111-4222-8333-444455556666';
 const ACTOR = { userId: ADMIN_ID, role: 'ADMIN' } as const;
+const DRIVER_USER_ID = '019a0000-0000-7000-8000-000000000001';
+const OTHER_DRIVER_ID = '019a0000-0000-7000-8000-00000000000f';
+const DRIVER_ACTOR = { userId: DRIVER_USER_ID, role: 'DRIVER' } as const;
 const START = new Date('2027-01-04T08:00:00.000Z');
 const END = new Date('2027-01-04T12:00:00.000Z');
 
@@ -82,6 +88,23 @@ function adapterError(originalCode: string) {
   };
 }
 
+/** A 23505 the pg adapter reports with its structured index name. */
+function uniqueViolation(index: string): Prisma.PrismaClientKnownRequestError {
+  return knownRequestError('P2002', {
+    modelName: 'Trip',
+    driverAdapterError: {
+      name: 'DriverAdapterError',
+      cause: {
+        originalCode: '23505',
+        kind: 'UniqueConstraintViolation',
+        constraint: { index },
+        table: 'trips',
+        detail: 'Key (driver_id)=(...) already exists.',
+      },
+    },
+  });
+}
+
 describe('sqlState', () => {
   it('reads the SQLSTATE from the driver adapter cause', () => {
     expect(sqlState(knownRequestError('P2039', adapterError('23P01')))).toBe(
@@ -106,6 +129,7 @@ describe('TripsService', () => {
     trip: {
       create: ReturnType<typeof vi.fn>;
       findUnique: ReturnType<typeof vi.fn>;
+      findFirst: ReturnType<typeof vi.fn>;
       updateManyAndReturn: ReturnType<typeof vi.fn>;
     };
     $queryRaw: ReturnType<typeof vi.fn>;
@@ -116,7 +140,9 @@ describe('TripsService', () => {
       findMany: ReturnType<typeof vi.fn>;
       count: ReturnType<typeof vi.fn>;
       findUnique: ReturnType<typeof vi.fn>;
+      findFirst: ReturnType<typeof vi.fn>;
     };
+    driver: { findUnique: ReturnType<typeof vi.fn> };
   };
   let audit: { record: ReturnType<typeof vi.fn> };
   let service: TripsService;
@@ -128,6 +154,7 @@ describe('TripsService', () => {
       trip: {
         create: vi.fn(),
         findUnique: vi.fn(),
+        findFirst: vi.fn(),
         updateManyAndReturn: vi.fn(),
       },
       $queryRaw: vi.fn((strings: TemplateStringsArray) => {
@@ -141,7 +168,13 @@ describe('TripsService', () => {
           ? (arg as (client: typeof tx) => Promise<unknown>)(tx)
           : Promise.all(arg as Promise<unknown>[]),
       ),
-      trip: { findMany: vi.fn(), count: vi.fn(), findUnique: vi.fn() },
+      trip: {
+        findMany: vi.fn(),
+        count: vi.fn(),
+        findUnique: vi.fn(),
+        findFirst: vi.fn(),
+      },
+      driver: { findUnique: vi.fn() },
     };
     audit = { record: vi.fn().mockResolvedValue(undefined) };
     service = new TripsService(
@@ -746,6 +779,492 @@ describe('TripsService', () => {
         scheduledStartAt: '2027-01-04T08:00:00.000Z',
         scheduledEndAt: '2027-01-04T12:00:00.000Z',
       });
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Stage 5C: driver-facing operations
+  // -------------------------------------------------------------------
+
+  describe('driver reads', () => {
+    it('resolves the operational driver from the login and scopes the listing', async () => {
+      prisma.driver.findUnique.mockResolvedValue({ id: DRIVER_ID });
+      prisma.trip.findMany.mockResolvedValue([tripRow()]);
+      prisma.trip.count.mockResolvedValue(1);
+
+      const page = await service.listForDriver({
+        actor: DRIVER_ACTOR,
+        query: {},
+      });
+
+      // The link is the only way a driver id is ever obtained.
+      expect(prisma.driver.findUnique).toHaveBeenCalledWith({
+        where: { userId: DRIVER_USER_ID },
+        select: { id: true },
+      });
+      expect(page).toMatchObject({ page: 1, pageSize: 25, total: 1 });
+      expect(prisma.trip.findMany.mock.calls[0]![0]).toMatchObject({
+        where: { driverId: DRIVER_ID },
+        orderBy: [
+          { scheduledStartAt: { sort: 'asc', nulls: 'last' } },
+          { id: 'asc' },
+        ],
+        skip: 0,
+        take: 25,
+      });
+    });
+
+    it('adds the status filter and pages, and offers nothing else', async () => {
+      prisma.driver.findUnique.mockResolvedValue({ id: DRIVER_ID });
+      prisma.trip.findMany.mockResolvedValue([]);
+      prisma.trip.count.mockResolvedValue(0);
+
+      await service.listForDriver({
+        actor: DRIVER_ACTOR,
+        query: { status: 'ASSIGNED', page: 3, pageSize: 10 },
+      });
+
+      const args = prisma.trip.findMany.mock.calls[0]![0];
+      expect(args.where).toEqual({ driverId: DRIVER_ID, status: 'ASSIGNED' });
+      expect(args.skip).toBe(20);
+      expect(args.take).toBe(10);
+    });
+
+    it('never consults the driver status: a deactivated driver may read', async () => {
+      prisma.driver.findUnique.mockResolvedValue({ id: DRIVER_ID });
+      prisma.trip.findMany.mockResolvedValue([]);
+      prisma.trip.count.mockResolvedValue(0);
+
+      await service.listForDriver({ actor: DRIVER_ACTOR, query: {} });
+
+      const select = prisma.driver.findUnique.mock.calls[0]![0].select;
+      expect(select).toEqual({ id: true });
+      expect(select).not.toHaveProperty('status');
+    });
+
+    it('409s driver_not_linked when the login has no operational driver', async () => {
+      prisma.driver.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.listForDriver({ actor: DRIVER_ACTOR, query: {} }),
+      ).rejects.toMatchObject({
+        status: 409,
+        message: DRIVER_ERROR.driverNotLinked,
+      });
+      expect(prisma.trip.findMany).not.toHaveBeenCalled();
+    });
+
+    it('scopes a detail read by ownership', async () => {
+      prisma.driver.findUnique.mockResolvedValue({ id: DRIVER_ID });
+      prisma.trip.findFirst.mockResolvedValue(tripRow());
+
+      await service.getOneForDriver({ actor: DRIVER_ACTOR, tripId: TRIP_ID });
+
+      expect(prisma.trip.findFirst.mock.calls[0]![0].where).toEqual({
+        id: TRIP_ID,
+        driverId: DRIVER_ID,
+      });
+    });
+
+    it('404s the trip of another driver exactly like a missing one', async () => {
+      prisma.driver.findUnique.mockResolvedValue({ id: DRIVER_ID });
+      prisma.trip.findFirst.mockResolvedValue(null);
+
+      const rejection = await service
+        .getOneForDriver({ actor: DRIVER_ACTOR, tripId: TRIP_ID })
+        .catch((error: unknown) => error);
+
+      expect(rejection).toBeInstanceOf(NotFoundException);
+      expect(rejection).toMatchObject({
+        status: 404,
+        message: TRIP_ERROR.tripNotFound,
+      });
+      // No hint that it exists elsewhere, and no other driver id.
+      expect(JSON.stringify(rejection)).not.toContain('not_owned');
+      expect(JSON.stringify(rejection)).not.toContain(OTHER_DRIVER_ID);
+    });
+
+    it('409s driver_not_linked on a detail read with no link', async () => {
+      prisma.driver.findUnique.mockResolvedValue(null);
+      await expect(
+        service.getOneForDriver({ actor: DRIVER_ACTOR, tripId: TRIP_ID }),
+      ).rejects.toMatchObject({
+        status: 409,
+        message: DRIVER_ERROR.driverNotLinked,
+      });
+      expect(prisma.trip.findFirst).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('start', () => {
+    const start = () =>
+      service.start({
+        actor: DRIVER_ACTOR,
+        tripId: TRIP_ID,
+        requestId: REQUEST_ID,
+      });
+
+    /** Queues the locked driver row, then the locked vehicle row. */
+    function locked(
+      driver: { id: string; status: string } | null,
+      vehicle: { status: string } | null,
+    ): void {
+      rawResults.push(driver === null ? [] : [driver]);
+      rawResults.push(vehicle === null ? [] : [vehicle]);
+    }
+
+    const assignedTrip = (overrides: Record<string, unknown> = {}) => ({
+      id: TRIP_ID,
+      status: 'ASSIGNED',
+      vehicleId: VEHICLE_ID,
+      ...overrides,
+    });
+
+    it('locks the driver by login, then the vehicle, then claims the trip', async () => {
+      locked({ id: DRIVER_ID, status: 'ACTIVE' }, { status: 'ACTIVE' });
+      tx.trip.findFirst.mockResolvedValue(assignedTrip());
+      tx.trip.updateManyAndReturn.mockResolvedValue([
+        tripRow({ status: 'IN_PROGRESS', startedAt: START }),
+      ]);
+
+      const started = await start();
+
+      expect(rawSql).toEqual([
+        'SELECT id, status FROM drivers WHERE user_id = ?::uuid FOR UPDATE',
+        'SELECT status FROM vehicles WHERE id = ?::uuid FOR UPDATE',
+      ]);
+      expect(tx.$queryRaw.mock.calls[0]![1]).toBe(DRIVER_USER_ID);
+      expect(tx.$queryRaw.mock.calls[1]![1]).toBe(VEHICLE_ID);
+      // The trip is read scoped to the resolved driver, never by id alone.
+      expect(tx.trip.findFirst.mock.calls[0]![0].where).toEqual({
+        id: TRIP_ID,
+        driverId: DRIVER_ID,
+      });
+      expect(started.status).toBe('IN_PROGRESS');
+    });
+
+    it('claims on ownership, the observed vehicle and the status, stamping startedAt', async () => {
+      locked({ id: DRIVER_ID, status: 'ACTIVE' }, { status: 'ACTIVE' });
+      tx.trip.findFirst.mockResolvedValue(assignedTrip());
+      tx.trip.updateManyAndReturn.mockResolvedValue([
+        tripRow({ status: 'IN_PROGRESS', startedAt: START }),
+      ]);
+
+      await start();
+
+      const args = tx.trip.updateManyAndReturn.mock.calls[0]![0];
+      expect(args.where).toEqual({
+        id: TRIP_ID,
+        driverId: DRIVER_ID,
+        vehicleId: VEHICLE_ID,
+        status: 'ASSIGNED',
+      });
+      expect(args.data.status).toBe('IN_PROGRESS');
+      expect(args.data.startedAt).toBeInstanceOf(Date);
+      // Nothing else is written.
+      expect(Object.keys(args.data).sort()).toEqual(['startedAt', 'status']);
+    });
+
+    it('409s driver_not_linked and touches nothing else', async () => {
+      locked(null, { status: 'ACTIVE' });
+
+      await expect(start()).rejects.toMatchObject({
+        status: 409,
+        message: DRIVER_ERROR.driverNotLinked,
+      });
+      expect(rawSql).toHaveLength(1);
+      expect(tx.trip.findFirst).not.toHaveBeenCalled();
+      expect(tx.trip.updateManyAndReturn).not.toHaveBeenCalled();
+    });
+
+    it('409s driver_inactive before reading the trip', async () => {
+      locked({ id: DRIVER_ID, status: 'INACTIVE' }, { status: 'ACTIVE' });
+
+      await expect(start()).rejects.toMatchObject({
+        status: 409,
+        message: DRIVER_ERROR.driverInactive,
+      });
+      expect(rawSql).toHaveLength(1);
+      expect(tx.trip.findFirst).not.toHaveBeenCalled();
+    });
+
+    it('404s a missing trip and one owned by another driver', async () => {
+      locked({ id: DRIVER_ID, status: 'ACTIVE' }, { status: 'ACTIVE' });
+      tx.trip.findFirst.mockResolvedValue(null);
+
+      await expect(start()).rejects.toMatchObject({
+        status: 404,
+        message: TRIP_ERROR.tripNotFound,
+      });
+      // The vehicle was never locked.
+      expect(rawSql).toHaveLength(1);
+    });
+
+    it.each([
+      'DRAFT',
+      'IN_PROGRESS',
+      'COMPLETED',
+      'VERIFIED',
+      'CLOSED',
+      'CANCELLED',
+    ])('409s trip_not_startable from %s', async (status) => {
+      locked({ id: DRIVER_ID, status: 'ACTIVE' }, { status: 'ACTIVE' });
+      tx.trip.findFirst.mockResolvedValue(assignedTrip({ status }));
+
+      await expect(start()).rejects.toMatchObject({
+        status: 409,
+        message: TRIP_ERROR.tripNotStartable,
+      });
+      expect(tx.trip.updateManyAndReturn).not.toHaveBeenCalled();
+    });
+
+    it.each(['IN_MAINTENANCE', 'RETIRED'] as const)(
+      '409s vehicle_not_active for a %s vehicle',
+      async (status) => {
+        locked({ id: DRIVER_ID, status: 'ACTIVE' }, { status });
+        tx.trip.findFirst.mockResolvedValue(assignedTrip());
+
+        await expect(start()).rejects.toMatchObject({
+          status: 409,
+          message: TRIP_ERROR.vehicleNotActive,
+        });
+        expect(rawSql).toHaveLength(2);
+        expect(tx.trip.updateManyAndReturn).not.toHaveBeenCalled();
+      },
+    );
+
+    it('treats an ASSIGNED trip with no vehicle as an internal invariant failure', async () => {
+      locked({ id: DRIVER_ID, status: 'ACTIVE' }, { status: 'ACTIVE' });
+      tx.trip.findFirst.mockResolvedValue(assignedTrip({ vehicleId: null }));
+
+      const rejection = await start().catch((error: unknown) => error);
+
+      expect(rejection).toBeInstanceOf(AuthInvariantError);
+      expect(rejection).not.toBeInstanceOf(ConflictException);
+    });
+
+    it('maps the driver one-running-trip index to driver_trip_in_progress', async () => {
+      locked({ id: DRIVER_ID, status: 'ACTIVE' }, { status: 'ACTIVE' });
+      tx.trip.findFirst.mockResolvedValue(assignedTrip());
+      tx.trip.updateManyAndReturn.mockRejectedValue(
+        uniqueViolation('trips_one_in_progress_per_driver'),
+      );
+
+      const rejection = await start().catch((error: unknown) => error);
+
+      expect(rejection).toBeInstanceOf(ConflictException);
+      expect(rejection).toMatchObject({
+        status: 409,
+        message: TRIP_ERROR.driverTripInProgress,
+      });
+      expect(JSON.stringify(rejection)).not.toContain('Key (driver_id');
+      expect(audit.record).not.toHaveBeenCalled();
+    });
+
+    it('maps the vehicle one-running-trip index to vehicle_trip_in_progress', async () => {
+      locked({ id: DRIVER_ID, status: 'ACTIVE' }, { status: 'ACTIVE' });
+      tx.trip.findFirst.mockResolvedValue(assignedTrip());
+      tx.trip.updateManyAndReturn.mockRejectedValue(
+        uniqueViolation('trips_one_in_progress_per_vehicle'),
+      );
+
+      await expect(start()).rejects.toMatchObject({
+        status: 409,
+        message: TRIP_ERROR.vehicleTripInProgress,
+      });
+    });
+
+    it('does not collapse an unrelated unique violation into either code', async () => {
+      locked({ id: DRIVER_ID, status: 'ACTIVE' }, { status: 'ACTIVE' });
+      tx.trip.findFirst.mockResolvedValue(assignedTrip());
+      const failure = uniqueViolation('some_other_unique_index');
+      tx.trip.updateManyAndReturn.mockRejectedValue(failure);
+
+      await expect(start()).rejects.toBe(failure);
+    });
+
+    it('propagates a failure that is not a unique violation', async () => {
+      locked({ id: DRIVER_ID, status: 'ACTIVE' }, { status: 'ACTIVE' });
+      tx.trip.findFirst.mockResolvedValue(assignedTrip());
+      const failure = knownRequestError('P2039', adapterError('23P01'));
+      tx.trip.updateManyAndReturn.mockRejectedValue(failure);
+
+      await expect(start()).rejects.toBe(failure);
+    });
+
+    it('audits trip.started with the source state only', async () => {
+      locked({ id: DRIVER_ID, status: 'ACTIVE' }, { status: 'ACTIVE' });
+      tx.trip.findFirst.mockResolvedValue(assignedTrip());
+      tx.trip.updateManyAndReturn.mockResolvedValue([
+        tripRow({ status: 'IN_PROGRESS', startedAt: START }),
+      ]);
+
+      await start();
+
+      expect(audit.record.mock.calls[0]![0]).toEqual({
+        actorUserId: DRIVER_USER_ID,
+        actorRole: 'DRIVER',
+        action: AUDIT_TRIP_STARTED,
+        entityType: 'trip',
+        entityId: TRIP_ID,
+        requestId: REQUEST_ID,
+        metadata: { from: 'ASSIGNED' },
+      });
+      const recorded = JSON.stringify(audit.record.mock.calls[0]![0]);
+      expect(recorded).not.toContain('Manila');
+      expect(recorded).not.toContain('2027-01-04');
+      expect(recorded).not.toContain(VEHICLE_ID);
+    });
+
+    it('propagates an audit failure so the transition rolls back', async () => {
+      locked({ id: DRIVER_ID, status: 'ACTIVE' }, { status: 'ACTIVE' });
+      tx.trip.findFirst.mockResolvedValue(assignedTrip());
+      tx.trip.updateManyAndReturn.mockResolvedValue([
+        tripRow({ status: 'IN_PROGRESS' }),
+      ]);
+      audit.record.mockRejectedValue(new Error('synthetic audit failure'));
+
+      await expect(start()).rejects.toThrow('synthetic audit failure');
+    });
+
+    it('classifies a lost claim by fresh ownership', async () => {
+      locked({ id: DRIVER_ID, status: 'ACTIVE' }, { status: 'ACTIVE' });
+      tx.trip.findFirst
+        .mockResolvedValueOnce(assignedTrip())
+        .mockResolvedValueOnce({ id: TRIP_ID });
+      tx.trip.updateManyAndReturn.mockResolvedValue([]);
+      await expect(start()).rejects.toMatchObject({
+        status: 409,
+        message: TRIP_ERROR.tripNotStartable,
+      });
+
+      locked({ id: DRIVER_ID, status: 'ACTIVE' }, { status: 'ACTIVE' });
+      tx.trip.findFirst
+        .mockResolvedValueOnce(assignedTrip())
+        .mockResolvedValueOnce(null);
+      // Re-assigned away mid-call: reported as absent, not as a conflict.
+      await expect(start()).rejects.toMatchObject({
+        status: 404,
+        message: TRIP_ERROR.tripNotFound,
+      });
+    });
+  });
+
+  describe('complete', () => {
+    const complete = () =>
+      service.complete({
+        actor: DRIVER_ACTOR,
+        tripId: TRIP_ID,
+        requestId: REQUEST_ID,
+      });
+
+    const lockedDriver = (row: { id: string; status: string } | null) => {
+      rawResults.push(row === null ? [] : [row]);
+    };
+
+    it('locks only the driver row and never reads the vehicle', async () => {
+      lockedDriver({ id: DRIVER_ID, status: 'ACTIVE' });
+      tx.trip.updateManyAndReturn.mockResolvedValue([
+        tripRow({ status: 'COMPLETED', completedAt: END }),
+      ]);
+
+      await complete();
+
+      expect(rawSql).toEqual([
+        'SELECT id, status FROM drivers WHERE user_id = ?::uuid FOR UPDATE',
+      ]);
+      expect(tx.trip.findFirst).not.toHaveBeenCalled();
+    });
+
+    it('accepts an INACTIVE driver: a running trip is never stranded', async () => {
+      lockedDriver({ id: DRIVER_ID, status: 'INACTIVE' });
+      tx.trip.updateManyAndReturn.mockResolvedValue([
+        tripRow({ status: 'COMPLETED', completedAt: END }),
+      ]);
+
+      await expect(complete()).resolves.toMatchObject({ status: 'COMPLETED' });
+    });
+
+    it('claims on ownership and IN_PROGRESS, stamping completedAt', async () => {
+      lockedDriver({ id: DRIVER_ID, status: 'ACTIVE' });
+      tx.trip.updateManyAndReturn.mockResolvedValue([
+        tripRow({ status: 'COMPLETED', startedAt: START, completedAt: END }),
+      ]);
+
+      const completed = await complete();
+
+      const args = tx.trip.updateManyAndReturn.mock.calls[0]![0];
+      expect(args.where).toEqual({
+        id: TRIP_ID,
+        driverId: DRIVER_ID,
+        status: 'IN_PROGRESS',
+      });
+      expect(args.data.status).toBe('COMPLETED');
+      expect(args.data.completedAt).toBeInstanceOf(Date);
+      expect(Object.keys(args.data).sort()).toEqual(['completedAt', 'status']);
+      // startedAt survives untouched.
+      expect(completed.startedAt).toBe('2027-01-04T08:00:00.000Z');
+    });
+
+    it('409s driver_not_linked when the link is gone', async () => {
+      lockedDriver(null);
+      await expect(complete()).rejects.toMatchObject({
+        status: 409,
+        message: DRIVER_ERROR.driverNotLinked,
+      });
+      expect(tx.trip.updateManyAndReturn).not.toHaveBeenCalled();
+    });
+
+    it('409s trip_not_completable when still owned but not running', async () => {
+      lockedDriver({ id: DRIVER_ID, status: 'ACTIVE' });
+      tx.trip.updateManyAndReturn.mockResolvedValue([]);
+      tx.trip.findFirst.mockResolvedValue({ id: TRIP_ID });
+
+      await expect(complete()).rejects.toMatchObject({
+        status: 409,
+        message: TRIP_ERROR.tripNotCompletable,
+      });
+      expect(audit.record).not.toHaveBeenCalled();
+    });
+
+    it('404s a missing trip and one owned by another driver', async () => {
+      lockedDriver({ id: DRIVER_ID, status: 'ACTIVE' });
+      tx.trip.updateManyAndReturn.mockResolvedValue([]);
+      tx.trip.findFirst.mockResolvedValue(null);
+
+      await expect(complete()).rejects.toMatchObject({
+        status: 404,
+        message: TRIP_ERROR.tripNotFound,
+      });
+    });
+
+    it('audits trip.completed with the source state only', async () => {
+      lockedDriver({ id: DRIVER_ID, status: 'ACTIVE' });
+      tx.trip.updateManyAndReturn.mockResolvedValue([
+        tripRow({ status: 'COMPLETED', completedAt: END }),
+      ]);
+
+      await complete();
+
+      expect(audit.record.mock.calls[0]![0]).toEqual({
+        actorUserId: DRIVER_USER_ID,
+        actorRole: 'DRIVER',
+        action: AUDIT_TRIP_COMPLETED,
+        entityType: 'trip',
+        entityId: TRIP_ID,
+        requestId: REQUEST_ID,
+        metadata: { from: 'IN_PROGRESS' },
+      });
+    });
+
+    it('propagates an audit failure so the transition rolls back', async () => {
+      lockedDriver({ id: DRIVER_ID, status: 'ACTIVE' });
+      tx.trip.updateManyAndReturn.mockResolvedValue([
+        tripRow({ status: 'COMPLETED' }),
+      ]);
+      audit.record.mockRejectedValue(new Error('synthetic audit failure'));
+
+      await expect(complete()).rejects.toThrow('synthetic audit failure');
     });
   });
 });

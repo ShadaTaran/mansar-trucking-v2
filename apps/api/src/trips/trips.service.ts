@@ -23,6 +23,7 @@ import {
   type CreateTripBody,
   DEFAULT_PAGE,
   DEFAULT_PAGE_SIZE,
+  type ListDriverTripsQuery,
   type ListTripsQuery,
   type UpdateTripBody,
 } from './trips.schemas.js';
@@ -33,9 +34,17 @@ export const AUDIT_TRIP_ASSIGNED = 'trip.assigned';
 export const AUDIT_TRIP_CANCELLED = 'trip.cancelled';
 export const AUDIT_TRIP_VERIFIED = 'trip.verified';
 export const AUDIT_TRIP_CLOSED = 'trip.closed';
+export const AUDIT_TRIP_STARTED = 'trip.started';
+export const AUDIT_TRIP_COMPLETED = 'trip.completed';
 
 /** SQLSTATE of a PostgreSQL exclusion-constraint violation (Stage 5A). */
 const EXCLUSION_VIOLATION = '23P01';
+/** SQLSTATE of a unique-index violation. */
+const UNIQUE_VIOLATION = '23505';
+
+/** The Stage 5A partial unique indexes, by their exact catalog names. */
+const ONE_IN_PROGRESS_PER_DRIVER = 'trips_one_in_progress_per_driver';
+const ONE_IN_PROGRESS_PER_VEHICLE = 'trips_one_in_progress_per_vehicle';
 
 /** Business text may still be corrected while a trip is being planned. */
 export const EDITABLE_FROM: readonly TripStatus[] = ['DRAFT', 'ASSIGNED'];
@@ -114,6 +123,24 @@ export function sqlState(error: unknown): string | null {
   ) as unknown;
   const code = property(cause, 'originalCode');
   return typeof code === 'string' ? code : null;
+}
+
+/**
+ * The index a unique violation names, taken from the structured field the
+ * Stage 5A.0 spike proved the pg adapter populates
+ * (`meta.driverAdapterError.cause.constraint.index`). No message is parsed,
+ * and `cause.detail` — which repeats the conflicting values — is never read.
+ */
+export function violatedIndex(error: unknown): string | null {
+  if (!(error instanceof Prisma.PrismaClientKnownRequestError)) {
+    return null;
+  }
+  const cause = property(
+    property(error.meta, 'driverAdapterError'),
+    'cause',
+  ) as unknown;
+  const index = property(property(cause, 'constraint'), 'index');
+  return typeof index === 'string' ? index : null;
 }
 
 type TripReader = Pick<Prisma.TransactionClient, 'trip'>;
@@ -404,6 +431,280 @@ export class TripsService {
       action: AUDIT_TRIP_CLOSED,
       conflict: TRIP_ERROR.tripNotClosable,
     });
+  }
+
+  // ---------------------------------------------------------------------
+  // Driver-facing operations (Stage 5C)
+  //
+  // ADR 0002: the JWT identifies a `users` row, trips belong to a `drivers`
+  // row, and the two are joined only by `drivers.user_id`. Everything below
+  // resolves that link itself and scopes every query to the resulting driver
+  // id — a driver id is never accepted from the client.
+  // ---------------------------------------------------------------------
+
+  /** The authenticated driver's own trips, never anyone else's. */
+  async listForDriver(input: {
+    readonly actor: TripActor;
+    readonly query: ListDriverTripsQuery;
+  }): Promise<Page<Trip>> {
+    const driverId = await this.linkedDriverIdForRead(input.actor.userId);
+    const { query } = input;
+    const page = query.page ?? DEFAULT_PAGE;
+    const pageSize = query.pageSize ?? DEFAULT_PAGE_SIZE;
+    const where: Prisma.TripWhereInput = {
+      driverId,
+      ...(query.status === undefined ? {} : { status: query.status }),
+    };
+
+    const [rows, total] = await this.prisma.$transaction([
+      this.prisma.trip.findMany({
+        where,
+        select: TRIP_SELECT,
+        orderBy: [
+          { scheduledStartAt: { sort: 'asc', nulls: 'last' } },
+          { id: 'asc' },
+        ],
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      }),
+      this.prisma.trip.count({ where }),
+    ]);
+
+    return { items: rows.map(toTrip), page, pageSize, total };
+  }
+
+  /**
+   * One of the authenticated driver's own trips. Another driver's trip is
+   * indistinguishable from one that does not exist: same 404, same body.
+   */
+  async getOneForDriver(input: {
+    readonly actor: TripActor;
+    readonly tripId: string;
+  }): Promise<Trip> {
+    const driverId = await this.linkedDriverIdForRead(input.actor.userId);
+    const row = await this.prisma.trip.findFirst({
+      where: { id: input.tripId, driverId },
+      select: TRIP_SELECT,
+    });
+    if (!row) {
+      throw new NotFoundException(TRIP_ERROR.tripNotFound);
+    }
+    return toTrip(row);
+  }
+
+  /**
+   * Begins a trip: ASSIGNED -> IN_PROGRESS, stamping `startedAt`.
+   *
+   * Three locks in one fixed order — driver, then vehicle, then the trip's
+   * own conditional claim — so this serialises against the ADMIN driver and
+   * vehicle status endpoints and against unlinking, all of which take the
+   * same driver row. Nothing else in this class may take these locks in
+   * another order.
+   *
+   * The final claim pins the driver id and the vehicle id as well as the
+   * status: an ADMIN re-assignment to a *different* driver never touches this
+   * driver's row, so the driver lock alone cannot make an earlier read safe.
+   */
+  async start(input: {
+    readonly actor: TripActor;
+    readonly tripId: string;
+    readonly requestId: string;
+  }): Promise<Trip> {
+    return this.prisma.$transaction(async (tx) => {
+      // 1. Driver row, locked by the authenticated login.
+      const driver = await this.lockLinkedDriver(tx, input.actor.userId);
+      if (!driver) {
+        throw new ConflictException(DRIVER_ERROR.driverNotLinked);
+      }
+      if (driver.status !== 'ACTIVE') {
+        throw new ConflictException(DRIVER_ERROR.driverInactive);
+      }
+
+      // 2. The trip, scoped to this driver so another owner reads as absent.
+      const trip = await tx.trip.findFirst({
+        where: { id: input.tripId, driverId: driver.id },
+        select: { id: true, status: true, vehicleId: true },
+      });
+      if (!trip) {
+        throw new NotFoundException(TRIP_ERROR.tripNotFound);
+      }
+      if (trip.status !== 'ASSIGNED') {
+        throw new ConflictException(TRIP_ERROR.tripNotStartable);
+      }
+      if (trip.vehicleId === null) {
+        // Stage 5A's trips_assignment_complete makes this unreachable.
+        throw new AuthInvariantError('assigned trip carries no vehicle');
+      }
+
+      // 3. Vehicle row, always after the driver row.
+      const vehicle = await this.lockVehicle(tx, trip.vehicleId);
+      if (!vehicle) {
+        // The trip's foreign key makes this unreachable.
+        throw new AuthInvariantError('assigned vehicle is missing');
+      }
+      if (vehicle.status !== 'ACTIVE') {
+        throw new ConflictException(TRIP_ERROR.vehicleNotActive);
+      }
+
+      // 4. The claim: ownership, the observed vehicle and the status.
+      let claimed;
+      try {
+        claimed = await tx.trip.updateManyAndReturn({
+          where: {
+            id: input.tripId,
+            driverId: driver.id,
+            vehicleId: trip.vehicleId,
+            status: 'ASSIGNED',
+          },
+          data: { status: 'IN_PROGRESS', startedAt: new Date() },
+          select: TRIP_SELECT,
+        });
+      } catch (error) {
+        throw this.translateRunningConflict(error);
+      }
+      const row = this.singleClaim(claimed);
+      if (!row) {
+        throw await this.unownedClaimError(
+          tx,
+          input.tripId,
+          driver.id,
+          TRIP_ERROR.tripNotStartable,
+        );
+      }
+
+      await this.record(tx, {
+        actor: input.actor,
+        action: AUDIT_TRIP_STARTED,
+        tripId: row.id,
+        requestId: input.requestId,
+        metadata: { from: 'ASSIGNED' },
+      });
+      return toTrip(row);
+    });
+  }
+
+  /**
+   * Ends a trip: IN_PROGRESS -> COMPLETED, stamping `completedAt`.
+   *
+   * Deliberately weaker than `start`: an INACTIVE driver and a non-ACTIVE
+   * vehicle may both still complete, because a driver or a truck can be taken
+   * out of service while a trip is already running and a running trip must
+   * never be left stranded. The vehicle is neither read nor locked.
+   *
+   * The driver row is still locked, even though its status is not checked:
+   * it is the serialisation point unlinking uses, so completion and unlink
+   * cannot interleave.
+   */
+  async complete(input: {
+    readonly actor: TripActor;
+    readonly tripId: string;
+    readonly requestId: string;
+  }): Promise<Trip> {
+    return this.prisma.$transaction(async (tx) => {
+      const driver = await this.lockLinkedDriver(tx, input.actor.userId);
+      if (!driver) {
+        throw new ConflictException(DRIVER_ERROR.driverNotLinked);
+      }
+
+      const claimed = await tx.trip.updateManyAndReturn({
+        where: {
+          id: input.tripId,
+          driverId: driver.id,
+          status: 'IN_PROGRESS',
+        },
+        data: { status: 'COMPLETED', completedAt: new Date() },
+        select: TRIP_SELECT,
+      });
+      const row = this.singleClaim(claimed);
+      if (!row) {
+        throw await this.unownedClaimError(
+          tx,
+          input.tripId,
+          driver.id,
+          TRIP_ERROR.tripNotCompletable,
+        );
+      }
+
+      await this.record(tx, {
+        actor: input.actor,
+        action: AUDIT_TRIP_COMPLETED,
+        tripId: row.id,
+        requestId: input.requestId,
+        metadata: { from: 'IN_PROGRESS' },
+      });
+      return toTrip(row);
+    });
+  }
+
+  /**
+   * The operational driver behind a login, for reads only.
+   *
+   * The status is deliberately not checked: a deactivated driver keeps read
+   * access to their own trips, and a trip that was running when they were
+   * deactivated still has to be completable.
+   */
+  private async linkedDriverIdForRead(userId: string): Promise<string> {
+    const driver = await this.prisma.driver.findUnique({
+      where: { userId },
+      select: { id: true },
+    });
+    if (!driver) {
+      throw new ConflictException(DRIVER_ERROR.driverNotLinked);
+    }
+    return driver.id;
+  }
+
+  /**
+   * Locks the operational driver row behind a login. `drivers.user_id` is
+   * unique, so this matches at most one row, and the lock is the first of the
+   * two resource locks a start takes.
+   */
+  private async lockLinkedDriver(
+    tx: Prisma.TransactionClient,
+    userId: string,
+  ): Promise<{ id: string; status: DriverStatus } | null> {
+    const rows = await tx.$queryRaw<{ id: string; status: DriverStatus }[]>`
+      SELECT id, status FROM drivers WHERE user_id = ${userId}::uuid FOR UPDATE`;
+    return rows[0] ?? null;
+  }
+
+  /**
+   * Maps the Stage 5A one-running-trip indexes onto their domain codes, by
+   * SQLSTATE and exact index name. Any other unique violation propagates
+   * untouched rather than being collapsed into one of these.
+   */
+  private translateRunningConflict(error: unknown): unknown {
+    if (sqlState(error) !== UNIQUE_VIOLATION) {
+      return error;
+    }
+    switch (violatedIndex(error)) {
+      case ONE_IN_PROGRESS_PER_DRIVER:
+        return new ConflictException(TRIP_ERROR.driverTripInProgress);
+      case ONE_IN_PROGRESS_PER_VEHICLE:
+        return new ConflictException(TRIP_ERROR.vehicleTripInProgress);
+      default:
+        return error;
+    }
+  }
+
+  /**
+   * Zero rows claimed on a driver-scoped write. Ownership is re-checked now,
+   * not taken from the earlier read: a trip re-assigned away mid-call is
+   * reported as absent, exactly like one that never existed.
+   */
+  private async unownedClaimError(
+    tx: TripReader,
+    tripId: string,
+    driverId: string,
+    conflict: TripErrorCode,
+  ): Promise<NotFoundException | ConflictException> {
+    const owned = await tx.trip.findFirst({
+      where: { id: tripId, driverId },
+      select: { id: true },
+    });
+    return owned
+      ? new ConflictException(conflict)
+      : new NotFoundException(TRIP_ERROR.tripNotFound);
   }
 
   /**

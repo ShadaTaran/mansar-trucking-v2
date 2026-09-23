@@ -366,54 +366,56 @@ Auth failure
 
 - [ ] wrong password → 401 `invalid_credentials`; unknown email indistinguishable
 
-## 12a. Stage 4 deployment checklist (to perform after the Stage 4 push)
+## 12a. Stage 4 deployment verification (performed)
 
-Not yet performed. Every box below is unticked on purpose: it is run once the
-four Stage 4 commits are pushed and Railway has deployed them, and the result
-is recorded only after it actually happens. Synthetic data only, no token or
-password ever printed.
+Verified on commit `f24e9b78e8a2eaf2ec1b2b224b97b24cccdac6c5`, with synthetic
+data only and no token or password printed.
 
-Pipeline, against the exact pushed commit SHA
+Pipeline, against that exact SHA
 
-- [ ] the GitHub Actions run for that SHA succeeds
-- [ ] `mansar-api` deploys that SHA; the pre-deploy migration command runs
-- [ ] `npm run db:migrate:status -w @mansar/api` against staging: all three
-      migrations applied, none pending
-- [ ] `GET /health/ready` → 200 with `checks.database = ok`
-- [ ] `mansar-web` deploys that same SHA
+- [x] GitHub Actions run `35802220693` — success
+- [x] `mansar-api` deployment `10d74992-c2ed-4863-8088-e49d9844ef75` — success
+      on that SHA; the pre-deploy command applied the Stage 4 migration
+- [x] `railway ssh -- npm run db:migrate:status -w @mansar/api` — 3 migrations,
+      "Database schema is up to date!"
+- [x] `GET /health/ready` — 200 with `checks.database = "ok"`
+- [x] `mansar-web` deployment `eedb1d7a-7d8c-4210-9abf-385b496cb074` — success
+      on that SHA
 
 Admin web, signed in as the synthetic staging ADMIN
 
-- [ ] `/dashboard` loads
-- [ ] `/drivers` loads
-- [ ] create a synthetic driver
-- [ ] edit that driver
-- [ ] link the synthetic `DRIVER` login to it
-- [ ] deactivate the linked driver; confirm the documented result — driver
-      `INACTIVE`, that login's refresh sessions revoked (`DEACTIVATED`), the
-      user account itself unchanged (see
-      [drivers-vehicles.md](drivers-vehicles.md) §6)
-- [ ] reactivate the driver
-- [ ] unlink the login
-- [ ] `/vehicles` loads
-- [ ] create a synthetic vehicle using non-canonical plate input
-      (e.g. leading/trailing spaces, doubled spaces, lower case)
-- [ ] the returned plate is the canonical form
-- [ ] edit that vehicle
-- [ ] move it through `ACTIVE`, `IN_MAINTENANCE` and `RETIRED`, and back
+- [x] `/dashboard`, `/drivers` and `/vehicles` render authenticated
+- [x] Stage 4 data traffic stays same-origin through `/api/backend/*`; the
+      browser makes no request to the API origin
+- [x] driver create, edit and login link
+- [x] deactivating the linked driver returned `INACTIVE` with
+      `revokedSessions=1`, while the linked `User.isActive` stayed `true`
+- [x] the Android staging app, force-stopped and relaunched, returned to the
+      login screen because its stored refresh session had been revoked
+- [x] driver reactivated, then unlinked
+- [x] the same DRIVER account authenticated again afterwards
+- [x] vehicle created from the non-canonical input `' stg4e   run2   01 '`
+      and stored as exactly `STG4E RUN2 01`
+- [x] vehicle edit persisted
+- [x] odometer corrected `100` → `50`
+- [x] vehicle moved `ACTIVE` → `IN_MAINTENANCE` → `RETIRED` → `ACTIVE`
 
 Authorization
 
-- [ ] a `DRIVER` principal cannot reach the ADMIN management endpoints
-      (403 `forbidden`)
+- [x] a `DRIVER` principal received `403 forbidden` from the ADMIN driver and
+      vehicle endpoints
 
 Cleanup
 
-- [ ] remove the synthetic smoke records where that is safe and appropriate
+- [x] assessed: Stage 4 has no application delete operation, and deleting
+      rows directly from PostgreSQL was deliberately not done. The smoke
+      driver and vehicle remain as synthetic staging data.
+- [x] the temporary authentication sessions the smoke created were revoked
 
 Production
 
-- [ ] the `production` environment remains untouched throughout
+- [x] untouched throughout: the `production` environment has no services and
+      no buckets
 
 ## 13. Not in scope for staging
 

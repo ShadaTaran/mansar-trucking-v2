@@ -91,6 +91,28 @@ export interface Vehicle {
 }
 
 /**
+ * Haulage job as the API returns it. Ownership is the operational driver
+ * (ADR 0002): a trip never carries a login identity. Every instant is an ISO
+ * 8601 string in UTC, and the assignment fields stay null until the trip is
+ * assigned.
+ */
+export interface Trip {
+  readonly id: string;
+  readonly status: TripStatus;
+  readonly driverId: string | null;
+  readonly vehicleId: string | null;
+  readonly origin: string;
+  readonly destination: string;
+  readonly scheduledStartAt: string | null;
+  readonly scheduledEndAt: string | null;
+  readonly startedAt: string | null;
+  readonly completedAt: string | null;
+  readonly notes: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+/**
  * Temporary workspace-resolution probe.
  *
  * Consumed by other workspaces (api-client now; web/mobile once scaffolded)

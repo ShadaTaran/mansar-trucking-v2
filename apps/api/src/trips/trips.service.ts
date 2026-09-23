@@ -1,0 +1,525 @@
+import type { Page, Trip } from '@mansar/types';
+import {
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+
+import { AuditService } from '../audit/audit.service.js';
+import { AuthInvariantError } from '../auth/errors.js';
+import type { AuthenticatedPrincipal } from '../auth/principal.js';
+import { PrismaService } from '../database/prisma.service.js';
+import { DRIVER_ERROR } from '../drivers/drivers.errors.js';
+import { Prisma } from '../generated/prisma/client.js';
+import type {
+  DriverStatus,
+  TripStatus,
+  VehicleStatus,
+} from '../generated/prisma/enums.js';
+import { VEHICLE_ERROR } from '../vehicles/vehicles.errors.js';
+import { TRIP_ERROR, type TripErrorCode } from './trips.errors.js';
+import {
+  type AssignTripBody,
+  type CreateTripBody,
+  DEFAULT_PAGE,
+  DEFAULT_PAGE_SIZE,
+  type ListTripsQuery,
+  type UpdateTripBody,
+} from './trips.schemas.js';
+
+export const AUDIT_TRIP_CREATED = 'trip.created';
+export const AUDIT_TRIP_UPDATED = 'trip.updated';
+export const AUDIT_TRIP_ASSIGNED = 'trip.assigned';
+export const AUDIT_TRIP_CANCELLED = 'trip.cancelled';
+export const AUDIT_TRIP_VERIFIED = 'trip.verified';
+export const AUDIT_TRIP_CLOSED = 'trip.closed';
+
+/** SQLSTATE of a PostgreSQL exclusion-constraint violation (Stage 5A). */
+const EXCLUSION_VIOLATION = '23P01';
+
+/** Business text may still be corrected while a trip is being planned. */
+export const EDITABLE_FROM: readonly TripStatus[] = ['DRAFT', 'ASSIGNED'];
+/** ASSIGNED is included on purpose: in-place re-assignment/rescheduling. */
+export const ASSIGNABLE_FROM: readonly TripStatus[] = ['DRAFT', 'ASSIGNED'];
+/** Tried in this order, one conditional claim each; both are legal sources. */
+export const CANCELLABLE_FROM: readonly TripStatus[] = ['DRAFT', 'ASSIGNED'];
+export const VERIFIABLE_FROM: TripStatus = 'COMPLETED';
+export const CLOSABLE_FROM: TripStatus = 'VERIFIED';
+
+/** Acting ADMIN, as the controller takes it from the verified access token. */
+export type TripActor = Pick<AuthenticatedPrincipal, 'userId' | 'role'>;
+
+const TRIP_SELECT = {
+  id: true,
+  status: true,
+  driverId: true,
+  vehicleId: true,
+  origin: true,
+  destination: true,
+  scheduledStartAt: true,
+  scheduledEndAt: true,
+  startedAt: true,
+  completedAt: true,
+  notes: true,
+  createdAt: true,
+  updatedAt: true,
+} satisfies Prisma.TripSelect;
+
+type TripRow = Prisma.TripGetPayload<{ select: typeof TRIP_SELECT }>;
+
+const iso = (value: Date | null): string | null =>
+  value === null ? null : value.toISOString();
+
+/** Prisma row → wire shape; every instant becomes an ISO 8601 UTC string. */
+function toTrip(row: TripRow): Trip {
+  return {
+    id: row.id,
+    status: row.status,
+    driverId: row.driverId,
+    vehicleId: row.vehicleId,
+    origin: row.origin,
+    destination: row.destination,
+    scheduledStartAt: iso(row.scheduledStartAt),
+    scheduledEndAt: iso(row.scheduledEndAt),
+    startedAt: iso(row.startedAt),
+    completedAt: iso(row.completedAt),
+    notes: row.notes,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+function property(value: unknown, key: string): unknown {
+  return typeof value === 'object' && value !== null
+    ? (value as Record<string, unknown>)[key]
+    : undefined;
+}
+
+/**
+ * SQLSTATE of a Prisma failure, read from the driver adapter's cause.
+ *
+ * The Prisma `P` code is deliberately not the key: the Stage 5A.0 spike
+ * showed that exclusion (23P01) and check (23514) violations both arrive as
+ * the undocumented `P2039`, so the SQLSTATE is the only stable signal.
+ * Nothing here reads `cause.message` or `cause.detail`, which repeat the
+ * conflicting driver id, vehicle id and schedule bounds.
+ */
+export function sqlState(error: unknown): string | null {
+  if (!(error instanceof Prisma.PrismaClientKnownRequestError)) {
+    return null;
+  }
+  const cause = property(
+    property(error.meta, 'driverAdapterError'),
+    'cause',
+  ) as unknown;
+  const code = property(cause, 'originalCode');
+  return typeof code === 'string' ? code : null;
+}
+
+type TripReader = Pick<Prisma.TransactionClient, 'trip'>;
+
+/**
+ * Admin management of trips (Stage 5B). Rows are never deleted; `status` is
+ * the lifecycle and there is no delete route.
+ *
+ * Every mutation runs in one interactive transaction with its audit row, and
+ * every transition is a conditional claim: the row is updated only while its
+ * status still matches the state this call decided to replace, so two
+ * concurrent callers can never both report success. Schedule overlap is not
+ * pre-checked in application code — the Stage 5A exclusion constraints are
+ * the arbiter, and their SQLSTATE becomes `trip_schedule_conflict`.
+ */
+@Injectable()
+export class TripsService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly audit: AuditService,
+  ) {}
+
+  async list(query: ListTripsQuery): Promise<Page<Trip>> {
+    const page = query.page ?? DEFAULT_PAGE;
+    const pageSize = query.pageSize ?? DEFAULT_PAGE_SIZE;
+    const search = query.q === undefined || query.q === '' ? null : query.q;
+    const where: Prisma.TripWhereInput = {
+      ...(query.status === undefined ? {} : { status: query.status }),
+      ...(query.driverId === undefined ? {} : { driverId: query.driverId }),
+      ...(query.vehicleId === undefined ? {} : { vehicleId: query.vehicleId }),
+      // Notes are deliberately not searchable.
+      ...(search === null
+        ? {}
+        : {
+            OR: [
+              { origin: { contains: search, mode: 'insensitive' } },
+              { destination: { contains: search, mode: 'insensitive' } },
+            ],
+          }),
+    };
+
+    const [rows, total] = await this.prisma.$transaction([
+      this.prisma.trip.findMany({
+        where,
+        select: TRIP_SELECT,
+        // Deterministic: scheduled start with unscheduled trips last, then id
+        // as the tie-breaker. The null placement is explicit, never implied.
+        orderBy: [
+          { scheduledStartAt: { sort: 'asc', nulls: 'last' } },
+          { id: 'asc' },
+        ],
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      }),
+      this.prisma.trip.count({ where }),
+    ]);
+
+    return { items: rows.map(toTrip), page, pageSize, total };
+  }
+
+  async getOne(tripId: string): Promise<Trip> {
+    const row = await this.prisma.trip.findUnique({
+      where: { id: tripId },
+      select: TRIP_SELECT,
+    });
+    if (!row) {
+      throw new NotFoundException(TRIP_ERROR.tripNotFound);
+    }
+    return toTrip(row);
+  }
+
+  /**
+   * Always a DRAFT with no assignment: the client cannot set the status, the
+   * driver, the vehicle or any instant.
+   */
+  async create(input: {
+    readonly actor: TripActor;
+    readonly body: CreateTripBody;
+    readonly requestId: string;
+  }): Promise<Trip> {
+    const { body } = input;
+    return this.prisma.$transaction(async (tx) => {
+      const row = await tx.trip.create({
+        data: {
+          origin: body.origin,
+          destination: body.destination,
+          notes: body.notes,
+        },
+        select: TRIP_SELECT,
+      });
+      await this.record(tx, {
+        actor: input.actor,
+        action: AUDIT_TRIP_CREATED,
+        tripId: row.id,
+        requestId: input.requestId,
+        metadata: {},
+      });
+      return toTrip(row);
+    });
+  }
+
+  /**
+   * Business text only, while the trip is still being planned. The claim
+   * carries the editable states in `where`, so a trip that moved on is never
+   * edited by a caller that read it a moment earlier.
+   */
+  async update(input: {
+    readonly actor: TripActor;
+    readonly tripId: string;
+    readonly body: UpdateTripBody;
+    readonly requestId: string;
+  }): Promise<Trip> {
+    const { body } = input;
+    const data: Prisma.TripUpdateInput = {
+      ...(body.origin === undefined ? {} : { origin: body.origin }),
+      ...(body.destination === undefined
+        ? {}
+        : { destination: body.destination }),
+      ...(body.notes === undefined ? {} : { notes: body.notes }),
+    };
+    const fields = Object.keys(data).sort();
+
+    return this.prisma.$transaction(async (tx) => {
+      const claimed = await tx.trip.updateManyAndReturn({
+        where: { id: input.tripId, status: { in: [...EDITABLE_FROM] } },
+        data,
+        select: TRIP_SELECT,
+      });
+      const row = this.singleClaim(claimed);
+      if (!row) {
+        throw await this.unclaimedError(
+          tx,
+          input.tripId,
+          TRIP_ERROR.tripNotEditable,
+        );
+      }
+
+      await this.record(tx, {
+        actor: input.actor,
+        action: AUDIT_TRIP_UPDATED,
+        tripId: row.id,
+        requestId: input.requestId,
+        // Field names only: never the submitted values.
+        metadata: { fields },
+      });
+      return toTrip(row);
+    });
+  }
+
+  /**
+   * Assigns or re-assigns a driver, a vehicle and a schedule.
+   *
+   * Resource state is taken from rows locked `FOR UPDATE`, always driver
+   * first and vehicle second so no code path can invert the order and
+   * deadlock. Holding those locks is what serialises this call against the
+   * Stage 4 status endpoints: whichever transaction takes a lock first wins,
+   * and the loser sees the committed state rather than a stale ACTIVE read.
+   * Overlapping schedules are left to the database.
+   */
+  async assign(input: {
+    readonly actor: TripActor;
+    readonly tripId: string;
+    readonly body: AssignTripBody;
+    readonly requestId: string;
+  }): Promise<Trip> {
+    const { body } = input;
+    return this.prisma.$transaction(async (tx) => {
+      const driver = await this.lockDriver(tx, body.driverId);
+      if (!driver) {
+        throw new NotFoundException(DRIVER_ERROR.driverNotFound);
+      }
+      if (driver.status !== 'ACTIVE') {
+        throw new ConflictException(DRIVER_ERROR.driverInactive);
+      }
+
+      const vehicle = await this.lockVehicle(tx, body.vehicleId);
+      if (!vehicle) {
+        throw new NotFoundException(VEHICLE_ERROR.vehicleNotFound);
+      }
+      if (vehicle.status !== 'ACTIVE') {
+        throw new ConflictException(TRIP_ERROR.vehicleNotActive);
+      }
+
+      let claimed;
+      try {
+        claimed = await tx.trip.updateManyAndReturn({
+          where: { id: input.tripId, status: { in: [...ASSIGNABLE_FROM] } },
+          data: {
+            status: 'ASSIGNED',
+            driverId: body.driverId,
+            vehicleId: body.vehicleId,
+            scheduledStartAt: body.scheduledStartAt,
+            scheduledEndAt: body.scheduledEndAt,
+          },
+          select: TRIP_SELECT,
+        });
+      } catch (error) {
+        // The Stage 5A exclusion constraints are the only arbiter of overlap.
+        if (sqlState(error) === EXCLUSION_VIOLATION) {
+          throw new ConflictException(TRIP_ERROR.tripScheduleConflict);
+        }
+        throw error;
+      }
+      const row = this.singleClaim(claimed);
+      if (!row) {
+        throw await this.unclaimedError(
+          tx,
+          input.tripId,
+          TRIP_ERROR.tripNotAssignable,
+        );
+      }
+
+      await this.record(tx, {
+        actor: input.actor,
+        action: AUDIT_TRIP_ASSIGNED,
+        tripId: row.id,
+        requestId: input.requestId,
+        // Identifiers only: never the schedule, the route or any name.
+        metadata: { driverId: body.driverId, vehicleId: body.vehicleId },
+      });
+      return toTrip(row);
+    });
+  }
+
+  /**
+   * Cancels a trip that has not started. The assignment and the schedule are
+   * kept as history; the Stage 5A exclusion predicate excludes CANCELLED, so
+   * the reservation is released by the status change alone.
+   *
+   * Cancellation has two legal source states, so it tries one conditional
+   * claim per state instead of reading the status first. Nothing is read to
+   * authorize the write: a trip that moves DRAFT -> ASSIGNED between the two
+   * attempts is still cancellable, and the state that is audited is the one
+   * whose claim actually won the row.
+   */
+  cancel(input: {
+    readonly actor: TripActor;
+    readonly tripId: string;
+    readonly requestId: string;
+  }): Promise<Trip> {
+    return this.prisma.$transaction(async (tx) => {
+      for (const from of CANCELLABLE_FROM) {
+        const row = await this.claim(tx, input.tripId, from, 'CANCELLED');
+        if (row) {
+          await this.record(tx, {
+            actor: input.actor,
+            action: AUDIT_TRIP_CANCELLED,
+            tripId: row.id,
+            requestId: input.requestId,
+            // State names only; `from` is the status this claim replaced.
+            metadata: { from },
+          });
+          return toTrip(row);
+        }
+      }
+      // Neither source state matched: one read, only to choose the answer.
+      throw await this.unclaimedError(
+        tx,
+        input.tripId,
+        TRIP_ERROR.tripNotCancellable,
+      );
+    });
+  }
+
+  verify(input: {
+    readonly actor: TripActor;
+    readonly tripId: string;
+    readonly requestId: string;
+  }): Promise<Trip> {
+    return this.transition({
+      ...input,
+      from: VERIFIABLE_FROM,
+      to: 'VERIFIED',
+      action: AUDIT_TRIP_VERIFIED,
+      conflict: TRIP_ERROR.tripNotVerifiable,
+    });
+  }
+
+  close(input: {
+    readonly actor: TripActor;
+    readonly tripId: string;
+    readonly requestId: string;
+  }): Promise<Trip> {
+    return this.transition({
+      ...input,
+      from: CLOSABLE_FROM,
+      to: 'CLOSED',
+      action: AUDIT_TRIP_CLOSED,
+      conflict: TRIP_ERROR.tripNotClosable,
+    });
+  }
+
+  /**
+   * One lifecycle step with a single legal source state: a conditional claim
+   * and nothing else. The status is never read to authorize the write, so
+   * `from` is a constant that the successful claim has already proven.
+   */
+  private transition(input: {
+    readonly actor: TripActor;
+    readonly tripId: string;
+    readonly requestId: string;
+    readonly from: TripStatus;
+    readonly to: TripStatus;
+    readonly action: string;
+    readonly conflict: TripErrorCode;
+  }): Promise<Trip> {
+    return this.prisma.$transaction(async (tx) => {
+      const row = await this.claim(tx, input.tripId, input.from, input.to);
+      if (!row) {
+        throw await this.unclaimedError(tx, input.tripId, input.conflict);
+      }
+
+      await this.record(tx, {
+        actor: input.actor,
+        action: input.action,
+        tripId: row.id,
+        requestId: input.requestId,
+        metadata: { from: input.from },
+      });
+      return toTrip(row);
+    });
+  }
+
+  /**
+   * Claims a status change from one exact source state. `undefined` means no
+   * row matched, which leaves the caller free to try the next legal source
+   * before deciding whether the trip is missing or simply in another state.
+   */
+  private async claim(
+    tx: TripReader,
+    tripId: string,
+    from: TripStatus,
+    to: TripStatus,
+  ): Promise<TripRow | undefined> {
+    const claimed = await tx.trip.updateManyAndReturn({
+      where: { id: tripId, status: from },
+      data: { status: to },
+      select: TRIP_SELECT,
+    });
+    return this.singleClaim(claimed);
+  }
+
+  /** Locks the driver row; the first of the two resource locks, always. */
+  private async lockDriver(
+    tx: Prisma.TransactionClient,
+    driverId: string,
+  ): Promise<{ status: DriverStatus } | null> {
+    const rows = await tx.$queryRaw<{ status: DriverStatus }[]>`
+      SELECT status FROM drivers WHERE id = ${driverId}::uuid FOR UPDATE`;
+    return rows[0] ?? null;
+  }
+
+  /** Locks the vehicle row; always after the driver lock. */
+  private async lockVehicle(
+    tx: Prisma.TransactionClient,
+    vehicleId: string,
+  ): Promise<{ status: VehicleStatus } | null> {
+    const rows = await tx.$queryRaw<{ status: VehicleStatus }[]>`
+      SELECT status FROM vehicles WHERE id = ${vehicleId}::uuid FOR UPDATE`;
+    return rows[0] ?? null;
+  }
+
+  /** The id is the primary key, so a claim can never match two rows. */
+  private singleClaim(claimed: readonly TripRow[]): TripRow | undefined {
+    if (claimed.length > 1) {
+      throw new AuthInvariantError('trip id matched several rows');
+    }
+    return claimed[0];
+  }
+
+  /** Zero rows claimed: the trip is gone, or it is no longer in that state. */
+  private async unclaimedError(
+    tx: TripReader,
+    tripId: string,
+    conflict: TripErrorCode,
+  ): Promise<NotFoundException | ConflictException> {
+    const existing = await tx.trip.findUnique({
+      where: { id: tripId },
+      select: { id: true },
+    });
+    return existing
+      ? new ConflictException(conflict)
+      : new NotFoundException(TRIP_ERROR.tripNotFound);
+  }
+
+  private record(
+    tx: Prisma.TransactionClient,
+    entry: {
+      readonly actor: TripActor;
+      readonly action: string;
+      readonly tripId: string;
+      readonly requestId: string;
+      readonly metadata: Prisma.InputJsonValue;
+    },
+  ): Promise<void> {
+    return this.audit.record(
+      {
+        actorUserId: entry.actor.userId,
+        actorRole: entry.actor.role,
+        action: entry.action,
+        entityType: 'trip',
+        entityId: entry.tripId,
+        requestId: entry.requestId,
+        metadata: entry.metadata,
+      },
+      tx,
+    );
+  }
+}

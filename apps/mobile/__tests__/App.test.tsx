@@ -37,6 +37,43 @@ const { __mansarConfigFake: nativeConfig } = jest.requireMock<
 
 const PASSWORD = 'synthetic password value';
 
+/** Synthetic trip the driver flow lists and opens; never real data. */
+const TRIP = {
+  id: '019a0000-0000-7000-8000-00000000001a',
+  status: 'ASSIGNED',
+  driverId: '019a0000-0000-7000-8000-00000000000d',
+  vehicleId: '019a0000-0000-7000-8000-00000000000e',
+  origin: 'Synthetic Origin',
+  destination: 'Synthetic Destination',
+  scheduledStartAt: '2026-09-24T00:30:00.000Z',
+  scheduledEndAt: '2026-09-24T04:30:00.000Z',
+  startedAt: null,
+  completedAt: null,
+  notes: '',
+  createdAt: '2026-09-01T00:00:00.000Z',
+  updatedAt: '2026-09-02T00:00:00.000Z',
+};
+
+const EMPTY_TRIP_PAGE = { items: [], page: 1, pageSize: 25, total: 0 };
+
+/**
+ * Answers the driver-trips requests the authenticated flow now makes on
+ * mount, so no test performs an uncontrolled network call. Auth traffic
+ * still goes through the injected fake API, not this stub.
+ */
+function stubTripFetch(body: unknown = EMPTY_TRIP_PAGE) {
+  const urls: string[] = [];
+  const mock = jest.fn(async (input: unknown) => {
+    urls.push(String(input));
+    return {
+      status: 200,
+      text: async () => JSON.stringify(body),
+    } as unknown as Response;
+  });
+  globalThis.fetch = mock as unknown as typeof fetch;
+  return urls;
+}
+
 let api: FakeAuthApi;
 let session: SessionManager;
 
@@ -67,6 +104,11 @@ beforeEach(() => {
   resetDefaultSessionForTests();
   api = createFakeAuthApi();
   session = newSession();
+  stubTripFetch();
+});
+
+afterEach(() => {
+  delete (globalThis as { fetch?: unknown }).fetch;
 });
 
 describe('App', () => {
@@ -100,7 +142,7 @@ describe('App', () => {
     );
   });
 
-  it('signs a DRIVER in, shows the placeholder and renders no token', async () => {
+  it('signs a DRIVER in, shows the trip list and renders no token', async () => {
     api.login.mockResolvedValueOnce(loginResult(2));
     await render(<App session={session} />);
     await screen.findByRole('button', { name: 'Sign in' });
@@ -110,6 +152,12 @@ describe('App', () => {
     expect(
       await screen.findByText('Signed in as driver@example.test'),
     ).toBeOnTheScreen();
+    // Stage 5E: the authenticated placeholder is gone; the driver lands on
+    // their own trips.
+    expect(await screen.findByText('My trips')).toBeOnTheScreen();
+    expect(
+      screen.queryByText('Trip screens arrive in a later stage.'),
+    ).toBeNull();
     expect(api.login).toHaveBeenCalledWith({
       email: 'driver@example.test',
       password: PASSWORD,
@@ -244,6 +292,102 @@ describe('App', () => {
     expect(
       await screen.findByRole('button', { name: 'Sign in' }),
     ).toBeOnTheScreen();
+    expect(keychain.entries.size).toBe(0);
+  });
+});
+
+describe('App driver trip flow', () => {
+  /** Signs a synthetic DRIVER in and waits for the trip list. */
+  async function signedInDriver(): Promise<void> {
+    api.login.mockResolvedValueOnce(loginResult(8));
+    await render(<App session={session} />);
+    await screen.findByRole('button', { name: 'Sign in' });
+    await signIn('driver@example.test');
+    await screen.findByText('My trips');
+  }
+
+  it('lists trips, opens one and comes back, all on local state', async () => {
+    const urls = stubTripFetch();
+    (globalThis.fetch as jest.Mock).mockImplementation(
+      async (input: unknown) => {
+        const url = String(input);
+        urls.push(url);
+        const body = url.includes(`/driver/trips/${TRIP.id}`)
+          ? TRIP
+          : { items: [TRIP], page: 1, pageSize: 25, total: 1 };
+        return {
+          status: 200,
+          text: async () => JSON.stringify(body),
+        } as unknown as Response;
+      },
+    );
+
+    await signedInDriver();
+
+    // The list asked the driver endpoint for page 1 only.
+    expect(
+      await screen.findByText('Synthetic Origin → Synthetic Destination'),
+    ).toBeOnTheScreen();
+    expect(urls).toContain(
+      'http://10.0.2.2:3001/driver/trips?page=1&pageSize=25',
+    );
+
+    await fireEvent.press(
+      screen.getByText('Synthetic Origin → Synthetic Destination'),
+    );
+
+    // The detail screen replaced the list; no navigation library involved.
+    expect(await screen.findByText('Status: ASSIGNED')).toBeOnTheScreen();
+    expect(screen.getByText('Origin: Synthetic Origin')).toBeOnTheScreen();
+    expect(screen.queryByText('My trips')).toBeNull();
+    expect(urls).toContain(`http://10.0.2.2:3001/driver/trips/${TRIP.id}`);
+
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Back to trips' }),
+    );
+
+    expect(await screen.findByText('My trips')).toBeOnTheScreen();
+    expect(screen.queryByText('Origin: Synthetic Origin')).toBeNull();
+  });
+
+  it('never puts a token in a trip URL or body', async () => {
+    const sent: Array<{ url: string; init: unknown }> = [];
+    globalThis.fetch = jest.fn(async (input: unknown, init: unknown) => {
+      sent.push({ url: String(input), init });
+      return {
+        status: 200,
+        text: async () => JSON.stringify(EMPTY_TRIP_PAGE),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+
+    await signedInDriver();
+
+    const tripCalls = sent.filter((call) => call.url.includes('/driver/trips'));
+    expect(tripCalls.length).toBeGreaterThan(0);
+    for (const call of tripCalls) {
+      expect(call.url).not.toMatch(/synthetic\.access|synthetic-refresh/);
+      const init = call.init as {
+        headers: Record<string, string>;
+        body?: unknown;
+      };
+      expect(JSON.stringify(init.body ?? null)).not.toMatch(
+        /synthetic\.access|synthetic-refresh/,
+      );
+      // The token lives in exactly one place.
+      expect(init.headers.authorization).toBe('Bearer synthetic.access.8');
+    }
+    expect(renderedText()).not.toMatch(/synthetic\.access|synthetic-refresh/);
+  });
+
+  it('returns to the login screen when the driver signs out of the flow', async () => {
+    await signedInDriver();
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Sign out' }));
+
+    expect(
+      await screen.findByRole('button', { name: 'Sign in' }),
+    ).toBeOnTheScreen();
+    expect(screen.queryByText('My trips')).toBeNull();
     expect(keychain.entries.size).toBe(0);
   });
 });

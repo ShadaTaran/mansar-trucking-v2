@@ -1,7 +1,16 @@
-import { createApiClientConfig, createAuthApi } from '@mansar/api-client';
-import { useEffect } from 'react';
+import {
+  type AuthUser,
+  createApiClientConfig,
+  createAuthApi,
+} from '@mansar/api-client';
+import { useEffect, useMemo, useState } from 'react';
 
-import { AuthProvider, useAuthState } from './src/auth/auth-context';
+import { createAuthenticatedFetch } from './src/auth/authenticated-fetch';
+import {
+  AuthProvider,
+  useAuthState,
+  useSession,
+} from './src/auth/auth-context';
 import { createKeychainSecretStore } from './src/auth/auth-secret-store';
 import {
   createSessionManager,
@@ -13,8 +22,10 @@ import {
   BootstrapScreen,
 } from './src/screens/BootstrapScreen';
 import { DriverHomeScreen } from './src/screens/DriverHomeScreen';
+import { DriverTripDetailScreen } from './src/screens/DriverTripDetailScreen';
 import { LoginScreen } from './src/screens/LoginScreen';
 import { UnconfiguredBuildScreen } from './src/screens/UnconfiguredBuildScreen';
+import { createDriverTripsApi } from './src/trips/driver-trips-api';
 
 /**
  * Driver app root: one session manager for the process, one screen per
@@ -42,6 +53,40 @@ function getDefaultSession(): SessionManager | null {
   return defaultSession;
 }
 
+/**
+ * The signed-in driver flow: the trip list, or one trip.
+ *
+ * Navigation is one piece of local state, not a library. The trips API is
+ * built once here from the session, so every trip request goes through the
+ * existing authenticated fetch; when authentication ends this component
+ * unmounts and the selected trip disappears with it.
+ */
+function AuthenticatedFlow({ user }: { readonly user: AuthUser }) {
+  const session = useSession();
+  const [selectedTripId, setSelectedTripId] = useState<string | null>(null);
+  const api = useMemo(() => {
+    const apiBaseUrl = getApiBaseUrl();
+    return apiBaseUrl === null
+      ? null
+      : createDriverTripsApi(apiBaseUrl, createAuthenticatedFetch(session));
+  }, [session]);
+
+  // Unreachable in a configured build, which is the only kind that can
+  // sign in at all; failing closed here beats inventing an endpoint.
+  if (api === null) {
+    return <UnconfiguredBuildScreen />;
+  }
+  return selectedTripId === null ? (
+    <DriverHomeScreen api={api} onOpenTrip={setSelectedTripId} user={user} />
+  ) : (
+    <DriverTripDetailScreen
+      api={api}
+      onBack={() => setSelectedTripId(null)}
+      tripId={selectedTripId}
+    />
+  );
+}
+
 function Root() {
   const state = useAuthState();
   switch (state.status) {
@@ -52,7 +97,7 @@ function Root() {
     case 'unauthenticated':
       return <LoginScreen />;
     case 'authenticated':
-      return <DriverHomeScreen user={state.user} />;
+      return <AuthenticatedFlow user={state.user} />;
   }
 }
 

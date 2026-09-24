@@ -36,7 +36,7 @@ afterEach(() => {
 });
 
 describe('AdminNav', () => {
-  it('links to the three admin areas', () => {
+  it('links to the four admin areas', () => {
     render(<AdminNav />);
     expect(screen.getByRole('link', { name: 'Dashboard' })).toHaveAttribute(
       'href',
@@ -50,6 +50,16 @@ describe('AdminNav', () => {
       'href',
       '/vehicles',
     );
+    expect(screen.getByRole('link', { name: 'Trips' })).toHaveAttribute(
+      'href',
+      '/trips',
+    );
+  });
+
+  it('lists the sections in the agreed order', () => {
+    render(<AdminNav />);
+    const links = screen.getAllByRole('link').map((link) => link.textContent);
+    expect(links).toEqual(['Dashboard', 'Drivers', 'Vehicles', 'Trips']);
   });
 
   it('marks the current section, including its sub-routes', () => {
@@ -62,6 +72,24 @@ describe('AdminNav', () => {
     expect(screen.getByRole('link', { name: 'Vehicles' })).not.toHaveAttribute(
       'aria-current',
     );
+  });
+
+  it.each([
+    '/trips',
+    '/trips/new',
+    '/trips/019a0000-0000-7000-8000-00000000001a',
+  ])('marks Trips current on %s', (path) => {
+    pathname.value = path;
+    render(<AdminNav />);
+    expect(screen.getByRole('link', { name: 'Trips' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+    for (const other of ['Dashboard', 'Drivers', 'Vehicles']) {
+      expect(screen.getByRole('link', { name: other })).not.toHaveAttribute(
+        'aria-current',
+      );
+    }
   });
 
   it('logs out through the established BFF flow and returns to /login', async () => {

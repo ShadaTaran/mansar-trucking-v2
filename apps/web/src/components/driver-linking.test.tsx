@@ -94,7 +94,7 @@ describe('DriverLinking (unlinked)', () => {
     ['user_inactive', 'That login account is deactivated.'],
     ['user_already_linked', 'That login is already linked to another driver.'],
     ['driver_already_linked', 'This driver already has a linked login.'],
-    ['driver_inactive', 'Activate this driver before linking a login.'],
+    ['driver_inactive', 'This driver is inactive.'],
     ['driver_not_found', 'This driver no longer exists.'],
   ])('maps %s to friendly text', async (code, message) => {
     installFetch(() => json(409, { statusCode: 409, message: code }));
@@ -172,5 +172,30 @@ describe('DriverLinking (linked)', () => {
       'This driver has no linked login.',
     );
     expect(onChanged).not.toHaveBeenCalled();
+  });
+
+  it('refuses to unlink a driver who is running a trip (Stage 5C)', async () => {
+    installFetch(() =>
+      json(409, { statusCode: 409, message: 'driver_has_in_progress_trip' }),
+    );
+    const onChanged = vi.fn();
+    render(<DriverLinking driver={LINKED} onChanged={onChanged} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Unlink login' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm unlink' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'This driver cannot be unlinked while a trip is in progress.',
+    );
+    // Nothing was assumed: the linked login is still on screen.
+    expect(onChanged).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(LINKED.user!.email, { exact: false }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Unlink login' })).toBeEnabled();
+    // The Stage 4 wording still stands: unlinking is not a sign-out.
+    expect(document.body.textContent).not.toMatch(
+      /signs? (them |the user )?out|logged out|revoke/i,
+    );
   });
 });

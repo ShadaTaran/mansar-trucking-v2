@@ -18,6 +18,8 @@ import AdminLayout from './layout';
 import DashboardPage from './dashboard/page';
 import DriversPage from './drivers/page';
 import NewDriverPage from './drivers/new/page';
+import TripsPage from './trips/page';
+import NewTripPage from './trips/new/page';
 import VehiclesPage from './vehicles/page';
 import NewVehiclePage from './vehicles/new/page';
 
@@ -87,6 +89,8 @@ describe('(admin) route group', () => {
     ['new driver', () => NewDriverPage(), 'Add driver'],
     ['vehicles list', () => VehiclesPage(), 'Vehicles'],
     ['new vehicle', () => NewVehiclePage(), 'Add vehicle'],
+    ['trips list', () => TripsPage(), 'Trips'],
+    ['new trip', () => NewTripPage(), 'Add trip'],
   ])('renders the %s page under the gate', async (_label, page, heading) => {
     installFetch(session);
     render(<AdminLayout>{page()}</AdminLayout>);
@@ -97,6 +101,19 @@ describe('(admin) route group', () => {
     expect(
       screen.getByRole('navigation', { name: 'Admin' }),
     ).toBeInTheDocument();
+  });
+
+  it('never fetches trips for an unauthenticated visitor', async () => {
+    const urls = installFetch((url) =>
+      url === '/api/auth/me' || url === '/api/auth/refresh'
+        ? new Response(null, { status: 401 })
+        : new Response(JSON.stringify(EMPTY_PAGE), { status: 200 }),
+    );
+    render(<AdminLayout>{TripsPage()}</AdminLayout>);
+
+    await waitFor(() => expect(replace).toHaveBeenCalledWith('/login'));
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
+    expect(urls).not.toContain('/api/backend/trips?page=1&pageSize=25');
   });
 
   it('sends an unauthenticated visitor to /login instead of rendering admin data', async () => {

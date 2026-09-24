@@ -1,25 +1,35 @@
+import { TRIP_STATUSES } from '@mansar/types';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   adminErrorMessage,
+  assignTrip,
+  cancelTrip,
+  closeTrip,
   createDriver,
+  createTrip,
   createVehicle,
   getDriver,
+  getTrip,
   getVehicle,
   linkDriverUser,
   listDrivers,
+  listTrips,
   listVehicles,
   setDriverStatus,
   setVehicleStatus,
   unlinkDriverUser,
   updateDriver,
+  updateTrip,
   updateVehicle,
+  verifyTrip,
 } from './admin-api';
 import { resetAuthenticatedFetchForTests } from './authenticated-fetch';
 
 const DRIVER_ID = '019a0000-0000-7000-8000-00000000000d';
 const VEHICLE_ID = '019a0000-0000-7000-8000-00000000000e';
 const USER_ID = '019a0000-0000-7000-8000-000000000001';
+const TRIP_ID = '019a0000-0000-7000-8000-00000000001a';
 
 const DRIVER = {
   id: DRIVER_ID,
@@ -42,6 +52,22 @@ const VEHICLE = {
   year: 2020,
   status: 'ACTIVE',
   currentOdometer: null,
+  notes: '',
+  createdAt: '2026-09-01T00:00:00.000Z',
+  updatedAt: '2026-09-02T00:00:00.000Z',
+};
+
+const TRIP = {
+  id: TRIP_ID,
+  status: 'ASSIGNED',
+  driverId: DRIVER_ID,
+  vehicleId: VEHICLE_ID,
+  origin: 'Manila',
+  destination: 'Cebu',
+  scheduledStartAt: '2026-09-24T00:30:00.000Z',
+  scheduledEndAt: '2026-09-24T04:30:00.000Z',
+  startedAt: null,
+  completedAt: null,
   notes: '',
   createdAt: '2026-09-01T00:00:00.000Z',
   updatedAt: '2026-09-02T00:00:00.000Z',
@@ -242,6 +268,209 @@ describe('vehicles requests', () => {
   });
 });
 
+describe('trips requests', () => {
+  it('lists with the query the API expects and parses the page', async () => {
+    const calls = installFetch(() =>
+      json(200, { items: [TRIP], page: 2, pageSize: 25, total: 30 }),
+    );
+
+    const result = await listTrips({
+      q: '  manila  ',
+      status: 'ASSIGNED',
+      driverId: DRIVER_ID,
+      vehicleId: VEHICLE_ID,
+      page: 2,
+      pageSize: 25,
+    });
+
+    expect(calls[0]).toMatchObject({
+      url: `/api/backend/trips?q=manila&status=ASSIGNED&driverId=${DRIVER_ID}&vehicleId=${VEHICLE_ID}&page=2&pageSize=25`,
+      method: 'GET',
+    });
+    expect(result).toEqual({
+      ok: true,
+      data: { items: [TRIP], page: 2, pageSize: 25, total: 30 },
+    });
+  });
+
+  it('omits empty query parameters', async () => {
+    const calls = installFetch(() =>
+      json(200, { items: [], page: 1, pageSize: 25, total: 0 }),
+    );
+    await listTrips({ q: '   ', status: '', page: 1, pageSize: 25 });
+    expect(calls[0]!.url).toBe('/api/backend/trips?page=1&pageSize=25');
+  });
+
+  it('sends no query string at all when nothing is supplied', async () => {
+    const calls = installFetch(() =>
+      json(200, { items: [], page: 1, pageSize: 25, total: 0 }),
+    );
+    await listTrips();
+    expect(calls[0]!.url).toBe('/api/backend/trips');
+  });
+
+  it('reads one trip', async () => {
+    const calls = installFetch(() => json(200, TRIP));
+    const result = await getTrip(TRIP_ID);
+    expect(calls[0]).toMatchObject({
+      url: `/api/backend/trips/${TRIP_ID}`,
+      method: 'GET',
+    });
+    expect(result).toEqual({ ok: true, data: TRIP });
+  });
+
+  it('creates with exactly the three business fields', async () => {
+    const calls = installFetch(() => json(201, TRIP));
+    await createTrip({ origin: 'Manila', destination: 'Cebu', notes: 'load' });
+    expect(calls[0]).toMatchObject({
+      url: '/api/backend/trips',
+      method: 'POST',
+      body: { origin: 'Manila', destination: 'Cebu', notes: 'load' },
+    });
+  });
+
+  it('patches with exactly the supplied business fields', async () => {
+    const calls = installFetch(() => json(200, TRIP));
+    await updateTrip(TRIP_ID, {
+      origin: 'Davao',
+      destination: 'Cebu',
+      notes: '',
+    });
+    expect(calls[0]).toMatchObject({
+      url: `/api/backend/trips/${TRIP_ID}`,
+      method: 'PATCH',
+      body: { origin: 'Davao', destination: 'Cebu', notes: '' },
+    });
+    expect(Object.keys(calls[0]!.body as object).sort()).toEqual([
+      'destination',
+      'notes',
+      'origin',
+    ]);
+  });
+
+  it('assigns with exactly the four assignment fields', async () => {
+    const calls = installFetch(() => json(200, TRIP));
+    await assignTrip(TRIP_ID, {
+      driverId: DRIVER_ID,
+      vehicleId: VEHICLE_ID,
+      scheduledStartAt: '2026-09-24T00:30:00.000Z',
+      scheduledEndAt: '2026-09-24T04:30:00.000Z',
+    });
+    expect(calls[0]).toMatchObject({
+      url: `/api/backend/trips/${TRIP_ID}/assign`,
+      method: 'POST',
+      body: {
+        driverId: DRIVER_ID,
+        vehicleId: VEHICLE_ID,
+        scheduledStartAt: '2026-09-24T00:30:00.000Z',
+        scheduledEndAt: '2026-09-24T04:30:00.000Z',
+      },
+    });
+  });
+
+  it.each([
+    ['cancel', cancelTrip],
+    ['verify', verifyTrip],
+    ['close', closeTrip],
+  ])('posts %s with no body at all', async (action, call) => {
+    const calls = installFetch(() => json(200, TRIP));
+    await call(TRIP_ID);
+    expect(calls[0]).toMatchObject({
+      url: `/api/backend/trips/${TRIP_ID}/${action}`,
+      method: 'POST',
+    });
+    // Not even an empty object: the API's strict schemas reject one.
+    expect(calls[0]!.body).toBeUndefined();
+    expect(calls[0]!.headers).toBeUndefined();
+  });
+});
+
+describe('trip parsing', () => {
+  it.each(TRIP_STATUSES)('accepts the %s status', async (status) => {
+    installFetch(() => json(200, { ...TRIP, status }));
+    const result = await getTrip(TRIP_ID);
+    expect(result.ok && result.data.status).toBe(status);
+  });
+
+  it('accepts null in every nullable field', async () => {
+    installFetch(() =>
+      json(200, {
+        ...TRIP,
+        driverId: null,
+        vehicleId: null,
+        scheduledStartAt: null,
+        scheduledEndAt: null,
+        startedAt: null,
+        completedAt: null,
+      }),
+    );
+    const result = await getTrip(TRIP_ID);
+    expect(result.ok && result.data).toMatchObject({
+      driverId: null,
+      vehicleId: null,
+      scheduledStartAt: null,
+      scheduledEndAt: null,
+      startedAt: null,
+      completedAt: null,
+    });
+  });
+
+  it.each([
+    ['an unknown status', { ...TRIP, status: 'RUNNING' }],
+    ['a missing status', { ...TRIP, status: undefined }],
+    ['a numeric id', { ...TRIP, id: 42 }],
+    ['a numeric origin', { ...TRIP, origin: 1 }],
+    ['a missing destination', { ...TRIP, destination: undefined }],
+    ['a numeric driverId', { ...TRIP, driverId: 7 }],
+    ['a numeric vehicleId', { ...TRIP, vehicleId: 7 }],
+    ['a numeric schedule', { ...TRIP, scheduledStartAt: 1_700_000_000 }],
+    ['a numeric startedAt', { ...TRIP, startedAt: 0 }],
+    ['null notes', { ...TRIP, notes: null }],
+    ['a missing createdAt', { ...TRIP, createdAt: undefined }],
+    ['a missing updatedAt', { ...TRIP, updatedAt: undefined }],
+    ['an array', [TRIP]],
+    ['a string', 'trip'],
+  ])('fails closed on %s', async (_label, body) => {
+    installFetch(() => json(200, body));
+    const result = await getTrip(TRIP_ID);
+    expect(result).toEqual({
+      ok: false,
+      status: 200,
+      code: 'invalid_response',
+    });
+  });
+
+  it('invalidates the whole page when one item is malformed', async () => {
+    installFetch(() =>
+      json(200, {
+        items: [TRIP, { ...TRIP, status: 'RUNNING' }],
+        page: 1,
+        pageSize: 25,
+        total: 2,
+      }),
+    );
+    const result = await listTrips();
+    expect(result).toEqual({
+      ok: false,
+      status: 200,
+      code: 'invalid_response',
+    });
+  });
+
+  it('never invents a nested driver or vehicle record', async () => {
+    installFetch(() =>
+      json(200, {
+        ...TRIP,
+        driver: { id: DRIVER_ID, fullName: 'Synthetic Driver' },
+        vehicle: { id: VEHICLE_ID, plateNumber: 'SYN 0001' },
+      }),
+    );
+    const result = await getTrip(TRIP_ID);
+    expect(result.ok && result.data).toEqual(TRIP);
+    expect(result.ok && Object.keys(result.data)).not.toContain('driver');
+  });
+});
+
 describe('parsing', () => {
   it('accepts a linked driver and a vehicle with an odometer', async () => {
     installFetch(() =>
@@ -392,7 +621,7 @@ describe('adminErrorMessage', () => {
     ['driver_status_unchanged', 'This driver is already in that state.'],
     ['driver_already_linked', 'This driver already has a linked login.'],
     ['driver_not_linked', 'This driver has no linked login.'],
-    ['driver_inactive', 'Activate this driver before linking a login.'],
+    ['driver_inactive', 'This driver is inactive.'],
     ['user_not_found', 'No login account exists with that email address.'],
     ['user_not_driver', 'That login is not a driver account.'],
     ['user_inactive', 'That login account is deactivated.'],
@@ -403,8 +632,46 @@ describe('adminErrorMessage', () => {
       'duplicate_plate_number',
       'A vehicle with this plate number already exists.',
     ],
+    [
+      'driver_has_in_progress_trip',
+      'This driver cannot be unlinked while a trip is in progress.',
+    ],
+    ['trip_not_found', 'This trip no longer exists.'],
+    ['trip_not_editable', 'This trip can no longer be edited.'],
+    [
+      'trip_not_assignable',
+      'This trip can no longer be assigned or rescheduled.',
+    ],
+    ['trip_not_cancellable', 'This trip can no longer be cancelled.'],
+    ['trip_not_verifiable', 'This trip is not ready to be verified.'],
+    ['trip_not_closable', 'This trip is not ready to be closed.'],
+    [
+      'trip_schedule_conflict',
+      'That driver or vehicle already has a trip in the selected time window.',
+    ],
+    ['vehicle_not_active', 'The selected vehicle is not active.'],
+    ['driver_trip_in_progress', 'This driver already has a trip in progress.'],
+    [
+      'vehicle_trip_in_progress',
+      'This vehicle already has a trip in progress.',
+    ],
   ])('maps %s', (code, message) => {
     expect(adminErrorMessage({ status: 409, code })).toBe(message);
+  });
+
+  it('states driver_inactive neutrally, since assignment returns it too', () => {
+    expect(adminErrorMessage({ status: 409, code: 'driver_inactive' })).toBe(
+      'This driver is inactive.',
+    );
+    expect(
+      adminErrorMessage({ status: 409, code: 'driver_inactive' }),
+    ).not.toContain('linking');
+  });
+
+  it('keeps the generic fallback for an unknown trip code', () => {
+    expect(
+      adminErrorMessage({ status: 409, code: 'trip_not_teleportable' }),
+    ).toBe('Something went wrong. Please try again shortly.');
   });
 
   it('falls back on status and never echoes server text', () => {

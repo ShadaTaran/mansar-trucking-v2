@@ -202,6 +202,27 @@ describe('driver trips API integration (mansar_test)', () => {
   const unlink = (driverId: string) =>
     drivers.unlinkUser({ actor: adminActor, driverId, requestId: REQUEST_ID });
 
+  /**
+   * A barrier the holding transaction signals once it genuinely owns its row
+   * lock and has made its uncommitted change.
+   *
+   * Launching the competing operation immediately and trusting `pause()` to be
+   * long enough is not deterministic: under CI load the competitor can reach
+   * the row first, take the lock itself and settle, which is exactly how this
+   * suite flaked. Waiting for this signal removes the assumption — the holder
+   * says when the lock is held, and only then does the competitor start.
+   */
+  function lockBarrier(): {
+    readonly acquired: Promise<void>;
+    readonly signal: () => void;
+  } {
+    let signal!: () => void;
+    const acquired = new Promise<void>((resolve) => {
+      signal = resolve;
+    });
+    return { acquired, signal };
+  }
+
   /** Long enough for a blocked statement to have settled if it could. */
   const pause = () => new Promise((resolve) => setTimeout(resolve, 150));
 
@@ -863,6 +884,7 @@ describe('driver trips API integration (mansar_test)', () => {
       const held = new Promise<void>((resolve) => {
         release = resolve;
       });
+      const lock = lockBarrier();
 
       // Holds the driver row and deactivates it, uncommitted. An unlocked
       // read would still see ACTIVE and wrongly authorize the start.
@@ -872,8 +894,11 @@ describe('driver trips API integration (mansar_test)', () => {
           where: { id: driverA },
           data: { status: 'INACTIVE' },
         });
+        lock.signal();
         await held;
       });
+
+      await lock.acquired;
 
       const attempt = settling(start(actorA, tripId));
       await pause();
@@ -917,6 +942,7 @@ describe('driver trips API integration (mansar_test)', () => {
       const held = new Promise<void>((resolve) => {
         release = resolve;
       });
+      const lock = lockBarrier();
 
       const maintenance = prisma.$transaction(async (tx) => {
         await tx.$queryRaw`SELECT status FROM vehicles WHERE id = ${vehicleA}::uuid FOR UPDATE`;
@@ -924,8 +950,11 @@ describe('driver trips API integration (mansar_test)', () => {
           where: { id: vehicleA },
           data: { status: 'IN_MAINTENANCE' },
         });
+        lock.signal();
         await held;
       });
+
+      await lock.acquired;
 
       const attempt = settling(start(actorA, tripId));
       await pause();
@@ -1030,6 +1059,7 @@ describe('driver trips API integration (mansar_test)', () => {
       const held = new Promise<void>((resolve) => {
         release = resolve;
       });
+      const lock = lockBarrier();
 
       // The start's own effect, holding the same driver row a real start
       // locks. The unlink must queue behind it and re-read afterwards.
@@ -1039,8 +1069,11 @@ describe('driver trips API integration (mansar_test)', () => {
           where: { id: tripId, driverId: driverA, status: 'ASSIGNED' },
           data: { status: 'IN_PROGRESS', startedAt: new Date() },
         });
+        lock.signal();
         await held;
       });
+
+      await lock.acquired;
 
       const attempt = settling(unlink(driverA) as Promise<never>);
       await pause();
@@ -1063,6 +1096,7 @@ describe('driver trips API integration (mansar_test)', () => {
       const held = new Promise<void>((resolve) => {
         release = resolve;
       });
+      const lock = lockBarrier();
 
       // The unlink's own effect, holding the driver row uncommitted.
       const unlinking = prisma.$transaction(async (tx) => {
@@ -1071,8 +1105,11 @@ describe('driver trips API integration (mansar_test)', () => {
           where: { id: driverA, userId: actorA.userId },
           data: { userId: null },
         });
+        lock.signal();
         await held;
       });
+
+      await lock.acquired;
 
       const attempt = settling(start(actorA, tripId));
       await pause();

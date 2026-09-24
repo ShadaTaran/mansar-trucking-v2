@@ -1083,6 +1083,27 @@ describe('trips API integration (mansar_test)', () => {
   });
 
   describe('concurrency', () => {
+    /**
+     * A barrier the holding transaction signals once it genuinely owns its row
+     * lock and has made its uncommitted change.
+     *
+     * Launching the competing operation immediately and trusting `pause()` to be
+     * long enough is not deterministic: under CI load the competitor can reach
+     * the row first, take the lock itself and settle, which is exactly how this
+     * suite flaked. Waiting for this signal removes the assumption — the holder
+     * says when the lock is held, and only then does the competitor start.
+     */
+    function lockBarrier(): {
+      readonly acquired: Promise<void>;
+      readonly signal: () => void;
+    } {
+      let signal!: () => void;
+      const acquired = new Promise<void>((resolve) => {
+        signal = resolve;
+      });
+      return { acquired, signal };
+    }
+
     /** Long enough for a blocked statement to have settled if it could. */
     const pause = () => new Promise((resolve) => setTimeout(resolve, 150));
 
@@ -1179,6 +1200,7 @@ describe('trips API integration (mansar_test)', () => {
       const held = new Promise<void>((resolve) => {
         release = resolve;
       });
+      const lock = lockBarrier();
 
       // The assignment's own conditional claim, held open so the cancellation
       // has to queue behind the trip row lock and re-evaluate afterwards.
@@ -1196,8 +1218,11 @@ describe('trips API integration (mansar_test)', () => {
           select: { id: true },
         });
         expect(claimed).toHaveLength(1);
+        lock.signal();
         await held;
       });
+
+      await lock.acquired;
 
       const attempt = settling(
         service.cancel({ actor, tripId: created.id, requestId: REQUEST_ID }),
@@ -1295,6 +1320,7 @@ describe('trips API integration (mansar_test)', () => {
       const held = new Promise<void>((resolve) => {
         release = resolve;
       });
+      const lock = lockBarrier();
 
       // Holds the driver row exclusively and deactivates it, uncommitted. An
       // unlocked read would still see ACTIVE here and wrongly authorize the
@@ -1305,8 +1331,11 @@ describe('trips API integration (mansar_test)', () => {
           where: { id: driverA },
           data: { status: 'INACTIVE' },
         });
+        lock.signal();
         await held;
       });
+
+      await lock.acquired;
 
       const attempt = settling(
         assign(
@@ -1358,6 +1387,7 @@ describe('trips API integration (mansar_test)', () => {
       const held = new Promise<void>((resolve) => {
         release = resolve;
       });
+      const lock = lockBarrier();
 
       const maintenance = prisma.$transaction(async (tx) => {
         await tx.$queryRaw`SELECT status FROM vehicles WHERE id = ${vehicleA}::uuid FOR UPDATE`;
@@ -1365,8 +1395,11 @@ describe('trips API integration (mansar_test)', () => {
           where: { id: vehicleA },
           data: { status: 'IN_MAINTENANCE' },
         });
+        lock.signal();
         await held;
       });
+
+      await lock.acquired;
 
       const attempt = settling(
         assign(

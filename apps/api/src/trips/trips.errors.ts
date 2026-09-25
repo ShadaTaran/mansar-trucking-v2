@@ -27,6 +27,13 @@ export const TRIP_ERROR = {
   tripNotCompletable: 'trip_not_completable',
   driverTripInProgress: 'driver_trip_in_progress',
   vehicleTripInProgress: 'vehicle_trip_in_progress',
+  /**
+   * Stage 6B: verification is the point at which a trip's costs are settled,
+   * so it refuses while any expense is still SUBMITTED. The code names no
+   * expense — how many are pending, and for how much, is not part of the
+   * answer.
+   */
+  tripHasPendingExpenses: 'trip_has_pending_expenses',
 } as const;
 
 export type TripErrorCode = (typeof TRIP_ERROR)[keyof typeof TRIP_ERROR];

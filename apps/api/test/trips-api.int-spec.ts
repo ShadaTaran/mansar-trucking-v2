@@ -15,6 +15,12 @@ import { RefreshSessionService } from '../src/auth/refresh-session.service.js';
 import { PrismaService } from '../src/database/prisma.service.js';
 import { DRIVER_ERROR } from '../src/drivers/drivers.errors.js';
 import { DriversService } from '../src/drivers/drivers.service.js';
+import { EXPENSE_ERROR } from '../src/expenses/expenses.errors.js';
+import { createExpenseSchema } from '../src/expenses/expenses.schemas.js';
+import {
+  AUDIT_EXPENSE_SUBMITTED,
+  ExpensesService,
+} from '../src/expenses/expenses.service.js';
 import type { TripStatus } from '../src/generated/prisma/enums.js';
 import { TRIP_ERROR } from '../src/trips/trips.errors.js';
 import {
@@ -56,6 +62,7 @@ describe('trips API integration (mansar_test)', () => {
   let prisma: PrismaService;
   let audit: AuditService;
   let service: TripsService;
+  let expenses: ExpensesService;
   let drivers: DriversService;
   let vehicles: VehiclesService;
   let actor: TripActor;
@@ -83,15 +90,27 @@ describe('trips API integration (mansar_test)', () => {
       where: { email: { startsWith: PREFIX } },
       select: { id: true },
     });
+    const expenses = await prisma.expense.findMany({
+      where: { tripId: { in: trips.map((t) => t.id) } },
+      select: { id: true },
+    });
     await prisma.auditLog.deleteMany({
       where: {
         OR: [
           { entityType: 'trip', entityId: { in: trips.map((t) => t.id) } },
+          {
+            entityType: 'expense',
+            entityId: { in: expenses.map((e) => e.id) },
+          },
           { actorUserId: { in: users.map((u) => u.id) } },
         ],
       },
     });
-    // Referential order: a trip holds its driver and vehicle with RESTRICT.
+    // Referential order: an expense holds its trip with RESTRICT, and a trip
+    // holds its driver and vehicle the same way.
+    await prisma.expense.deleteMany({
+      where: { tripId: { in: trips.map((t) => t.id) } },
+    });
     await prisma.trip.deleteMany({ where: { origin: { startsWith: PREFIX } } });
     await prisma.driver.deleteMany({
       where: { fullName: { startsWith: PREFIX } },
@@ -216,6 +235,7 @@ describe('trips API integration (mansar_test)', () => {
     await prisma.onModuleInit();
     audit = new AuditService(prisma);
     service = new TripsService(prisma, audit);
+    expenses = new ExpensesService(prisma, audit);
     drivers = new DriversService(
       prisma,
       audit,
@@ -870,6 +890,374 @@ describe('trips API integration (mansar_test)', () => {
         status: 404,
         message: TRIP_ERROR.tripNotFound,
       });
+    });
+  });
+
+  /**
+   * Stage 6B adds one business precondition to the existing COMPLETED ->
+   * VERIFIED transition: a trip's costs must be settled before it can be
+   * declared verified. No trip state and no transition is added or removed.
+   */
+  describe('verification and pending expenses', () => {
+    const fileExpense = (tripId: string, overrides = {}) =>
+      expenses.createForTrip({
+        actor,
+        tripId,
+        body: createExpenseSchema.parse({
+          amount: '1250.00',
+          category: 'FUEL',
+          incurredAt: '2027-03-01T08:00:00.000Z',
+          ...overrides,
+        }),
+        requestId: REQUEST_ID,
+      });
+
+    it('refuses verification while one expense is still SUBMITTED', async () => {
+      const tripId = await seedTrip('COMPLETED');
+      await fileExpense(tripId);
+
+      await expect(
+        service.verify({ actor, tripId, requestId: REQUEST_ID }),
+      ).rejects.toMatchObject({
+        status: 409,
+        message: TRIP_ERROR.tripHasPendingExpenses,
+      });
+      expect(await statusOf(tripId)).toBe('COMPLETED');
+    });
+
+    it('names no expense in the refusal', async () => {
+      const tripId = await seedTrip('COMPLETED');
+      const pending = await fileExpense(tripId, {
+        amount: '4321.99',
+        description: 'Synthetic Fuel Stop North',
+      });
+
+      const error = await service
+        .verify({ actor, tripId, requestId: REQUEST_ID })
+        .catch((e: unknown) => e);
+      const serialized = JSON.stringify(error);
+      expect(serialized).not.toContain(pending.id);
+      expect(serialized).not.toContain('4321.99');
+      expect(serialized).not.toContain('Synthetic Fuel Stop North');
+    });
+
+    it('refuses while any one of several expenses is still pending', async () => {
+      const tripId = await seedTrip('COMPLETED');
+      const approved = await fileExpense(tripId, { amount: '1.00' });
+      await expenses.approve({
+        actor,
+        expenseId: approved.id,
+        reviewNote: '',
+        requestId: REQUEST_ID,
+      });
+      await fileExpense(tripId, { amount: '2.00' });
+
+      await expect(
+        service.verify({ actor, tripId, requestId: REQUEST_ID }),
+      ).rejects.toMatchObject({
+        message: TRIP_ERROR.tripHasPendingExpenses,
+      });
+    });
+
+    it('verifies once every expense is APPROVED', async () => {
+      const tripId = await seedTrip('COMPLETED');
+      const filed = await fileExpense(tripId);
+      await expenses.approve({
+        actor,
+        expenseId: filed.id,
+        reviewNote: '',
+        requestId: REQUEST_ID,
+      });
+
+      const verified = await service.verify({
+        actor,
+        tripId,
+        requestId: REQUEST_ID,
+      });
+      expect(verified.status).toBe('VERIFIED');
+    });
+
+    it('verifies once every expense is REJECTED: resolved, not approved', async () => {
+      const tripId = await seedTrip('COMPLETED');
+      const filed = await fileExpense(tripId);
+      await expenses.reject({
+        actor,
+        expenseId: filed.id,
+        reviewNote: 'no receipt',
+        requestId: REQUEST_ID,
+      });
+
+      const verified = await service.verify({
+        actor,
+        tripId,
+        requestId: REQUEST_ID,
+      });
+      expect(verified.status).toBe('VERIFIED');
+    });
+
+    it('verifies a trip that has no expenses at all', async () => {
+      const tripId = await seedTrip('COMPLETED');
+      const verified = await service.verify({
+        actor,
+        tripId,
+        requestId: REQUEST_ID,
+      });
+      expect(verified.status).toBe('VERIFIED');
+    });
+
+    it('is not confused by a pending expense on a different trip', async () => {
+      const other = await seedTrip('COMPLETED', {
+        driverId: driverB,
+        vehicleId: vehicleB,
+      });
+      await fileExpense(other);
+      const tripId = await seedTrip('COMPLETED');
+
+      const verified = await service.verify({
+        actor,
+        tripId,
+        requestId: REQUEST_ID,
+      });
+      expect(verified.status).toBe('VERIFIED');
+    });
+
+    it('leaves VERIFIED -> CLOSED unchanged, with no second expense gate', async () => {
+      const tripId = await seedTrip('COMPLETED');
+      const filed = await fileExpense(tripId);
+      await expenses.approve({
+        actor,
+        expenseId: filed.id,
+        reviewNote: '',
+        requestId: REQUEST_ID,
+      });
+      await service.verify({ actor, tripId, requestId: REQUEST_ID });
+
+      const closed = await service.close({
+        actor,
+        tripId,
+        requestId: REQUEST_ID,
+      });
+      expect(closed.status).toBe('CLOSED');
+    });
+
+    it('records no audit row for a refused verification', async () => {
+      const tripId = await seedTrip('COMPLETED');
+      await fileExpense(tripId);
+      await service
+        .verify({ actor, tripId, requestId: REQUEST_ID })
+        .catch(() => undefined);
+
+      const rows = await auditRows(tripId);
+      expect(rows.filter((r) => r.action === AUDIT_TRIP_VERIFIED)).toHaveLength(
+        0,
+      );
+    });
+  });
+
+  /**
+   * Expense submission and trip verification write different tables, so a
+   * conditional claim alone cannot order them. Both take the same trip row
+   * lock first; these tests drive the **real** service methods through each
+   * interleaving and prove the forbidden committed state is unreachable.
+   *
+   * Two things make them deterministic without a timer deciding anything.
+   *
+   * The hold point is a barrier on the shared `AuditService.record`. Both
+   * services write their audit row inside the business transaction and as
+   * the last thing they do, so pausing there leaves the transaction holding
+   * the trip lock with its change made and uncommitted — exactly the window
+   * under test — without production code knowing a test exists.
+   *
+   * The proof that the competitor is genuinely queued is PostgreSQL's own
+   * answer: `pg_stat_activity.wait_event_type = 'Lock'` for a statement
+   * against the contended table. Elapsed time proves nothing here; the
+   * polling interval and overall timeout exist only so a broken test fails
+   * instead of hanging.
+   */
+  describe('submit vs verify', () => {
+    /** Infrastructure failure protection, never the correctness assertion. */
+    const LOCK_WAIT_TIMEOUT_MS = 15_000;
+    const LOCK_POLL_MS = 10;
+
+    /**
+     * Resolves once PostgreSQL reports some other session of this database
+     * blocked on a lock while running a statement that matches. Throws on
+     * timeout, so a test that never blocks fails loudly rather than hanging.
+     */
+    async function awaitLockWait(matching: RegExp): Promise<void> {
+      const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS;
+      for (;;) {
+        const waiting = await prisma.$queryRaw<{ query: string }[]>`
+          SELECT query FROM pg_stat_activity
+          WHERE datname = current_database()
+            AND pid <> pg_backend_pid()
+            AND wait_event_type = 'Lock'`;
+        if (waiting.some((row) => matching.test(row.query))) {
+          return;
+        }
+        if (Date.now() > deadline) {
+          throw new Error(
+            `no session waiting on a lock for ${String(matching)} within ${LOCK_WAIT_TIMEOUT_MS}ms`,
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, LOCK_POLL_MS));
+      }
+    }
+
+    /**
+     * Pauses the real transaction at its audit write — after the lock is
+     * held and the change is made, before commit — and lets the test decide
+     * when it may finish. The original write still happens on release, so
+     * the audit trail under test is the production one.
+     */
+    function auditBarrier(action: string): {
+      readonly reached: Promise<void>;
+      readonly release: () => void;
+      readonly restore: () => void;
+    } {
+      const original = audit.record.bind(audit);
+      let signalReached!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        signalReached = resolve;
+      });
+      let signalRelease!: () => void;
+      const held = new Promise<void>((resolve) => {
+        signalRelease = resolve;
+      });
+
+      const spy = vi
+        .spyOn(audit, 'record')
+        .mockImplementation(async (entry, tx) => {
+          if (entry.action === action) {
+            signalReached();
+            await held;
+          }
+          await original(entry, tx);
+        });
+
+      return {
+        reached,
+        release: () => signalRelease(),
+        restore: () => {
+          signalRelease();
+          spy.mockRestore();
+        },
+      };
+    }
+
+    const fileExpense = (tripId: string) =>
+      expenses.createForTrip({
+        actor,
+        tripId,
+        body: createExpenseSchema.parse({
+          amount: '1250.00',
+          category: 'FUEL',
+          incurredAt: '2027-03-01T08:00:00.000Z',
+        }),
+        requestId: REQUEST_ID,
+      });
+
+    /** The state the whole design exists to make unreachable. */
+    async function assertNeverVerifiedWithPending(
+      tripId: string,
+    ): Promise<void> {
+      const status = await statusOf(tripId);
+      const pending = await prisma.expense.count({
+        where: { tripId, status: 'SUBMITTED' },
+      });
+      expect(status === 'VERIFIED' && pending > 0).toBe(false);
+    }
+
+    it('A. submission first: verification queues on the trip lock, then refuses', async () => {
+      const tripId = await seedTrip('COMPLETED');
+      const barrier = auditBarrier(AUDIT_EXPENSE_SUBMITTED);
+      try {
+        // The real submission path: locks the trip, inserts, then pauses
+        // at its audit write while still holding the lock uncommitted.
+        const submission = fileExpense(tripId);
+        await barrier.reached;
+
+        // The real verification path, which must now queue behind it.
+        const verification = service
+          .verify({ actor, tripId, requestId: REQUEST_ID })
+          .catch((error: unknown) => error);
+        await awaitLockWait(/FROM trips/i);
+
+        barrier.release();
+        await submission;
+        const outcome = await verification;
+
+        expect(outcome).toMatchObject({
+          status: 409,
+          message: TRIP_ERROR.tripHasPendingExpenses,
+        });
+        expect(await statusOf(tripId)).toBe('COMPLETED');
+        await assertNeverVerifiedWithPending(tripId);
+      } finally {
+        barrier.restore();
+      }
+    });
+
+    it('B. verification first: submission queues on the trip lock, then refuses', async () => {
+      const tripId = await seedTrip('COMPLETED');
+      const barrier = auditBarrier(AUDIT_TRIP_VERIFIED);
+      try {
+        // The real verification path: locks the trip, finds nothing pending,
+        // claims COMPLETED -> VERIFIED, then pauses uncommitted.
+        const verification = service.verify({
+          actor,
+          tripId,
+          requestId: REQUEST_ID,
+        });
+        await barrier.reached;
+
+        const submission = fileExpense(tripId).catch((error: unknown) => error);
+        await awaitLockWait(/FROM trips/i);
+
+        barrier.release();
+        await verification;
+        const outcome = await submission;
+
+        expect(outcome).toMatchObject({
+          status: 409,
+          message: EXPENSE_ERROR.tripNotExpensable,
+        });
+        expect(await statusOf(tripId)).toBe('VERIFIED');
+        expect(await prisma.expense.count({ where: { tripId } })).toBe(0);
+        await assertNeverVerifiedWithPending(tripId);
+      } finally {
+        barrier.restore();
+      }
+    });
+
+    it('C. free concurrency: exactly one wins, and the loser names its conflict', async () => {
+      const tripId = await seedTrip('COMPLETED');
+
+      const [submission, verification] = await Promise.allSettled([
+        fileExpense(tripId),
+        service.verify({ actor, tripId, requestId: REQUEST_ID }),
+      ]);
+
+      const results = [submission, verification];
+      expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+      expect(results.filter((r) => r.status === 'rejected')).toHaveLength(1);
+
+      if (verification.status === 'fulfilled') {
+        // Verification got the lock first, so the trip was VERIFIED by the
+        // time submission read it.
+        expect(submission.status).toBe('rejected');
+        expect((submission as PromiseRejectedResult).reason).toMatchObject({
+          message: EXPENSE_ERROR.tripNotExpensable,
+        });
+        expect(await statusOf(tripId)).toBe('VERIFIED');
+      } else {
+        // Submission got there first, so the pending expense blocked it.
+        expect((verification as PromiseRejectedResult).reason).toMatchObject({
+          message: TRIP_ERROR.tripHasPendingExpenses,
+        });
+        expect(await statusOf(tripId)).toBe('COMPLETED');
+      }
+      await assertNeverVerifiedWithPending(tripId);
     });
   });
 

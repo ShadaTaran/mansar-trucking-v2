@@ -132,6 +132,8 @@ describe('TripsService', () => {
       findFirst: ReturnType<typeof vi.fn>;
       updateManyAndReturn: ReturnType<typeof vi.fn>;
     };
+    // Stage 6B: verification asks whether any expense is still SUBMITTED.
+    expense: { findFirst: ReturnType<typeof vi.fn> };
     $queryRaw: ReturnType<typeof vi.fn>;
   };
   let prisma: {
@@ -157,6 +159,7 @@ describe('TripsService', () => {
         findFirst: vi.fn(),
         updateManyAndReturn: vi.fn(),
       },
+      expense: { findFirst: vi.fn() },
       $queryRaw: vi.fn((strings: TemplateStringsArray) => {
         rawSql.push(strings.join('?').replace(/\s+/g, ' ').trim());
         return Promise.resolve(rawResults.shift() ?? []);
@@ -587,21 +590,14 @@ describe('TripsService', () => {
       expect(audit.record).not.toHaveBeenCalled();
     });
   });
-  describe('verify and close', () => {
+  /**
+   * `close` still runs on the general lifecycle path — a single conditional
+   * claim with no lock and no read to authorize it. Stage 6B changed only
+   * `verify`, which now has its own block below; these assertions are the
+   * original ones, unchanged, and prove the shared path was left alone.
+   */
+  describe('close', () => {
     const cases = [
-      {
-        label: 'verify',
-        run: () =>
-          service.verify({
-            actor: ACTOR,
-            tripId: TRIP_ID,
-            requestId: REQUEST_ID,
-          }),
-        from: 'COMPLETED',
-        to: 'VERIFIED',
-        action: AUDIT_TRIP_VERIFIED,
-        conflict: TRIP_ERROR.tripNotVerifiable,
-      },
       {
         label: 'close',
         run: () =>
@@ -668,6 +664,142 @@ describe('TripsService', () => {
       expect(rejection).toBeInstanceOf(NotFoundException);
       expect(rejection).toMatchObject({ message: TRIP_ERROR.tripNotFound });
       expect(audit.record).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * Stage 6B gave `verify` its own transaction. It no longer claims blind:
+   * the trip row is locked first, and only then is the pending-expense
+   * question asked, in a separate statement. That ordering is the whole
+   * point — expense submission takes the same lock, so nothing can be
+   * inserted between the check and the claim — so it is what these tests
+   * assert. The old "reads nothing first" expectation is deliberately gone;
+   * reading after the lock is now the approved contract.
+   */
+  describe('verify', () => {
+    const verify = () =>
+      service.verify({ actor: ACTOR, tripId: TRIP_ID, requestId: REQUEST_ID });
+
+    /** Queues the locked-row result `lockTrip` will consume. */
+    const lockReturns = (status: string | null) => {
+      rawResults.push(status === null ? [] : [{ status }]);
+    };
+
+    it('locks the trip row before evaluating pending expenses', async () => {
+      lockReturns('COMPLETED');
+      tx.expense.findFirst.mockResolvedValue(null);
+      tx.trip.updateManyAndReturn.mockResolvedValue([
+        tripRow({ status: 'VERIFIED' }),
+      ]);
+
+      const order: string[] = [];
+      tx.$queryRaw.mockImplementation((strings: TemplateStringsArray) => {
+        order.push('lock');
+        rawSql.push(strings.join('?').replace(/\s+/g, ' ').trim());
+        return Promise.resolve(rawResults.shift() ?? []);
+      });
+      tx.expense.findFirst.mockImplementation(() => {
+        order.push('pending');
+        return Promise.resolve(null);
+      });
+
+      await verify();
+
+      expect(order).toEqual(['lock', 'pending']);
+      expect(rawSql[0]).toContain('FROM trips');
+      expect(rawSql[0]).toContain('FOR UPDATE');
+    });
+
+    it('404s when the locked row does not exist', async () => {
+      lockReturns(null);
+
+      const rejection = await verify().catch((error: unknown) => error);
+
+      expect(rejection).toBeInstanceOf(NotFoundException);
+      expect(rejection).toMatchObject({ message: TRIP_ERROR.tripNotFound });
+      expect(tx.expense.findFirst).not.toHaveBeenCalled();
+      expect(tx.trip.updateManyAndReturn).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      'DRAFT',
+      'ASSIGNED',
+      'IN_PROGRESS',
+      'VERIFIED',
+      'CLOSED',
+      'CANCELLED',
+    ])(
+      '409s trip_not_verifiable for a %s trip, before any expense read',
+      async (status) => {
+        lockReturns(status);
+
+        const rejection = await verify().catch((error: unknown) => error);
+
+        expect(rejection).toBeInstanceOf(ConflictException);
+        expect(rejection).toMatchObject({
+          status: 409,
+          message: TRIP_ERROR.tripNotVerifiable,
+        });
+        expect(tx.expense.findFirst).not.toHaveBeenCalled();
+        expect(tx.trip.updateManyAndReturn).not.toHaveBeenCalled();
+        expect(audit.record).not.toHaveBeenCalled();
+      },
+    );
+
+    it('409s trip_has_pending_expenses when one expense is still SUBMITTED', async () => {
+      lockReturns('COMPLETED');
+      tx.expense.findFirst.mockResolvedValue({ id: 'some-expense-id' });
+
+      const rejection = await verify().catch((error: unknown) => error);
+
+      expect(rejection).toBeInstanceOf(ConflictException);
+      expect(rejection).toMatchObject({
+        status: 409,
+        message: TRIP_ERROR.tripHasPendingExpenses,
+      });
+      expect(tx.expense.findFirst.mock.calls[0]![0]).toMatchObject({
+        where: { tripId: TRIP_ID, status: 'SUBMITTED' },
+      });
+      // Nothing was claimed, and the refusal names no expense.
+      expect(tx.trip.updateManyAndReturn).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
+      expect(JSON.stringify(rejection)).not.toContain('some-expense-id');
+    });
+
+    it('claims COMPLETED -> VERIFIED when nothing is pending', async () => {
+      lockReturns('COMPLETED');
+      tx.expense.findFirst.mockResolvedValue(null);
+      tx.trip.updateManyAndReturn.mockResolvedValue([
+        tripRow({ status: 'VERIFIED' }),
+      ]);
+
+      const result = await verify();
+
+      expect(tx.trip.updateManyAndReturn).toHaveBeenCalledTimes(1);
+      expect(tx.trip.updateManyAndReturn.mock.calls[0]![0]).toMatchObject({
+        where: { id: TRIP_ID, status: 'COMPLETED' },
+        data: { status: 'VERIFIED' },
+      });
+      expect(result.status).toBe('VERIFIED');
+    });
+
+    it('still records trip.verified with the state it replaced', async () => {
+      lockReturns('COMPLETED');
+      tx.expense.findFirst.mockResolvedValue(null);
+      tx.trip.updateManyAndReturn.mockResolvedValue([
+        tripRow({ status: 'VERIFIED' }),
+      ]);
+
+      await verify();
+
+      expect(audit.record).toHaveBeenCalledTimes(1);
+      expect(audit.record.mock.calls[0]![0]).toMatchObject({
+        action: AUDIT_TRIP_VERIFIED,
+        entityType: 'trip',
+        entityId: TRIP_ID,
+        metadata: { from: 'COMPLETED' },
+      });
     });
   });
 

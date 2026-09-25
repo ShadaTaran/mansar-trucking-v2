@@ -3,6 +3,11 @@ import { describe, expect, it } from 'vitest';
 import {
   DRIVER_STATUSES,
   type DriverStatus,
+  EXPENSE_CATEGORIES,
+  EXPENSE_STATUSES,
+  type Expense,
+  type ExpenseCategory,
+  type ExpenseStatus,
   MANSAR_PACKAGE_PROBE,
   type Page,
   type Trip,
@@ -75,6 +80,61 @@ describe('@mansar/types', () => {
       'updatedAt',
     ]);
     expect(TRIP_STATUSES).toContain(trip.status);
+  });
+
+  it('exposes the three frozen expense states', () => {
+    expect(EXPENSE_STATUSES).toEqual(['SUBMITTED', 'APPROVED', 'REJECTED']);
+    const status: ExpenseStatus = 'SUBMITTED';
+    expect(EXPENSE_STATUSES).toContain(status);
+  });
+
+  it('exposes the six frozen expense categories', () => {
+    expect(EXPENSE_CATEGORIES).toEqual([
+      'FUEL',
+      'TOLL',
+      'PARKING',
+      'MEAL',
+      'REPAIR',
+      'OTHER',
+    ]);
+    const category: ExpenseCategory = 'FUEL';
+    expect(EXPENSE_CATEGORIES).toContain(category);
+  });
+
+  it('describes an expense with no driver, no submitter and a string amount', () => {
+    const expense: Expense = {
+      id: '019a0000-0000-7000-8000-000000000002',
+      tripId: '019a0000-0000-7000-8000-000000000001',
+      status: 'SUBMITTED',
+      amount: '1250.00',
+      category: 'FUEL',
+      incurredAt: '2026-09-01T00:00:00.000Z',
+      description: '',
+      reviewNote: '',
+      reviewedAt: null,
+      createdAt: '2026-09-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    };
+
+    expect(Object.keys(expense)).toEqual([
+      'id',
+      'tripId',
+      'status',
+      'amount',
+      'category',
+      'incurredAt',
+      'description',
+      'reviewNote',
+      'reviewedAt',
+      'createdAt',
+      'updatedAt',
+    ]);
+    // Ownership is the trip's driver and the submitter is the audit actor;
+    // neither is duplicated onto the expense.
+    expect(Object.keys(expense)).not.toContain('driverId');
+    expect(Object.keys(expense)).not.toContain('submittedByUserId');
+    // Money is a string on the wire, never an IEEE-754 double.
+    expect(typeof expense.amount).toBe('string');
   });
 
   it('pages trips with the shared Page type', () => {

@@ -147,13 +147,86 @@ model Trip {
   createdAt        DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt        DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  driver  Driver?  @relation(fields: [driverId], references: [id], onDelete: Restrict, onUpdate: NoAction)
-  vehicle Vehicle? @relation(fields: [vehicleId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  driver   Driver?   @relation(fields: [driverId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  vehicle  Vehicle?  @relation(fields: [vehicleId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  expenses Expense[]
 
   @@index([status, scheduledStartAt, id], map: "trips_status_scheduled_start_at_id_idx")
   @@index([driverId, scheduledStartAt, id], map: "trips_driver_id_scheduled_start_at_id_idx")
   @@index([vehicleId, scheduledStartAt, id], map: "trips_vehicle_id_scheduled_start_at_id_idx")
   @@map("trips")
+}
+
+/// Frozen Stage 6 expense lifecycle. Mirrors the shared tuple
+/// `EXPENSE_STATUSES` in @mansar/types; the API asserts the two stay
+/// identical. APPROVED and REJECTED are terminal: there is no reopen and no
+/// return to SUBMITTED, so a correction is a new expense and the incorrect
+/// row survives as history.
+enum ExpenseStatus {
+  SUBMITTED
+  APPROVED
+  REJECTED
+
+  @@map("expense_status")
+}
+
+/// Frozen Stage 6 expense categories. A closed set keeps review and
+/// reporting on a fixed vocabulary; `OTHER` absorbs the long tail rather
+/// than inviting free-text categories.
+enum ExpenseCategory {
+  FUEL
+  TOLL
+  PARKING
+  MEAL
+  REPAIR
+  OTHER
+
+  @@map("expense_category")
+}
+
+/// A cost incurred against one trip. Rows are never hard-deleted; `status`
+/// is the lifecycle.
+///
+/// Ownership is deliberately *not* stored. An expense cannot be submitted
+/// before its trip is IN_PROGRESS, and a trip can no longer be re-assigned
+/// by then, so the operational driver is always `trip.driverId` and a second
+/// copy would only be an invariant to keep in step. The acting identity —
+/// including an ADMIN filing on a driver's behalf — is the audit row's
+/// actor, not a column here (ADR 0002).
+///
+/// `amount` is PHP only; there is no currency column (docs/database.md §14).
+/// It crosses the API as a decimal *string* so no consumer can round it
+/// through an IEEE-754 double.
+///
+/// Three CHECK constraints are added by hand in the migration and are
+/// invisible to `db:diff:check` (docs/database.md §15), so
+/// `test/expenses-persistence.int-spec.ts` proves each against a real
+/// database:
+///   - `expenses_amount_positive`          a zero or negative cost is not one
+///   - `expenses_review_consistency`       reviewed exactly when not SUBMITTED
+///   - `expenses_rejection_requires_note`  a rejection always says why
+model Expense {
+  id          String          @id @default(uuid(7)) @db.Uuid
+  tripId      String          @map("trip_id") @db.Uuid
+  status      ExpenseStatus   @default(SUBMITTED)
+  /// PHP, two decimal places. Never serialized as a JavaScript number.
+  amount      Decimal         @db.Decimal(12, 2)
+  category    ExpenseCategory
+  /// When the money was spent, which is not when the row was filed.
+  incurredAt  DateTime        @map("incurred_at") @db.Timestamptz(3)
+  description String          @default("") @db.Text
+  /// Why a review decided what it did. Required on REJECTED.
+  reviewNote  String          @default("") @map("review_note") @db.Text
+  /// Server-set at APPROVE/REJECT; null while SUBMITTED.
+  reviewedAt  DateTime?       @map("reviewed_at") @db.Timestamptz(3)
+  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  trip Trip @relation(fields: [tripId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@index([status, incurredAt, id], map: "expenses_status_incurred_at_id_idx")
+  @@index([tripId, incurredAt, id], map: "expenses_trip_id_incurred_at_id_idx")
+  @@map("expenses")
 }
 
 /// Append-only record of significant actions. Survives actor deletion.

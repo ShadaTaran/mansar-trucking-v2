@@ -37,6 +37,33 @@ export const VEHICLE_STATUSES = [
 
 export type VehicleStatus = (typeof VEHICLE_STATUSES)[number];
 
+/**
+ * Frozen expense lifecycle (Stage 0, Stage 6). Mirrors the database enum
+ * `expense_status`; the API asserts the two stay identical.
+ *
+ * `APPROVED` and `REJECTED` are terminal. There is no reopen and no return
+ * to `SUBMITTED`: a correction is a new expense, and the incorrect one stays
+ * as history.
+ */
+export const EXPENSE_STATUSES = ['SUBMITTED', 'APPROVED', 'REJECTED'] as const;
+
+export type ExpenseStatus = (typeof EXPENSE_STATUSES)[number];
+
+/**
+ * Frozen expense categories (Stage 6). Mirrors the database enum
+ * `expense_category`; the API asserts the two stay identical.
+ */
+export const EXPENSE_CATEGORIES = [
+  'FUEL',
+  'TOLL',
+  'PARKING',
+  'MEAL',
+  'REPAIR',
+  'OTHER',
+] as const;
+
+export type ExpenseCategory = (typeof EXPENSE_CATEGORIES)[number];
+
 /** One page of a listing endpoint. */
 export interface Page<T> {
   readonly items: readonly T[];
@@ -108,6 +135,37 @@ export interface Trip {
   readonly startedAt: string | null;
   readonly completedAt: string | null;
   readonly notes: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+/**
+ * A cost incurred against one trip, as the API returns it.
+ *
+ * The expense carries no driver and no submitter: ownership is the trip's
+ * operational driver, and the acting identity lives in the audit trail
+ * (ADR 0002). Every instant is an ISO 8601 string in UTC.
+ */
+export interface Expense {
+  readonly id: string;
+  readonly tripId: string;
+  readonly status: ExpenseStatus;
+  /**
+   * PHP, as a decimal string with **exactly two** fractional digits
+   * (`"1250.00"`, `"99.50"`). Never a JavaScript number: the API refuses to
+   * hand a monetary value to a consumer through an IEEE-754 double, where
+   * `0.1 + 0.2 !== 0.3`. Requests send the same shape, and accept one or two
+   * fractional digits or none at all.
+   */
+  readonly amount: string;
+  readonly category: ExpenseCategory;
+  /** When the money was spent, which is not when the row was filed. */
+  readonly incurredAt: string;
+  readonly description: string;
+  /** Why a review decided what it did; `''` while still submitted. */
+  readonly reviewNote: string;
+  /** Set when the expense was approved or rejected; null while submitted. */
+  readonly reviewedAt: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }

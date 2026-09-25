@@ -405,17 +405,70 @@ export class TripsService {
     });
   }
 
+  /**
+   * COMPLETED -> VERIFIED, refused while any expense is still SUBMITTED
+   * (Stage 6B). Verification is where a trip's costs are settled, so an
+   * unreviewed expense must not be able to slip in behind it.
+   *
+   * This cannot use the shared `transition()` helper, because the invariant
+   * spans two tables and a conditional claim alone does not close the race.
+   * At READ COMMITTED an `UPDATE trips … WHERE NOT EXISTS (pending expense)`
+   * can still hold a snapshot older than a child insert that commits while
+   * the statement waits on the trip's row lock — it would then verify a trip
+   * that already carries a pending expense.
+   *
+   * So the trip row is locked **first**, and the pending-expense question is
+   * asked only afterwards, as a separate statement inside the same
+   * transaction. Expense submission takes that identical lock before it
+   * reads the trip's status, so the two serialise: whichever transaction
+   * takes the row first wins, and the loser sees committed state. Nothing
+   * can be inserted between the check and the claim.
+   */
   verify(input: {
     readonly actor: TripActor;
     readonly tripId: string;
     readonly requestId: string;
   }): Promise<Trip> {
-    return this.transition({
-      ...input,
-      from: VERIFIABLE_FROM,
-      to: 'VERIFIED',
-      action: AUDIT_TRIP_VERIFIED,
-      conflict: TRIP_ERROR.tripNotVerifiable,
+    return this.prisma.$transaction(async (tx) => {
+      // 1. The serialisation point, taken before anything is read.
+      const locked = await this.lockTrip(tx, input.tripId);
+      if (!locked) {
+        throw new NotFoundException(TRIP_ERROR.tripNotFound);
+      }
+      if (locked.status !== VERIFIABLE_FROM) {
+        throw new ConflictException(TRIP_ERROR.tripNotVerifiable);
+      }
+
+      // 2. A second statement, deliberately after the lock: an answer read
+      //    before it could already be out of date.
+      const pending = await tx.expense.findFirst({
+        where: { tripId: input.tripId, status: 'SUBMITTED' },
+        select: { id: true },
+      });
+      if (pending) {
+        throw new ConflictException(TRIP_ERROR.tripHasPendingExpenses);
+      }
+
+      const row = await this.claim(
+        tx,
+        input.tripId,
+        VERIFIABLE_FROM,
+        'VERIFIED',
+      );
+      if (!row) {
+        // Unreachable while the lock is held: nothing else can move the trip
+        // out of COMPLETED between the check above and this claim.
+        throw new AuthInvariantError('locked trip lost its verifiable state');
+      }
+
+      await this.record(tx, {
+        actor: input.actor,
+        action: AUDIT_TRIP_VERIFIED,
+        tripId: row.id,
+        requestId: input.requestId,
+        metadata: { from: VERIFIABLE_FROM },
+      });
+      return toTrip(row);
     });
   }
 
@@ -774,6 +827,23 @@ export class TripsService {
   ): Promise<{ status: VehicleStatus } | null> {
     const rows = await tx.$queryRaw<{ status: VehicleStatus }[]>`
       SELECT status FROM vehicles WHERE id = ${vehicleId}::uuid FOR UPDATE`;
+    return rows[0] ?? null;
+  }
+
+  /**
+   * Locks the trip row and returns its status as of that lock; always last
+   * in the DRIVER -> VEHICLE -> TRIP order, so no path can invert it and
+   * deadlock. Used by verification, and by expense submission in the
+   * expenses module, which is what makes the two serialise against each
+   * other. The status comes from the locked row itself, never from an
+   * earlier read that could already be stale.
+   */
+  private async lockTrip(
+    tx: Prisma.TransactionClient,
+    tripId: string,
+  ): Promise<{ status: TripStatus } | null> {
+    const rows = await tx.$queryRaw<{ status: TripStatus }[]>`
+      SELECT status FROM trips WHERE id = ${tripId}::uuid FOR UPDATE`;
     return rows[0] ?? null;
   }
 

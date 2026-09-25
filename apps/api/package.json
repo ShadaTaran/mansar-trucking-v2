@@ -40,6 +40,9 @@
     "test:db": "vitest run --config vitest.config.db.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1140.0",
+    "@aws-sdk/s3-presigned-post": "^3.1140.0",
+    "@aws-sdk/s3-request-presigner": "^3.1140.0",
     "@mansar/types": "*",
     "@nestjs/common": "~12.0.3",
     "@nestjs/core": "~12.0.3",

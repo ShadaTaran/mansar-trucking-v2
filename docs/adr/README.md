@@ -29,13 +29,14 @@ An accepted ADR is not edited to change its decision; a new ADR supersedes it.
 
 ## Index
 
-| ADR                                                     | Title                                   |
-| ------------------------------------------------------- | --------------------------------------- |
-| [0001](0001-monorepo-and-application-boundaries.md)     | Monorepo and application boundaries     |
-| [0002](0002-users-and-drivers-are-separate.md)          | Users and drivers are separate          |
-| [0003](0003-trip-state-machine.md)                      | Trip state machine                      |
-| [0004](0004-location-is-trip-scoped.md)                 | Location is trip-scoped                 |
-| [0005](0005-public-demo-uses-synthetic-data.md)         | Public demo uses synthetic data         |
-| [0006](0006-authentication-credentials-and-sessions.md) | Authentication credentials and sessions |
-| [0007](0007-browser-bff-authentication.md)              | Browser BFF authentication              |
-| [0008](0008-mobile-authentication.md)                   | Mobile authentication                   |
+| ADR                                                      | Title                                    |
+| -------------------------------------------------------- | ---------------------------------------- |
+| [0001](0001-monorepo-and-application-boundaries.md)      | Monorepo and application boundaries      |
+| [0002](0002-users-and-drivers-are-separate.md)           | Users and drivers are separate           |
+| [0003](0003-trip-state-machine.md)                       | Trip state machine                       |
+| [0004](0004-location-is-trip-scoped.md)                  | Location is trip-scoped                  |
+| [0005](0005-public-demo-uses-synthetic-data.md)          | Public demo uses synthetic data          |
+| [0006](0006-authentication-credentials-and-sessions.md)  | Authentication credentials and sessions  |
+| [0007](0007-browser-bff-authentication.md)               | Browser BFF authentication               |
+| [0008](0008-mobile-authentication.md)                    | Mobile authentication                    |
+| [0009](0009-receipt-object-storage-and-direct-upload.md) | Receipt object storage and direct upload |

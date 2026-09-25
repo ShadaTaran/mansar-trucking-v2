@@ -152,9 +152,9 @@ a production admin tool.
 
 ## 13. Current schema
 
-Three migrations exist: `init_users_audit` (users, audit_logs),
-`add_refresh_sessions`, and `20260922105701_add_drivers_vehicles` (Stage 4:
-drivers, vehicles). Tables:
+Four migrations exist: `init_users_audit` (users, audit_logs),
+`add_refresh_sessions`, `20260922105701_add_drivers_vehicles` (Stage 4:
+drivers, vehicles) and `20260923065202_add_trips` (Stage 5: trips). Tables:
 
 - `users`: login identity; `password_hash` holds a self-describing Argon2id
   PHC string and is omitted from every Prisma result unless a query selects
@@ -203,6 +203,65 @@ behaviour by `test/drivers-api.int-spec.ts` and
 the application: `status` is the lifecycle, documented in
 [drivers-vehicles.md](drivers-vehicles.md).
 
+Stage 5 added one table and its enum (`trip_status` = `DRAFT | ASSIGNED |
+IN_PROGRESS | COMPLETED | VERIFIED | CLOSED | CANCELLED`):
+
+- `trips`: haulage jobs. `driver_id` and `vehicle_id` are nullable — a
+  `DRAFT` carries no assignment yet — and both foreign keys are **`ON DELETE
+RESTRICT ON UPDATE NO ACTION`**, so a driver or vehicle referenced by any
+  trip cannot be deleted and history is never silently detached. Ownership is
+  the operational driver, never a login identity
+  ([ADR 0002](adr/0002-users-and-drivers-are-separate.md)).
+  `scheduled_start_at` and `scheduled_end_at` are the planned window;
+  `started_at` and `completed_at` are stamped by the driver's own actions.
+  All four are `TIMESTAMPTZ(3)` and nullable. `origin` and `destination` are
+  `NOT NULL`, `notes` is `NOT NULL DEFAULT ''`, and `status` defaults to
+  `DRAFT`.
+
+Unlike the Stage 4 driver and vehicle tables, Stage 5 adds indexes because
+the trip listing and assignment query patterns justify them:
+`(status, scheduled_start_at, id)`, `(driver_id, scheduled_start_at, id)` and
+`(vehicle_id, scheduled_start_at, id)` serve the admin and driver listings,
+which order by scheduled start with `id` as the deterministic tie-breaker.
+Paging is offset-based (`page`/`pageSize` → `skip`/`take`); `id` is not a
+cursor.
+
+The rest of the trip invariants are PostgreSQL-native and hand-written in the
+migration (§15), because Prisma cannot express them:
+
+- `btree_gist` — the extension that lets a plain-equality column share a GiST
+  index with a range column. Required by the two exclusion constraints.
+- `trips_schedule_order` — CHECK: either bound may be absent, but a complete
+  window must be ordered (`end > start`).
+- `trips_assignment_complete` — CHECK: past `DRAFT` and `CANCELLED`, a trip
+  carries a driver, a vehicle **and** both schedule bounds. This also guards
+  the exclusion constraints, since `tstzrange(NULL, NULL)` is the UNBOUNDED
+  range and would otherwise overlap every other row.
+- `trips_driver_schedule_excl` and `trips_vehicle_schedule_excl` — GiST
+  EXCLUDE constraints over `driver_id`/`vehicle_id` `WITH =` and
+  `tstzrange(scheduled_start_at, scheduled_end_at, '[)')` `WITH &&`. The
+  interval is **half-open**, so a trip ending at 12:00 and one starting at
+  12:00 are back-to-back rather than overlapping.
+- `trips_one_in_progress_per_driver` and
+  `trips_one_in_progress_per_vehicle` — partial unique indexes
+  `WHERE status = 'IN_PROGRESS'`, allowing at most one running trip per
+  driver and per vehicle regardless of the scheduled windows.
+
+Both exclusion constraints are partial:
+`WHERE status IN ('ASSIGNED', 'IN_PROGRESS', 'COMPLETED', 'VERIFIED',
+'CLOSED')`. `DRAFT` and `CANCELLED` do not participate, so planning and
+cancelling never reserve a resource. The historical statuses
+(`COMPLETED`, `VERIFIED`, `CLOSED`) **do** participate on purpose: a finished
+trip keeps protecting its window, so the past cannot be overwritten by a new
+assignment.
+
+Constraint names are explicit and stable because the API maps violations back
+to domain errors by SQLSTATE and index name
+([trips.md §6](trips.md)). Every one of these objects is asserted against a
+real database by `test/trips-persistence.int-spec.ts`; behaviour by
+`test/trips-api.int-spec.ts` and `test/driver-trips-api.int-spec.ts`. Trip
+rows are never deleted by the application; see [trips.md](trips.md).
+
 ## 14. Conventions
 
 | Concern            | Rule                                                              |
@@ -225,10 +284,17 @@ in the database.
 ## 15. Raw SQL in migrations
 
 Migration SQL may be reviewed and extended by hand when a PostgreSQL-native
-invariant cannot be expressed in the Prisma schema. Future examples include
-partial unique indexes, `btree_gist` exclusion constraints and triggers; none
-exist yet. Every such feature gets a behavioural and/or catalog integration
-test, because `db:diff:check` cannot see it.
+invariant cannot be expressed in the Prisma schema. Every such feature gets a
+behavioural and/or catalog integration test, because `db:diff:check` cannot
+see it.
+
+`20260923065202_add_trips` is the first migration to use this: below the
+Prisma-generated section it creates the `btree_gist` extension, two CHECK
+constraints, two GiST exclusion constraints and two partial unique indexes
+(§13). Names are explicit and stable, because the API maps violations back to
+domain errors by SQLSTATE and index name, and
+`test/trips-persistence.int-spec.ts` asserts every object against a real
+database.
 
 ## 16. CI database proof
 

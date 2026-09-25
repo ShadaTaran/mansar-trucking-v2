@@ -11,12 +11,18 @@ Implemented so far:
 - authentication and authorization: email + password login, HS256 access
   tokens, rotating refresh sessions with reuse detection, ADMIN/DRIVER roles,
   login/refresh rate limiting — [docs/authentication.md](../../docs/authentication.md)
-- append-only audit logging of auth and user events
+- append-only audit logging of auth, user, driver, vehicle and trip events
 - ADMIN and DRIVER **login identities** created by interactive CLIs
+- operational **drivers and vehicles**: ADMIN management, lifecycle status,
+  login linking — [docs/drivers-vehicles.md](../../docs/drivers-vehicles.md)
+- **ADMIN trip management**: create, edit, assign/re-assign, cancel, verify,
+  close — [docs/trips.md](../../docs/trips.md)
+- **DRIVER trip lifecycle**: a driver's own trips, Start and Complete, with
+  the schedule and one-running-trip invariants enforced by PostgreSQL itself
+  — [docs/trips.md](../../docs/trips.md)
 - health (liveness) and readiness endpoints
 
-Operational features (drivers, vehicles, trips, expenses, receipts,
-maintenance, location) arrive in later stages.
+Expenses, receipts, maintenance and location tracking arrive in later stages.
 
 ## Endpoints
 
@@ -30,8 +36,12 @@ maintenance, location) arrive in later stages.
 | `POST /auth/logout-all` | bearer | revoke every session of the caller                                                       |
 | `GET /auth/me`          | bearer | fresh `{ id, email, role }`                                                              |
 
-Every other route requires a bearer access token; see the authentication
-guide for request/response shapes and error codes.
+Every other route requires a bearer access token. The `/drivers` and
+`/vehicles` routes are ADMIN-only
+([docs/drivers-vehicles.md](../../docs/drivers-vehicles.md)); `/trips` is
+ADMIN-only and `/driver/trips` DRIVER-only
+([docs/trips.md](../../docs/trips.md)). See the authentication guide for
+token, request/response and error-code shapes.
 
 ## Commands
 
@@ -60,8 +70,14 @@ never accepted from arguments, the environment or files, and never printed.
 The role is fixed by the command. `driver:create` creates a **login identity
 only** — a `users` row with role DRIVER — not an operational driver record;
 users and drivers are separate concepts
-([ADR 0002](../../docs/adr/0002-users-and-drivers-are-separate.md)) and the
-operational entity arrives with trip management.
+([ADR 0002](../../docs/adr/0002-users-and-drivers-are-separate.md)). The
+operational driver is created through the ADMIN drivers API and linked to
+that login afterwards
+([docs/drivers-vehicles.md](../../docs/drivers-vehicles.md)). Such a login
+authenticates normally; until it is linked to an operational driver, every
+`/driver/trips` operation fails with `409 driver_not_linked` rather than
+returning an empty list
+([docs/trips.md](../../docs/trips.md)).
 
 Scripts that compile, run or test the API (`build`, `start`, `start:dev`,
 `typecheck`, `test`, `test:db`, `admin:create`, `driver:create`) first run

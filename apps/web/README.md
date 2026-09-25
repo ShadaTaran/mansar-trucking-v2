@@ -3,9 +3,27 @@
 Admin web application for the Mansar Trucking Management System v2, built
 with Next.js (App Router).
 
-Scaffold stage only: the app renders a single development page that proves
-the workspace wiring. Application screens, authentication, and API
-integration arrive in later stages.
+Implemented so far:
+
+- **Browser authentication and BFF** — sign in, refresh, sign out and
+  sign-out-everywhere through same-origin `/api/auth/*` route handlers.
+  Tokens live in `HttpOnly` cookies and never reach JavaScript; all other
+  data traffic is proxied through `/api/backend/*`, so the browser never
+  calls the API origin directly.
+  [docs/authentication.md](../../docs/authentication.md)
+- **Driver management** — `/drivers`, `/drivers/new`, `/drivers/[id]`:
+  create, edit, activate/deactivate, link and unlink a login.
+- **Vehicle management** — `/vehicles`, `/vehicles/new`, `/vehicles/[id]`:
+  create, edit and move through the vehicle lifecycle.
+  Both: [docs/drivers-vehicles.md](../../docs/drivers-vehicles.md)
+- **Trip administration** — `/trips`, `/trips/new`, `/trips/[id]`: create a
+  draft, edit its text, assign or re-assign a driver, vehicle and schedule,
+  and cancel, verify or close it. Actions appear only where the lifecycle
+  allows them. [docs/trips.md](../../docs/trips.md)
+
+Screens live under the `(admin)` route group behind `/login`. Starting and
+completing a trip belong to the driver app, not here. Expenses, receipts,
+maintenance and location tracking arrive in later stages.
 
 ## Commands
 

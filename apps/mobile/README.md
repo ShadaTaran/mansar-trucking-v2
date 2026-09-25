@@ -4,9 +4,18 @@ Driver mobile application for the Mansar Trucking Management System v2, built
 with React Native (Android only for the MVP; the generated iOS project was
 removed because it cannot be built or verified in this environment).
 
-Implemented so far: driver authentication (sign in, session restore after
-restart, sign out) against the API. Trip screens, location sharing and the
-offline queue arrive in later stages.
+Implemented so far — a deliberately thin execution MVP:
+
+- driver authentication: sign in, session restore after restart, sign out
+- the driver's **own trip list**, filterable by status and paged
+- **trip detail**: origin, destination, schedule, start/completion instants,
+  notes and status
+- **Start** for an `ASSIGNED` trip and **Complete** for an `IN_PROGRESS` one,
+  each behind a confirmation
+
+The trip contract is documented in [docs/trips.md](../../docs/trips.md).
+Location sharing, the offline queue, expenses and receipts are **not**
+implemented and arrive in later stages; nothing here is stubbed for them.
 
 Native identity: project `MansarDriver`, display name "Mansar Driver",
 Android application id `com.mansar.driver`.
@@ -54,13 +63,43 @@ the API remains the only authentication authority
 - `src/auth/authenticated-fetch.ts` — bearer requests with one automatic
   refresh + retry on 401.
 - `src/auth/auth-context.tsx`, `src/screens/*` — React wiring and the
-  minimal sign-in, loading, retry and signed-in placeholder screens.
+  sign-in, loading, retry, trip-list and trip-detail screens. Screen
+  switching is local state; there is intentionally no navigation library.
 
 AsyncStorage must never hold credentials; an ESLint rule scoped to
 `src/auth/**` rejects `@react-native-async-storage/async-storage`.
 
 `react-native-keychain` is linked through React Native autolinking; no manual
 registration in `MainApplication.kt`.
+
+## Trips
+
+- `src/trips/driver-trips-api.ts` — the four DRIVER routes (`list`, `get`,
+  `start`, `complete`) over `@mansar/api-client` and the existing
+  authenticated fetch stack. No new transport and no new storage were
+  introduced for Stage 5.
+- `src/trips/driver-trip-messages.ts` — the fixed user-facing strings for
+  each API error code.
+- `src/trips/trip-time.ts` — schedule display only.
+- `src/screens/DriverHomeScreen.tsx`, `src/screens/DriverTripDetailScreen.tsx`.
+
+The rendered status is **server-authoritative**: each screen shows what the
+API returned, never an optimistic local guess, and there is no offline queue
+to reconcile. While a mutation is in flight the action button and the Back
+control are both disabled, so navigation cannot race a response.
+
+Schedule instants are displayed in **Asia/Manila at a fixed UTC+08:00
+offset**. The device timezone is never consulted — a phone set to another
+zone would otherwise silently shift every trip — and no date library is
+involved. A value that is not a well-formed UTC instant is shown unchanged
+rather than as a confident wrong time. The Philippines has observed UTC+08:00
+without daylight saving since 1978, which is what makes the fixed offset
+sound.
+
+The `staging` variant below is what Stage 5F used to verify this flow against
+the real staging API, running on an Android emulator (`emulator-5554`,
+`sdk_gphone16k_x86_64`) rather than physical hardware
+([docs/staging-deployment.md](../../docs/staging-deployment.md) §12b).
 
 ## API endpoint per build variant
 

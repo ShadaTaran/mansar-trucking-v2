@@ -341,9 +341,16 @@ Web (ADMIN)
 
 Mobile (DRIVER, `staging` build variant, HTTPS)
 
-- [ ] login → authenticated placeholder
+- [ ] login → own trip list, not a placeholder
 - [ ] force-stop + relaunch → session restored (old session `ROTATED`, new `ACTIVE`)
 - [ ] refresh (401 → one refresh → one retry)
+- [ ] trip list loads the driver's own trips; status filters page correctly
+- [ ] a trip belonging to another driver is not listed and reads as `trip_not_found`
+- [ ] schedule instants render in Asia/Manila (UTC+08:00), independent of the device timezone
+- [ ] detail of an `ASSIGNED` trip offers Start and no Complete
+- [ ] Start → `IN_PROGRESS`, `startedAt` non-null, Complete offered
+- [ ] Complete → `COMPLETED`, `completedAt` non-null, no lifecycle action remains
+- [ ] the rendered status is the server's, not an optimistic local guess
 - [ ] logout → login screen, Keychain entry removed
 - [ ] relaunch after logout stays logged out
 - [ ] no access token persisted; refresh token in Keychain only
@@ -416,6 +423,101 @@ Production
 
 - [x] untouched throughout: the `production` environment has no services and
       no buckets
+
+## 12b. Stage 5 deployment and device verification (performed)
+
+The Stage 5 trip flow verified end to end against the real staging API on an
+Android emulator (`emulator-5554`, `sdk_gphone16k_x86_64`), with synthetic
+data only and without printing a token or password. Feature baseline and
+final tested source: `388cd7c097cd32eff6ecefbad6c5a95d47af0736`.
+
+Pipeline, against that exact SHA
+
+- [x] GitHub Actions run `35989799916` (run #17) — success
+- [x] `quality` job `107600898650` — success
+- [x] `database` job `107600899142` — success
+- [x] `mansar-api` deployment `f68a907e-e568-43bd-bab3-3719f6819bc9` —
+      success on `388cd7c0…`. Its pre-deploy command
+      `npm run db:migrate:deploy -w @mansar/api` ran successfully and
+      reported `4 migrations found in prisma/migrations` and
+      `No pending migrations to apply.` — the staging database was already
+      fully migrated, so **this deployment did not itself apply**
+      `20260923065202_add_trips`
+- [x] `GET /health` and `GET /health/ready` — 200, `checks.database = "ok"`
+
+Service SHAs differ, deliberately
+
+- [x] `mansar-web` deployment `46f158f2-4027-4d1d-ad35-c6b6722260b8` —
+      success, but on the **Stage 5D** SHA
+      `742c3f348695eb189ab8e33d47740fca74112110`, not `388cd7c0…`. The two
+      commits after Stage 5D touched only the mobile app and the API test
+      suite, so the web service had nothing to redeploy for. **The executable
+      application components did not all use the same repository SHA**:
+      `mansar-api` ran `388cd7c0…`, `mansar-web` remained on `742c3f34…`,
+      and the Android staging APK was built from the clean working tree at
+      `388cd7c0…`. PostgreSQL is the managed database service and is not tied
+      to a repository commit SHA.
+
+Android staging build
+
+- [x] `com.mansar.driver.staging` uninstalled first, so the smoke could not
+      reuse an older refresh token; `com.mansar.driver` left untouched
+- [x] built and installed from a clean worktree at `388cd7c0…` with
+      `npm run android:staging -w @mansar/mobile` — `BUILD SUCCESSFUL`
+- [x] APK `apps/mobile/android/app/build/outputs/apk/staging/app-staging.apk`,
+      SHA-256
+      `3BBF639B877560C0D666DDB4BFE789468B7998668BA83DB5F1AE6599418B0885`
+- [x] the earlier uninstall is what cleared the old staging app's data and
+      stored session state; the reinstall then landed on an empty sandbox.
+      Supporting evidence that it was a fresh install rather than an upgrade:
+      `firstInstallTime` equals `lastUpdateTime`
+- [x] launched to the unauthenticated Sign in screen, both fields empty and
+      no session restored
+
+Prepared synthetic data (admin web / ADMIN API only)
+
+- [x] driver `01a0cc31-8838-7691-a8f3-27fa5e805ed6`, `ACTIVE`, linked to the
+      synthetic DRIVER login
+- [x] vehicle `01a0ccb0-a502-738c-8fe7-5647b328802e`, plate `STG4E RUN2 01`,
+      `ACTIVE`
+- [x] trip `01a0d1e5-8c4b-70fa-8b3c-0939b523b033` assigned to that driver and
+      vehicle for `2026-09-25T01:00:00.000Z` – `2026-09-25T03:00:00.000Z`
+
+Driver mobile lifecycle, on `emulator-5554`
+
+- [x] DRIVER login succeeded against the staging API over HTTPS
+- [x] own trip list loaded and showed the prepared trip as `ASSIGNED`
+- [x] its schedule rendered as 09:00–11:00 Asia/Manila — the fixed UTC+08:00
+      conversion of the stored instants
+- [x] detail showed `ASSIGNED` with a Start action and no Complete
+- [x] Start confirmation performed; server-authoritative status became
+      `IN_PROGRESS`, persisted
+      `startedAt = 2026-09-24T14:14:05.467Z`
+- [x] Complete confirmation performed; server-authoritative status became
+      `COMPLETED`, persisted
+      `completedAt = 2026-09-24T14:14:53.068Z`
+- [x] no Start or Complete action remained on the completed trip
+- [x] returning to the list refetched from the API and showed `COMPLETED`
+- [x] `driverId` and `vehicleId` unchanged throughout
+- [x] a subsequent read-only ADMIN `GET` confirmed the exact final server
+      state, and no unrelated trip changed
+- [x] normal single-session sign-out returned the app to the Sign in screen;
+      `logout-all` was not used
+
+Cleanup
+
+- [x] assessed: trips are cancelled, never deleted, and the completed smoke
+      trip is legitimate synthetic history. It remains as `COMPLETED`
+      staging data, together with its driver and vehicle.
+- [x] the temporary ADMIN sessions the preparation and verification created
+      were revoked with ordinary single-session logout
+
+Production
+
+- [x] untouched throughout: the `production` environment has no services and
+      no buckets, no production endpoint was contacted, and the
+      `com.mansar.driver` package on the device was neither reinstalled nor
+      modified
 
 ## 13. Not in scope for staging
 

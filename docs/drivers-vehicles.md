@@ -222,15 +222,40 @@ numbers, plate values, notes or email addresses. `fields` lists field _names_
 only; user references are UUIDs, matching the existing audit convention in
 [authentication.md](authentication.md) §9.
 
-## 11. Stage 5 boundary
+## 11. How trips use drivers and vehicles
 
-Trips, assignment, trip lifecycle and the mobile trip flow are **not
-implemented**. Two constraints follow from this stage for whoever builds
-them:
+Trips, assignment, the trip lifecycle and the mobile trip flow are
+implemented. The full contract lives in [trips.md](trips.md); what follows is
+only where it touches the records described above.
 
-- operational assignment may be offered only for `ACTIVE` drivers and
-  `ACTIVE` vehicles;
-- driver operational status must be re-checked against fresh state at the
-  moment of the action, never inferred from the age or existence of an access
-  token — a deactivated driver's token stays valid for its normal short
-  lifetime, and the linked login may sign in again.
+**Assignment requires both resources `ACTIVE`.** `POST /trips/:id/assign`
+rejects a driver that is not `ACTIVE` (`driver_inactive`) and a vehicle that
+is not `ACTIVE` (`vehicle_not_active`, covering both `IN_MAINTENANCE` and
+`RETIRED`).
+
+**Start re-checks both, fresh.** An assignment made earlier proves nothing
+about now, so `POST /driver/trips/:id/start` reads the driver and vehicle
+again — from rows locked `FOR UPDATE`, driver first and vehicle second — and
+refuses if either has since left `ACTIVE`. Status is never inferred from the
+age or existence of an access token: a deactivated driver's token stays valid
+for its normal short lifetime, and the linked login may sign in again. Those
+locks are what serialise a trip write against the driver and vehicle status
+endpoints above; whichever transaction takes the lock first wins, and the
+loser sees committed state rather than a stale `ACTIVE` read.
+
+**Complete requires neither.** A running trip must always be finishable, so
+`POST /driver/trips/:id/complete` checks no resource status at all. A driver
+deactivated, or a vehicle sent for maintenance, in the middle of a journey
+can still close out the work rather than leaving it stranded.
+
+**A driver cannot be unlinked while an `IN_PROGRESS` trip exists.**
+`POST /drivers/:id/unlink-user` returns `409 driver_has_in_progress_trip` in
+that case (§7), because unlinking mid-journey would strand the running trip.
+Only `IN_PROGRESS` blocks.
+
+**Future trips are not auto-cancelled.** Deactivating a driver, or moving a
+vehicle to `IN_MAINTENANCE` or `RETIRED`, does **not** cancel or unassign
+their existing `ASSIGNED` trips. Those trips simply cannot be started while
+the resource is non-active; an administrator re-assigns or cancels them
+deliberately. A lifecycle change to a record is never a silent bulk edit of
+operational work.

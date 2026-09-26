@@ -65,6 +65,9 @@ function installFetch(
       if (url.startsWith('/api/backend/vehicles?')) {
         return json(200, emptyPage);
       }
+      if (url.startsWith('/api/backend/expenses?')) {
+        return json(200, emptyPage);
+      }
       if (
         url.startsWith('/api/backend/drivers/') ||
         url.startsWith('/api/backend/vehicles/')
@@ -239,6 +242,187 @@ describe('TripDetail controls per status', () => {
     expect(
       screen.queryByRole('button', { name: /^complete/i }),
     ).not.toBeInTheDocument();
+  });
+});
+
+describe('TripDetail expenses section', () => {
+  it('renders an Expenses section on every trip', async () => {
+    installFetch(() => json(200, trip('IN_PROGRESS')));
+    render(<TripDetail tripId={TRIP_ID} />);
+    await screen.findByRole('heading', { level: 1 });
+
+    expect(
+      await screen.findByRole('heading', { level: 2, name: 'Expenses' }),
+    ).toBeInTheDocument();
+  });
+
+  it('places Expenses before Lifecycle, so pending costs are read first', async () => {
+    installFetch(() => json(200, trip('COMPLETED')));
+    render(<TripDetail tripId={TRIP_ID} />);
+    await screen.findByRole('heading', { level: 2, name: 'Lifecycle' });
+
+    const headings = screen
+      .getAllByRole('heading', { level: 2 })
+      .map((node) => node.textContent);
+    // Pending expenses are the one thing that can block Verify.
+    expect(headings.indexOf('Expenses')).toBeLessThan(
+      headings.indexOf('Lifecycle'),
+    );
+  });
+
+  it('asks the server for this trip only', async () => {
+    const urls = installFetch(() => json(200, trip('COMPLETED')));
+    render(<TripDetail tripId={TRIP_ID} />);
+    await screen.findByRole('heading', { level: 2, name: 'Expenses' });
+
+    await waitFor(() =>
+      expect(urls).toContain(
+        `/api/backend/expenses?tripId=${TRIP_ID}&page=1&pageSize=25`,
+      ),
+    );
+  });
+
+  it('offers admin expense entry on a COMPLETED trip', async () => {
+    installFetch(() => json(200, trip('COMPLETED')));
+    render(<TripDetail tripId={TRIP_ID} />);
+
+    expect(
+      await screen.findByRole('heading', { level: 3, name: 'Add expense' }),
+    ).toBeInTheDocument();
+  });
+
+  it.each([
+    'DRAFT',
+    'ASSIGNED',
+    'IN_PROGRESS',
+    'VERIFIED',
+    'CLOSED',
+    'CANCELLED',
+  ] as const)('offers no expense entry while %s', async (status) => {
+    installFetch(() => json(200, trip(status)));
+    render(<TripDetail tripId={TRIP_ID} />);
+    await screen.findByRole('heading', { level: 2, name: 'Expenses' });
+
+    expect(
+      screen.queryByRole('heading', { level: 3, name: 'Add expense' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('leaves the existing edit and assignment behaviour alone', async () => {
+    installFetch(() => json(200, trip('DRAFT')));
+    render(<TripDetail tripId={TRIP_ID} />);
+    await screen.findByRole('heading', { level: 1 });
+
+    expect(
+      screen.getByRole('heading', { level: 2, name: 'Edit trip' }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('heading', { level: 2, name: 'Assignment' }),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByRole('heading', { level: 2, name: 'Expenses' }),
+    ).toBeInTheDocument();
+  });
+});
+
+describe('TripDetail verification with expenses', () => {
+  it('still offers Verify on a COMPLETED trip, whatever the expenses say', async () => {
+    installFetch((url) =>
+      url.startsWith('/api/backend/expenses?')
+        ? json(200, {
+            items: [
+              {
+                id: '019a0000-0000-7000-8000-000000000002',
+                tripId: TRIP_ID,
+                status: 'SUBMITTED',
+                amount: '1250.00',
+                category: 'FUEL',
+                incurredAt: '2026-09-24T00:30:00.000Z',
+                description: '',
+                reviewNote: '',
+                reviewedAt: null,
+                createdAt: '2026-09-24T01:00:00.000Z',
+                updatedAt: '2026-09-24T01:00:00.000Z',
+              },
+            ],
+            page: 1,
+            pageSize: 25,
+            total: 1,
+          })
+        : json(200, trip('COMPLETED')),
+    );
+    render(<TripDetail tripId={TRIP_ID} />);
+
+    // The server is the authority on whether a trip can verify; a
+    // client-side disable would be stale the moment someone else reviews.
+    expect(
+      await screen.findByRole('button', { name: 'Verify trip' }),
+    ).toBeEnabled();
+  });
+
+  it('shows the safe message when the server refuses over pending expenses', async () => {
+    installFetch((url, method) => {
+      if (url.startsWith('/api/backend/expenses?')) {
+        return json(200, emptyPage);
+      }
+      if (method === 'POST' && url.endsWith('/verify')) {
+        return json(409, { message: 'trip_has_pending_expenses' });
+      }
+      return json(200, trip('COMPLETED'));
+    });
+    render(<TripDetail tripId={TRIP_ID} />);
+    await screen.findByRole('button', { name: 'Verify trip' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Verify trip' }));
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Confirm verification' }),
+    );
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Review all submitted expenses before verifying this trip.',
+    );
+    // The trip is left exactly as it was.
+    expect(dd('Status')).toBe('COMPLETED');
+  });
+
+  it('never changes the trip status because of expense activity', async () => {
+    installFetch((url, method) => {
+      if (url.startsWith('/api/backend/expenses?')) {
+        return json(200, emptyPage);
+      }
+      if (method === 'POST' && url.endsWith('/expenses')) {
+        return json(201, {
+          id: '019a0000-0000-7000-8000-000000000002',
+          tripId: TRIP_ID,
+          status: 'SUBMITTED',
+          amount: '10.00',
+          category: 'FUEL',
+          incurredAt: '2026-09-24T00:30:00.000Z',
+          description: '',
+          reviewNote: '',
+          reviewedAt: null,
+          createdAt: '2026-09-24T01:00:00.000Z',
+          updatedAt: '2026-09-24T01:00:00.000Z',
+        });
+      }
+      return json(200, trip('COMPLETED'));
+    });
+    render(<TripDetail tripId={TRIP_ID} />);
+    await screen.findByRole('heading', { level: 3, name: 'Add expense' });
+
+    fireEvent.change(screen.getByLabelText('Amount (PHP)'), {
+      target: { value: '10.00' },
+    });
+    fireEvent.change(screen.getByLabelText('Incurred at (Asia/Manila)'), {
+      target: { value: '2026-09-24T08:30' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Add expense' }));
+
+    await screen.findByRole('status');
+    expect(dd('Status')).toBe('COMPLETED');
+    expect(
+      screen.getByRole('button', { name: 'Verify trip' }),
+    ).toBeInTheDocument();
   });
 });
 

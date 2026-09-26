@@ -11,6 +11,7 @@ const LINKS = [
   { href: '/drivers', label: 'Drivers' },
   { href: '/vehicles', label: 'Vehicles' },
   { href: '/trips', label: 'Trips' },
+  { href: '/expenses', label: 'Expenses' },
 ] as const;
 
 /**

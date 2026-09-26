@@ -8,6 +8,7 @@ import { adminErrorMessage, getTrip } from '@/lib/client/admin-api';
 import { formatTripTime, NO_TIME } from '@/lib/trip-time';
 
 import { TripAssignment } from './trip-assignment';
+import { TripExpenses } from './trip-expenses';
 import { TripForm } from './trip-form';
 import { TripLifecycle } from './trip-lifecycle';
 
@@ -135,6 +136,11 @@ export function TripDetail({ tripId }: { readonly tripId: string }) {
           <TripAssignment trip={trip} onChanged={setTrip} />
         </>
       ) : null}
+      {/* Before the lifecycle control on purpose: pending expenses are the
+          one thing that can block Verify, so an admin should read them
+          before reaching that button. Expense activity never changes the
+          trip's own status — only the server's lifecycle transitions do. */}
+      <TripExpenses trip={trip} />
       <TripLifecycle trip={trip} onChanged={setTrip} />
     </main>
   );

@@ -1,7 +1,15 @@
 import {
   type Driver,
   type DriverStatus,
+  EXPENSE_CATEGORIES,
+  EXPENSE_STATUSES,
+  type Expense,
+  type ExpenseCategory,
+  type ExpenseStatus,
   type Page,
+  type Receipt,
+  type ReceiptReadAuthorization,
+  type ReceiptUploadAuthorization,
   type Trip,
   TRIP_STATUSES,
   type TripStatus,
@@ -9,6 +17,7 @@ import {
   type VehicleStatus,
 } from '@mansar/types';
 
+import { isExpenseAmountResponse } from '../money';
 import { authenticatedFetch } from './authenticated-fetch';
 
 /**
@@ -603,6 +612,353 @@ export function closeTrip(id: string): Promise<AdminApiResult<Trip>> {
   );
 }
 
+/** Sourced from the shared tuples, so the UI cannot drift from the API. */
+const EXPENSE_STATUS_VALUES: readonly string[] = EXPENSE_STATUSES;
+const EXPENSE_CATEGORY_VALUES: readonly string[] = EXPENSE_CATEGORIES;
+
+/** The three frozen receipt image types, as the API stores them. */
+const RECEIPT_CONTENT_TYPES: readonly string[] = [
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+];
+
+/** The frozen Stage 6 receipt size window, in bytes. */
+const RECEIPT_MIN_BYTE_SIZE = 1;
+const RECEIPT_MAX_BYTE_SIZE = 10 * 1024 * 1024;
+
+/**
+ * Fail-closed Expense parser.
+ *
+ * `amount` is checked as a **string** against the exact shape the API
+ * returns — `Decimal.toFixed(2)`, so always two fractional digits and
+ * always positive — and is never routed through `Number`. A malformed
+ * amount fails the whole parse rather than arriving in the UI as something
+ * that merely looks like money.
+ *
+ * No driver appears here because the wire type has none: ownership is the
+ * trip's driver (ADR 0002), and inventing one would mean claiming knowledge
+ * the response does not carry.
+ */
+export function parseExpense(value: unknown): Expense | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const id = str(value.id);
+  const tripId = str(value.tripId);
+  const status = str(value.status);
+  const amount = str(value.amount);
+  const category = str(value.category);
+  const incurredAt = str(value.incurredAt);
+  const description = str(value.description);
+  const reviewNote = str(value.reviewNote);
+  const reviewedAt = nullableStr(value.reviewedAt);
+  const createdAt = str(value.createdAt);
+  const updatedAt = str(value.updatedAt);
+  if (
+    id === null ||
+    tripId === null ||
+    status === null ||
+    !EXPENSE_STATUS_VALUES.includes(status) ||
+    amount === null ||
+    !isExpenseAmountResponse(amount) ||
+    category === null ||
+    !EXPENSE_CATEGORY_VALUES.includes(category) ||
+    incurredAt === null ||
+    description === null ||
+    reviewNote === null ||
+    reviewedAt === undefined ||
+    createdAt === null ||
+    updatedAt === null
+  ) {
+    return null;
+  }
+  return {
+    id,
+    tripId,
+    status: status as ExpenseStatus,
+    amount,
+    category: category as ExpenseCategory,
+    incurredAt,
+    description,
+    reviewNote,
+    reviewedAt,
+    createdAt,
+    updatedAt,
+  };
+}
+
+/**
+ * Fail-closed Receipt parser.
+ *
+ * The returned object is built field by field from the six wire fields, so
+ * `objectKey` cannot reach the browser even if an upstream response somehow
+ * carried one: it is never read and never copied. `confirmedAt` is the whole
+ * lifecycle — null means an upload was authorized but no object has been
+ * verified, and such a receipt is not yet evidence of anything.
+ */
+export function parseReceipt(value: unknown): Receipt | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const id = str(value.id);
+  const expenseId = str(value.expenseId);
+  const contentType = str(value.contentType);
+  const byteSize = int(value.byteSize);
+  const confirmedAt = nullableStr(value.confirmedAt);
+  const createdAt = str(value.createdAt);
+  if (
+    id === null ||
+    expenseId === null ||
+    contentType === null ||
+    !RECEIPT_CONTENT_TYPES.includes(contentType) ||
+    byteSize === null ||
+    byteSize < RECEIPT_MIN_BYTE_SIZE ||
+    byteSize > RECEIPT_MAX_BYTE_SIZE ||
+    confirmedAt === undefined ||
+    createdAt === null
+  ) {
+    return null;
+  }
+  return { id, expenseId, contentType, byteSize, confirmedAt, createdAt };
+}
+
+/**
+ * An opaque provider bag: every value must already be a string, because it
+ * is reproduced verbatim into a form field or a request header and anything
+ * else would be silently stringified into a broken signature.
+ */
+function stringRecord(value: unknown): Record<string, string> | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const record: Record<string, string> = {};
+  for (const [name, entry] of Object.entries(value)) {
+    if (typeof entry !== 'string') {
+      return null;
+    }
+    record[name] = entry;
+  }
+  return record;
+}
+
+/**
+ * Fail-closed upload authorization parser, over both frozen branches.
+ *
+ * The discriminant is checked first and each branch is then required to
+ * carry its own member and *not* the other's: a POST arriving with
+ * `headers`, or a PUT with `fields`, is a response this client does not
+ * understand, and guessing which half to believe is how a signature ends up
+ * silently wrong. Nothing is cast — the union is rebuilt explicitly so no
+ * extra provider property can ride along.
+ */
+export function parseReceiptUploadAuthorization(
+  value: unknown,
+): ReceiptUploadAuthorization | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const receiptId = str(value.receiptId);
+  const url = str(value.url);
+  const expiresAt = str(value.expiresAt);
+  const method = str(value.method);
+  if (receiptId === null || url === null || expiresAt === null) {
+    return null;
+  }
+
+  if (method === 'POST') {
+    if (value.headers !== undefined) {
+      return null;
+    }
+    const fields = stringRecord(value.fields);
+    return fields === null
+      ? null
+      : { receiptId, method: 'POST', url, fields, expiresAt };
+  }
+
+  if (method === 'PUT') {
+    if (value.fields !== undefined) {
+      return null;
+    }
+    const headers = stringRecord(value.headers);
+    return headers === null
+      ? null
+      : { receiptId, method: 'PUT', url, headers, expiresAt };
+  }
+
+  return null;
+}
+
+/** Fail-closed read authorization parser: a URL and an expiry, nothing else. */
+export function parseReceiptReadAuthorization(
+  value: unknown,
+): ReceiptReadAuthorization | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const url = str(value.url);
+  const expiresAt = str(value.expiresAt);
+  return url === null || expiresAt === null ? null : { url, expiresAt };
+}
+
+/**
+ * Expenses filter their listing on closed vocabularies and ids only. There
+ * is deliberately no `q`: the API has no free-text search over expenses, and
+ * a search box that quietly filtered nothing would be worse than none.
+ */
+export interface ListExpensesQuery {
+  readonly status?: string;
+  readonly category?: string;
+  readonly tripId?: string;
+  readonly driverId?: string;
+  readonly page?: number;
+  readonly pageSize?: number;
+}
+
+export interface CreateExpenseInput {
+  readonly amount: string;
+  readonly category: ExpenseCategory;
+  readonly incurredAt: string;
+  readonly description: string;
+}
+
+export interface ReceiptUploadIntentInput {
+  readonly contentType: string;
+  readonly byteSize: number;
+}
+
+function expenseListPath(query: ListExpensesQuery): string {
+  const params = new URLSearchParams();
+  if (query.status) {
+    params.set('status', query.status);
+  }
+  if (query.category) {
+    params.set('category', query.category);
+  }
+  if (query.tripId) {
+    params.set('tripId', query.tripId);
+  }
+  if (query.driverId) {
+    params.set('driverId', query.driverId);
+  }
+  if (query.page !== undefined) {
+    params.set('page', String(query.page));
+  }
+  if (query.pageSize !== undefined) {
+    params.set('pageSize', String(query.pageSize));
+  }
+  const search = params.toString();
+  return search ? `/expenses?${search}` : '/expenses';
+}
+
+export function listExpenses(
+  query: ListExpensesQuery = {},
+): Promise<AdminApiResult<Page<Expense>>> {
+  return request(expenseListPath(query), {}, (value) =>
+    parsePage(value, parseExpense),
+  );
+}
+
+export function getExpense(id: string): Promise<AdminApiResult<Expense>> {
+  return request(`/expenses/${encodeURIComponent(id)}`, {}, parseExpense);
+}
+
+/**
+ * ADMIN-on-behalf entry. Creation is trip-scoped because the API says so:
+ * an expense only exists against a trip, and only once that trip is
+ * COMPLETED. The answer is 201, which the shared `response.ok` handling
+ * already accepts.
+ */
+export function createTripExpense(
+  tripId: string,
+  input: CreateExpenseInput,
+): Promise<AdminApiResult<Expense>> {
+  return request(
+    `/trips/${encodeURIComponent(tripId)}/expenses`,
+    { method: 'POST', body: input },
+    parseExpense,
+  );
+}
+
+/**
+ * Review sends a JSON body, unlike the trip lifecycle transitions.
+ *
+ * This is not a stylistic difference and copying `verifyTrip`'s bodyless
+ * call here would 400: the approve schema is a strict object whose
+ * `reviewNote` merely *defaults*, so the object itself is still required.
+ * An empty note therefore sends `{}`, not nothing.
+ */
+export function approveExpense(
+  id: string,
+  reviewNote?: string,
+): Promise<AdminApiResult<Expense>> {
+  const body =
+    reviewNote === undefined || reviewNote === '' ? {} : { reviewNote };
+  return request(
+    `/expenses/${encodeURIComponent(id)}/approve`,
+    { method: 'POST', body },
+    parseExpense,
+  );
+}
+
+/** A rejection always says why; the API requires a non-empty note. */
+export function rejectExpense(
+  id: string,
+  reviewNote: string,
+): Promise<AdminApiResult<Expense>> {
+  return request(
+    `/expenses/${encodeURIComponent(id)}/reject`,
+    { method: 'POST', body: { reviewNote } },
+    parseExpense,
+  );
+}
+
+export function getExpenseReceipt(
+  expenseId: string,
+): Promise<AdminApiResult<Receipt>> {
+  return request(
+    `/expenses/${encodeURIComponent(expenseId)}/receipt`,
+    {},
+    parseReceipt,
+  );
+}
+
+export function createReceiptUploadIntent(
+  expenseId: string,
+  input: ReceiptUploadIntentInput,
+): Promise<AdminApiResult<ReceiptUploadAuthorization>> {
+  return request(
+    `/expenses/${encodeURIComponent(expenseId)}/receipt/upload-intent`,
+    { method: 'POST', body: input },
+    parseReceiptUploadAuthorization,
+  );
+}
+
+/**
+ * Confirmation and read authorization take no request body at all — not
+ * even an empty object — because the API binds a strict empty-body schema
+ * to both and the server already knows which receipt it authorized.
+ */
+export function confirmExpenseReceipt(
+  expenseId: string,
+): Promise<AdminApiResult<Receipt>> {
+  return request(
+    `/expenses/${encodeURIComponent(expenseId)}/receipt/confirm`,
+    { method: 'POST' },
+    parseReceipt,
+  );
+}
+
+export function createReceiptReadAuthorization(
+  expenseId: string,
+): Promise<AdminApiResult<ReceiptReadAuthorization>> {
+  return request(
+    `/expenses/${encodeURIComponent(expenseId)}/receipt/read-authorization`,
+    { method: 'POST' },
+    parseReceiptReadAuthorization,
+  );
+}
+
 /**
  * Safe, user-facing text for a failed call; never raw server output.
  *
@@ -637,6 +993,22 @@ const ERROR_MESSAGES: Readonly<Record<string, string>> = {
   vehicle_not_active: 'The selected vehicle is not active.',
   driver_trip_in_progress: 'This driver already has a trip in progress.',
   vehicle_trip_in_progress: 'This vehicle already has a trip in progress.',
+  expense_not_found: 'This expense no longer exists.',
+  expense_not_reviewable:
+    'This expense can no longer be reviewed. Refresh to see its current status.',
+  expense_not_modifiable: 'This expense can no longer accept receipt changes.',
+  trip_not_expensable:
+    'Expenses can only be added while this trip is completed and awaiting verification.',
+  trip_has_pending_expenses:
+    'Review all submitted expenses before verifying this trip.',
+  receipt_not_found: 'No receipt is available.',
+  receipt_not_modifiable:
+    'This receipt has already been confirmed and cannot be replaced.',
+  receipt_upload_incomplete: 'The receipt upload has not completed yet.',
+  receipt_upload_mismatch:
+    'The uploaded file does not match the receipt details. Choose the file again and retry.',
+  receipt_storage_unavailable:
+    'Receipt storage is not available right now. Expense details and review are unaffected — please try the receipt again later.',
   invalid_request: 'Please check the values you entered.',
   too_many_requests: 'Too many attempts. Please wait a minute and try again.',
 };

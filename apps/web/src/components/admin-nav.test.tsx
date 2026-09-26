@@ -36,7 +36,7 @@ afterEach(() => {
 });
 
 describe('AdminNav', () => {
-  it('links to the four admin areas', () => {
+  it('links to the five admin areas', () => {
     render(<AdminNav />);
     expect(screen.getByRole('link', { name: 'Dashboard' })).toHaveAttribute(
       'href',
@@ -54,12 +54,24 @@ describe('AdminNav', () => {
       'href',
       '/trips',
     );
+    expect(screen.getByRole('link', { name: 'Expenses' })).toHaveAttribute(
+      'href',
+      '/expenses',
+    );
   });
 
   it('lists the sections in the agreed order', () => {
     render(<AdminNav />);
     const links = screen.getAllByRole('link').map((link) => link.textContent);
-    expect(links).toEqual(['Dashboard', 'Drivers', 'Vehicles', 'Trips']);
+    // Expenses comes last: overview, then master data, then operations,
+    // and an expense only exists downstream of a trip.
+    expect(links).toEqual([
+      'Dashboard',
+      'Drivers',
+      'Vehicles',
+      'Trips',
+      'Expenses',
+    ]);
   });
 
   it('marks the current section, including its sub-routes', () => {
@@ -85,12 +97,29 @@ describe('AdminNav', () => {
       'aria-current',
       'page',
     );
-    for (const other of ['Dashboard', 'Drivers', 'Vehicles']) {
+    for (const other of ['Dashboard', 'Drivers', 'Vehicles', 'Expenses']) {
       expect(screen.getByRole('link', { name: other })).not.toHaveAttribute(
         'aria-current',
       );
     }
   });
+
+  it.each(['/expenses', '/expenses/019a0000-0000-7000-8000-000000000002'])(
+    'marks Expenses current on %s',
+    (path) => {
+      pathname.value = path;
+      render(<AdminNav />);
+      expect(screen.getByRole('link', { name: 'Expenses' })).toHaveAttribute(
+        'aria-current',
+        'page',
+      );
+      for (const other of ['Dashboard', 'Drivers', 'Vehicles', 'Trips']) {
+        expect(screen.getByRole('link', { name: other })).not.toHaveAttribute(
+          'aria-current',
+        );
+      }
+    },
+  );
 
   it('logs out through the established BFF flow and returns to /login', async () => {
     const calls = installFetch();

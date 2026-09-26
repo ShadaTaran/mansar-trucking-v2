@@ -17,6 +17,7 @@ import { resetAuthenticatedFetchForTests } from '@/lib/client/authenticated-fetc
 import AdminLayout from './layout';
 import DashboardPage from './dashboard/page';
 import DriversPage from './drivers/page';
+import ExpensesPage from './expenses/page';
 import NewDriverPage from './drivers/new/page';
 import TripsPage from './trips/page';
 import NewTripPage from './trips/new/page';
@@ -91,6 +92,9 @@ describe('(admin) route group', () => {
     ['new vehicle', () => NewVehiclePage(), 'Add vehicle'],
     ['trips list', () => TripsPage(), 'Trips'],
     ['new trip', () => NewTripPage(), 'Add trip'],
+    // No /expenses/new: an expense only exists against a trip, so admin
+    // entry lives on the trip page.
+    ['expenses list', () => ExpensesPage(), 'Expenses'],
   ])('renders the %s page under the gate', async (_label, page, heading) => {
     installFetch(session);
     render(<AdminLayout>{page()}</AdminLayout>);
@@ -114,6 +118,19 @@ describe('(admin) route group', () => {
     await waitFor(() => expect(replace).toHaveBeenCalledWith('/login'));
     expect(screen.queryByRole('table')).not.toBeInTheDocument();
     expect(urls).not.toContain('/api/backend/trips?page=1&pageSize=25');
+  });
+
+  it('never fetches expenses for an unauthenticated visitor', async () => {
+    const urls = installFetch((url) =>
+      url === '/api/auth/me' || url === '/api/auth/refresh'
+        ? new Response(null, { status: 401 })
+        : new Response(JSON.stringify(EMPTY_PAGE), { status: 200 }),
+    );
+    render(<AdminLayout>{ExpensesPage()}</AdminLayout>);
+
+    await waitFor(() => expect(replace).toHaveBeenCalledWith('/login'));
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
+    expect(urls).not.toContain('/api/backend/expenses?page=1&pageSize=25');
   });
 
   it('sends an unauthenticated visitor to /login instead of rendering admin data', async () => {

@@ -237,6 +237,95 @@ describe('/api/backend/[...path]', () => {
     expect(headers.get('forwarded')).toBeNull();
   });
 
+  /**
+   * Stage 6E regression. The receipt routes are the first Nest endpoints
+   * reached through this proxy that actually *parse* their request body: a
+   * strict empty-body schema is bound to confirm and read-authorization, so
+   * what the proxy forwards for a bodyless browser POST stops being
+   * invisible and starts being the difference between 200 and 400.
+   *
+   * The chain these assertions pin down is:
+   *   browser sends no body and no JSON content-type
+   *     -> BFF forwards a zero-length body and no content-type
+   *     -> Nest's emptyBodySchema normalizes the absent body to {}
+   *
+   * The Nest half is already proved by the Stage 6D API tests; this covers
+   * the middle link, which is the one nothing else exercises.
+   */
+  describe('bodyless receipt POST', () => {
+    const expenseId = '019a0000-0000-7000-8000-000000000002';
+
+    it.each(['confirm', 'read-authorization'])(
+      'forwards %s with a zero-length body and no content-type',
+      async (action) => {
+        const fetchMock = mockFetch(() => new Response(null, { status: 200 }));
+        const res = await POST(
+          bffRequest(`/api/backend/expenses/${expenseId}/receipt/${action}`, {
+            cookies: { mansar_at: ACCESS, mansar_rt: REFRESH },
+          }),
+          ctx('expenses', expenseId, 'receipt', action),
+        );
+
+        expect(res.status).toBe(200);
+        const [url, init] = fetchMock.mock.calls[0]!;
+        expect(url).toBe(
+          `http://127.0.0.1:3001/expenses/${expenseId}/receipt/${action}`,
+        );
+        expect(init!.method).toBe('POST');
+        expect((init!.body as ArrayBuffer).byteLength).toBe(0);
+
+        const headers = init!.headers as Headers;
+        // No JSON content-type, so Nest's body parser leaves the body
+        // undefined rather than trying to parse zero bytes as JSON.
+        expect(headers.get('content-type')).toBeNull();
+        expect(headers.get('authorization')).toBe(`Bearer ${ACCESS}`);
+        expect(headers.get('cookie')).toBeNull();
+      },
+    );
+
+    it('carries the hyphenated receipt segments through unchanged', async () => {
+      const fetchMock = mockFetch(() => new Response(null, { status: 200 }));
+      await POST(
+        bffRequest(`/api/backend/expenses/${expenseId}/receipt/upload-intent`, {
+          cookies: { mansar_at: ACCESS },
+          json: { contentType: 'image/jpeg', byteSize: 1024 },
+        }),
+        ctx('expenses', expenseId, 'receipt', 'upload-intent'),
+      );
+
+      const [url, init] = fetchMock.mock.calls[0]!;
+      expect(url).toBe(
+        `http://127.0.0.1:3001/expenses/${expenseId}/receipt/upload-intent`,
+      );
+      // A body-carrying receipt call still forwards its JSON normally.
+      expect(Buffer.from(init!.body as ArrayBuffer).toString()).toBe(
+        '{"contentType":"image/jpeg","byteSize":1024}',
+      );
+      expect((init!.headers as Headers).get('content-type')).toBe(
+        'application/json',
+      );
+    });
+
+    it('builds the receipt paths without rewriting the hyphens', () => {
+      expect(
+        buildUpstreamUrl(
+          ['expenses', expenseId, 'receipt', 'upload-intent'],
+          '',
+        ),
+      ).toBe(
+        `http://127.0.0.1:3001/expenses/${expenseId}/receipt/upload-intent`,
+      );
+      expect(
+        buildUpstreamUrl(
+          ['expenses', expenseId, 'receipt', 'read-authorization'],
+          '',
+        ),
+      ).toBe(
+        `http://127.0.0.1:3001/expenses/${expenseId}/receipt/read-authorization`,
+      );
+    });
+  });
+
   it('network failure: safe 502 body', async () => {
     mockFetch(() => {
       throw new TypeError('connect ECONNREFUSED 127.0.0.1:3001');

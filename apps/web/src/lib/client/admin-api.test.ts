@@ -3,19 +3,28 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   adminErrorMessage,
+  approveExpense,
   assignTrip,
   cancelTrip,
   closeTrip,
+  confirmExpenseReceipt,
   createDriver,
+  createReceiptReadAuthorization,
+  createReceiptUploadIntent,
   createTrip,
+  createTripExpense,
   createVehicle,
   getDriver,
+  getExpense,
+  getExpenseReceipt,
   getTrip,
   getVehicle,
   linkDriverUser,
   listDrivers,
+  listExpenses,
   listTrips,
   listVehicles,
+  rejectExpense,
   setDriverStatus,
   setVehicleStatus,
   unlinkDriverUser,
@@ -111,6 +120,406 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+const EXPENSE_ID = '019a0000-0000-7000-8000-000000000002';
+const RECEIPT_ID = '019a0000-0000-7000-8000-000000000003';
+
+const EXPENSE = {
+  id: EXPENSE_ID,
+  tripId: TRIP_ID,
+  status: 'SUBMITTED',
+  amount: '1250.00',
+  category: 'FUEL',
+  incurredAt: '2026-09-24T00:30:00.000Z',
+  description: 'Fuel stop',
+  reviewNote: '',
+  reviewedAt: null,
+  createdAt: '2026-09-24T01:00:00.000Z',
+  updatedAt: '2026-09-24T01:00:00.000Z',
+};
+
+const RECEIPT = {
+  id: RECEIPT_ID,
+  expenseId: EXPENSE_ID,
+  contentType: 'image/jpeg',
+  byteSize: 2048,
+  confirmedAt: null,
+  createdAt: '2026-09-24T02:00:00.000Z',
+};
+
+/** Synthetic `.test` origin only; no provider domain appears in this file. */
+const POST_AUTHORIZATION = {
+  receiptId: RECEIPT_ID,
+  method: 'POST',
+  url: 'https://storage.example.test/upload',
+  fields: { key: 'receipts/a/b', policy: 'synthetic-policy' },
+  expiresAt: '2026-09-24T02:05:00.000Z',
+};
+
+const PUT_AUTHORIZATION = {
+  receiptId: RECEIPT_ID,
+  method: 'PUT',
+  url: 'https://storage.example.test/object',
+  headers: { 'Content-Type': 'image/png' },
+  expiresAt: '2026-09-24T02:05:00.000Z',
+};
+
+describe('expense parsing', () => {
+  it('parses the whole wire shape exactly', async () => {
+    installFetch(() => json(200, EXPENSE));
+    const result = await getExpense(EXPENSE_ID);
+    expect(result).toEqual({ ok: true, data: EXPENSE });
+  });
+
+  it.each([['0.01'], ['1.00'], ['99.50'], ['1250.00'], ['9999999999.99']])(
+    'accepts the response amount %s as a string',
+    async (amount) => {
+      installFetch(() => json(200, { ...EXPENSE, amount }));
+      const result = await getExpense(EXPENSE_ID);
+      expect(result.ok && result.data.amount).toBe(amount);
+      expect(result.ok && typeof result.data.amount).toBe('string');
+    },
+  );
+
+  it.each([
+    ['zero', '0.00'],
+    ['no decimals', '1'],
+    ['one decimal', '1.0'],
+    ['three decimals', '1.000'],
+    ['a leading zero', '01.00'],
+    ['a negative amount', '-1.00'],
+    ['exponent notation', '1e3'],
+    ['leading whitespace', ' 1.00'],
+    ['a number rather than a string', 1250],
+  ])('fails closed on %s', async (_label, amount) => {
+    installFetch(() => json(200, { ...EXPENSE, amount }));
+    const result = await getExpense(EXPENSE_ID);
+    // A value that merely looks like money never reaches the UI.
+    expect(result).toEqual({
+      ok: false,
+      status: 200,
+      code: 'invalid_response',
+    });
+  });
+
+  it.each([
+    ['an unknown status', { status: 'PENDING' }],
+    ['an unknown category', { category: 'BRIBE' }],
+    ['a missing tripId', { tripId: undefined }],
+    ['a null description', { description: null }],
+    ['a numeric reviewedAt', { reviewedAt: 7 }],
+  ])('fails closed on %s', async (_label, patch) => {
+    installFetch(() => json(200, { ...EXPENSE, ...patch }));
+    const result = await getExpense(EXPENSE_ID);
+    expect(result.ok).toBe(false);
+  });
+
+  it('accepts a reviewed expense with its note and instant', async () => {
+    const reviewed = {
+      ...EXPENSE,
+      status: 'APPROVED',
+      reviewNote: 'checked',
+      reviewedAt: '2026-09-25T00:00:00.000Z',
+    };
+    installFetch(() => json(200, reviewed));
+    const result = await getExpense(EXPENSE_ID);
+    expect(result).toEqual({ ok: true, data: reviewed });
+  });
+});
+
+describe('receipt parsing', () => {
+  it('parses the six wire fields exactly', async () => {
+    installFetch(() => json(200, RECEIPT));
+    const result = await getExpenseReceipt(EXPENSE_ID);
+    expect(result).toEqual({ ok: true, data: RECEIPT });
+  });
+
+  it('never carries an objectKey through, even if one is sent', async () => {
+    installFetch(() =>
+      json(200, { ...RECEIPT, objectKey: 'receipts/secret/location' }),
+    );
+    const result = await getExpenseReceipt(EXPENSE_ID);
+
+    // The parser builds the result from six named fields, so a storage
+    // locator has no route into the browser.
+    expect(result.ok && Object.keys(result.data)).toEqual([
+      'id',
+      'expenseId',
+      'contentType',
+      'byteSize',
+      'confirmedAt',
+      'createdAt',
+    ]);
+    expect(JSON.stringify(result)).not.toContain('objectKey');
+    expect(JSON.stringify(result)).not.toContain('secret/location');
+  });
+
+  it('accepts a confirmed receipt', async () => {
+    const confirmed = { ...RECEIPT, confirmedAt: '2026-09-24T03:00:00.000Z' };
+    installFetch(() => json(200, confirmed));
+    const result = await getExpenseReceipt(EXPENSE_ID);
+    expect(result).toEqual({ ok: true, data: confirmed });
+  });
+
+  it.each([
+    ['an unknown content type', { contentType: 'application/pdf' }],
+    ['a zero byte size', { byteSize: 0 }],
+    ['a byte size over 10 MiB', { byteSize: 10 * 1024 * 1024 + 1 }],
+    ['a fractional byte size', { byteSize: 1024.5 }],
+    ['a string byte size', { byteSize: '1024' }],
+    ['a numeric confirmedAt', { confirmedAt: 7 }],
+    ['a missing expenseId', { expenseId: undefined }],
+  ])('fails closed on %s', async (_label, patch) => {
+    installFetch(() => json(200, { ...RECEIPT, ...patch }));
+    const result = await getExpenseReceipt(EXPENSE_ID);
+    expect(result.ok).toBe(false);
+  });
+});
+
+describe('upload authorization parsing', () => {
+  it('parses the POST branch', async () => {
+    installFetch(() => json(200, POST_AUTHORIZATION));
+    const result = await createReceiptUploadIntent(EXPENSE_ID, {
+      contentType: 'image/jpeg',
+      byteSize: 2048,
+    });
+    expect(result).toEqual({ ok: true, data: POST_AUTHORIZATION });
+  });
+
+  it('parses the PUT branch', async () => {
+    installFetch(() => json(200, PUT_AUTHORIZATION));
+    const result = await createReceiptUploadIntent(EXPENSE_ID, {
+      contentType: 'image/png',
+      byteSize: 2048,
+    });
+    expect(result).toEqual({ ok: true, data: PUT_AUTHORIZATION });
+  });
+
+  it('preserves every opaque field verbatim', async () => {
+    const fields = {
+      key: 'receipts/a/b',
+      'Content-Type': 'image/jpeg',
+      policy: 'synthetic-policy',
+      'x-amz-signature': 'synthetic-signature',
+    };
+    installFetch(() => json(200, { ...POST_AUTHORIZATION, fields }));
+    const result = await createReceiptUploadIntent(EXPENSE_ID, {
+      contentType: 'image/jpeg',
+      byteSize: 2048,
+    });
+    expect(
+      result.ok && result.data.method === 'POST' && result.data.fields,
+    ).toEqual(fields);
+  });
+
+  it.each([
+    ['an unknown method', { method: 'PATCH' }],
+    ['a missing method', { method: undefined }],
+    ['a missing receiptId', { receiptId: undefined }],
+    ['a missing url', { url: undefined }],
+    ['a missing expiresAt', { expiresAt: undefined }],
+    ['fields that are not an object', { fields: 'nope' }],
+    ['fields that are an array', { fields: ['a'] }],
+    ['a non-string field value', { fields: { key: 7 } }],
+    ['a POST carrying headers', { headers: { a: 'b' } }],
+  ])('fails closed on %s', async (_label, patch) => {
+    installFetch(() => json(200, { ...POST_AUTHORIZATION, ...patch }));
+    const result = await createReceiptUploadIntent(EXPENSE_ID, {
+      contentType: 'image/jpeg',
+      byteSize: 2048,
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it.each([
+    ['headers that are not an object', { headers: 'nope' }],
+    ['a non-string header value', { headers: { a: 7 } }],
+    ['a PUT carrying fields', { fields: { a: 'b' } }],
+  ])('fails closed on %s', async (_label, patch) => {
+    installFetch(() => json(200, { ...PUT_AUTHORIZATION, ...patch }));
+    const result = await createReceiptUploadIntent(EXPENSE_ID, {
+      contentType: 'image/png',
+      byteSize: 2048,
+    });
+    expect(result.ok).toBe(false);
+  });
+});
+
+describe('read authorization parsing', () => {
+  it('parses a url and an expiry', async () => {
+    const authorization = {
+      url: 'https://storage.example.test/read?signature=synthetic',
+      expiresAt: '2026-09-24T03:01:00.000Z',
+    };
+    installFetch(() => json(200, authorization));
+    const result = await createReceiptReadAuthorization(EXPENSE_ID);
+    expect(result).toEqual({ ok: true, data: authorization });
+  });
+
+  it.each([
+    ['a missing url', { expiresAt: '2026-09-24T03:01:00.000Z' }],
+    ['a missing expiry', { url: 'https://storage.example.test/read' }],
+    ['a numeric url', { url: 7, expiresAt: '2026-09-24T03:01:00.000Z' }],
+  ])('fails closed on %s', async (_label, body) => {
+    installFetch(() => json(200, body));
+    const result = await createReceiptReadAuthorization(EXPENSE_ID);
+    expect(result.ok).toBe(false);
+  });
+});
+
+describe('expense requests', () => {
+  it('lists with only the filters the API understands', async () => {
+    const calls = installFetch(() =>
+      json(200, { items: [EXPENSE], page: 2, pageSize: 25, total: 30 }),
+    );
+    await listExpenses({
+      status: 'SUBMITTED',
+      category: 'FUEL',
+      tripId: TRIP_ID,
+      page: 2,
+      pageSize: 25,
+    });
+    expect(calls[0]).toMatchObject({
+      url: `/api/backend/expenses?status=SUBMITTED&category=FUEL&tripId=${TRIP_ID}&page=2&pageSize=25`,
+      method: 'GET',
+    });
+  });
+
+  it('omits empty filters', async () => {
+    const calls = installFetch(() =>
+      json(200, { items: [], page: 1, pageSize: 25, total: 0 }),
+    );
+    await listExpenses({ status: '', category: '', page: 1, pageSize: 25 });
+    expect(calls[0]!.url).toBe('/api/backend/expenses?page=1&pageSize=25');
+  });
+
+  it('reads one expense', async () => {
+    const calls = installFetch(() => json(200, EXPENSE));
+    await getExpense(EXPENSE_ID);
+    expect(calls[0]).toMatchObject({
+      url: `/api/backend/expenses/${EXPENSE_ID}`,
+      method: 'GET',
+    });
+  });
+
+  it('creates against the trip and accepts a 201', async () => {
+    const calls = installFetch(() => json(201, EXPENSE));
+    const input = {
+      amount: '1250.00',
+      category: 'FUEL' as const,
+      incurredAt: '2026-09-24T00:30:00.000Z',
+      description: 'Fuel stop',
+    };
+    const result = await createTripExpense(TRIP_ID, input);
+
+    expect(calls[0]).toMatchObject({
+      url: `/api/backend/trips/${TRIP_ID}/expenses`,
+      method: 'POST',
+      body: input,
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it('sends an empty object when approving without a note', async () => {
+    const calls = installFetch(() => json(200, EXPENSE));
+    await approveExpense(EXPENSE_ID);
+
+    // Not bodyless: the approve schema is a strict object, so copying
+    // verifyTrip's no-body request here would 400.
+    expect(calls[0]).toMatchObject({
+      url: `/api/backend/expenses/${EXPENSE_ID}/approve`,
+      method: 'POST',
+      body: {},
+    });
+    expect(calls[0]!.headers).toMatchObject({
+      'content-type': 'application/json',
+    });
+  });
+
+  it('sends the note when approving with one', async () => {
+    const calls = installFetch(() => json(200, EXPENSE));
+    await approveExpense(EXPENSE_ID, 'checked against the log');
+    expect(calls[0]!.body).toEqual({ reviewNote: 'checked against the log' });
+  });
+
+  it('sends the reason when rejecting', async () => {
+    const calls = installFetch(() => json(200, EXPENSE));
+    await rejectExpense(EXPENSE_ID, 'no receipt');
+    expect(calls[0]).toMatchObject({
+      url: `/api/backend/expenses/${EXPENSE_ID}/reject`,
+      method: 'POST',
+      body: { reviewNote: 'no receipt' },
+    });
+  });
+});
+
+describe('receipt requests', () => {
+  it('reads receipt metadata', async () => {
+    const calls = installFetch(() => json(200, RECEIPT));
+    await getExpenseReceipt(EXPENSE_ID);
+    expect(calls[0]).toMatchObject({
+      url: `/api/backend/expenses/${EXPENSE_ID}/receipt`,
+      method: 'GET',
+    });
+  });
+
+  it('declares the content type and byte size on upload intent', async () => {
+    const calls = installFetch(() => json(200, POST_AUTHORIZATION));
+    await createReceiptUploadIntent(EXPENSE_ID, {
+      contentType: 'image/webp',
+      byteSize: 4096,
+    });
+    expect(calls[0]).toMatchObject({
+      url: `/api/backend/expenses/${EXPENSE_ID}/receipt/upload-intent`,
+      method: 'POST',
+      body: { contentType: 'image/webp', byteSize: 4096 },
+    });
+  });
+
+  it.each([
+    ['confirm', () => confirmExpenseReceipt(EXPENSE_ID), 'confirm'],
+    [
+      'read authorization',
+      () => createReceiptReadAuthorization(EXPENSE_ID),
+      'read-authorization',
+    ],
+  ])('sends no body at all for %s', async (_label, call, segment) => {
+    const calls = installFetch(() =>
+      json(
+        200,
+        segment === 'confirm'
+          ? RECEIPT
+          : {
+              url: 'https://storage.example.test/read',
+              expiresAt: '2026-09-24T03:01:00.000Z',
+            },
+      ),
+    );
+    await call();
+
+    expect(calls[0]).toMatchObject({
+      url: `/api/backend/expenses/${EXPENSE_ID}/receipt/${segment}`,
+      method: 'POST',
+    });
+    // Nest binds a strict empty-body schema to both; the BFF forwards a
+    // zero-length body with no JSON content-type, which it normalizes.
+    expect(calls[0]!.body).toBeUndefined();
+    expect(calls[0]!.headers).toBeUndefined();
+  });
+
+  it('never sends a Mansar origin for the binary itself', async () => {
+    const calls = installFetch(() => json(200, POST_AUTHORIZATION));
+    await createReceiptUploadIntent(EXPENSE_ID, {
+      contentType: 'image/jpeg',
+      byteSize: 2048,
+    });
+    // Only the authorization is fetched here; the upload is a separate
+    // helper that never touches /api/backend.
+    expect(calls.every((call) => call.url.startsWith('/api/backend'))).toBe(
+      true,
+    );
+  });
 });
 
 describe('drivers requests', () => {
@@ -655,6 +1064,37 @@ describe('adminErrorMessage', () => {
       'vehicle_trip_in_progress',
       'This vehicle already has a trip in progress.',
     ],
+    ['expense_not_found', 'This expense no longer exists.'],
+    [
+      'expense_not_reviewable',
+      'This expense can no longer be reviewed. Refresh to see its current status.',
+    ],
+    [
+      'expense_not_modifiable',
+      'This expense can no longer accept receipt changes.',
+    ],
+    [
+      'trip_not_expensable',
+      'Expenses can only be added while this trip is completed and awaiting verification.',
+    ],
+    [
+      'trip_has_pending_expenses',
+      'Review all submitted expenses before verifying this trip.',
+    ],
+    ['receipt_not_found', 'No receipt is available.'],
+    [
+      'receipt_not_modifiable',
+      'This receipt has already been confirmed and cannot be replaced.',
+    ],
+    ['receipt_upload_incomplete', 'The receipt upload has not completed yet.'],
+    [
+      'receipt_upload_mismatch',
+      'The uploaded file does not match the receipt details. Choose the file again and retry.',
+    ],
+    [
+      'receipt_storage_unavailable',
+      'Receipt storage is not available right now. Expense details and review are unaffected — please try the receipt again later.',
+    ],
   ])('maps %s', (code, message) => {
     expect(adminErrorMessage({ status: 409, code })).toBe(message);
   });
@@ -666,6 +1106,26 @@ describe('adminErrorMessage', () => {
     expect(
       adminErrorMessage({ status: 409, code: 'driver_inactive' }),
     ).not.toContain('linking');
+  });
+
+  it('never leaks provider or storage internals through an error', () => {
+    for (const code of [
+      'receipt_storage_unavailable',
+      'receipt_upload_mismatch',
+      'receipt_upload_incomplete',
+    ]) {
+      const message = adminErrorMessage({ status: 503, code });
+      for (const forbidden of [
+        'bucket',
+        'endpoint',
+        's3',
+        'aws',
+        'signature',
+        'objectKey',
+      ]) {
+        expect(message.toLowerCase()).not.toContain(forbidden);
+      }
+    }
   });
 
   it('keeps the generic fallback for an unknown trip code', () => {

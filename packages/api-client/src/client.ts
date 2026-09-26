@@ -213,6 +213,42 @@ export async function requestJson<T>(
   return parsed;
 }
 
+/**
+ * Performs a request expecting a **201** JSON body, for an endpoint whose
+ * contract is "created" rather than "here is the current state".
+ *
+ * Deliberately a sibling of `requestJson` rather than a status parameter on
+ * it. The expected status *is* part of the contract — the driver expense
+ * create answers 201 and nothing else — so a caller that asked for the
+ * created variant and got a 200 was answered by something other than the
+ * endpoint it meant to call, and should hear about it rather than have the
+ * body quietly accepted. Keeping it separate also leaves `requestJson` and
+ * `requestNoContent` exactly as they are: both already have call sites across
+ * the workspace, and widening either to take a status would change every one
+ * of them for the benefit of this single new case.
+ *
+ * Everything else is shared with `requestJson`: the same `send`, the same
+ * JSON parsing, the same HTTP error shaping and the same fail-closed parser
+ * contract, so a malformed 201 body is an `invalid_response` and is never
+ * trusted.
+ */
+export async function requestCreated<T>(
+  config: ApiClientConfig,
+  spec: RequestSpec,
+  parse: (value: unknown) => T | null,
+): Promise<T> {
+  const result = await send(config, spec);
+  if (result.status !== 201) {
+    throwHttpError(result);
+  }
+  const body = parseJson(result.text);
+  const parsed = body === undefined ? null : parse(body);
+  if (parsed === null) {
+    throw new ApiError('invalid_response', { status: result.status });
+  }
+  return parsed;
+}
+
 /** Performs a request expecting 204 No Content. */
 export async function requestNoContent(
   config: ApiClientConfig,

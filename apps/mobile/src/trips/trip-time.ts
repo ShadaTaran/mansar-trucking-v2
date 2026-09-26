@@ -102,3 +102,89 @@ export function formatTripTime(value: string | null): string {
   const local = new Date(time + MANILA_OFFSET_MS).toISOString();
   return `${local.slice(0, 10)} ${local.slice(11, 16)} ${MANILA_LABEL}`;
 }
+
+/**
+ * The fixed offset as the API's `incurredAt` schema wants to read it. The
+ * server accepts `Z` or `±HH:MM` and rejects a zone-less local time, so the
+ * suffix is part of the contract rather than decoration.
+ */
+export const MANILA_OFFSET_SUFFIX = '+08:00';
+
+/** What a driver types: `YYYY-MM-DD HH:MM`, always Manila local. */
+const MANILA_LOCAL_INPUT = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})$/;
+
+/** Calendar validity of a Manila-local wall-clock reading. */
+function isRealManilaLocal(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+): boolean {
+  if (month < 1 || month > 12 || day < 1 || day > 31) {
+    return false;
+  }
+  if (hour > 23 || minute > 59) {
+    return false;
+  }
+  // Date.UTC would roll 2026-02-29 into March; comparing the components back
+  // rejects a day that does not exist in its month instead. Only `Date.UTC`
+  // and the getUTC* readers are used, so the device zone cannot be observed.
+  const probe = new Date(Date.UTC(year, month - 1, day));
+  return (
+    probe.getUTCFullYear() === year &&
+    probe.getUTCMonth() === month - 1 &&
+    probe.getUTCDate() === day
+  );
+}
+
+/**
+ * The inverse of `formatTripTime` for form entry: a Manila-local
+ * `YYYY-MM-DD HH:MM` becomes `YYYY-MM-DDTHH:MM:00+08:00`.
+ *
+ * The offset is written literally rather than computed, for the same reason
+ * `formatTripTime` pins it: the device's zone is not trustworthy for a
+ * business record, and a phone set to another zone would otherwise file a
+ * fuel stop hours from when it happened. Because the result is assembled from
+ * the matched digits and a constant suffix, nothing here can observe local
+ * time at all.
+ *
+ * Returns `null` for anything that is not a real Manila wall-clock reading —
+ * wrong shape, impossible calendar day, hour 24, minute 60 — so the caller
+ * refuses locally rather than sending a value the API would answer with 400.
+ */
+export function manilaLocalToInstant(value: string): string | null {
+  const match = MANILA_LOCAL_INPUT.exec(value);
+  if (!match) {
+    return null;
+  }
+  const year = match[1]!;
+  const month = match[2]!;
+  const day = match[3]!;
+  const hour = match[4]!;
+  const minute = match[5]!;
+  if (
+    !isRealManilaLocal(
+      Number(year),
+      Number(month),
+      Number(day),
+      Number(hour),
+      Number(minute),
+    )
+  ) {
+    return null;
+  }
+  return `${year}-${month}-${day}T${hour}:${minute}:00${MANILA_OFFSET_SUFFIX}`;
+}
+
+/**
+ * Now, as the form's initial Manila-local text.
+ *
+ * `Date.now()` is a zone-less UTC instant, so shifting it by the fixed offset
+ * and reading the UTC components back yields Manila wall-clock time on a
+ * phone set to any timezone.
+ */
+export function manilaLocalNow(now: number = Date.now()): string {
+  const local = new Date(now + MANILA_OFFSET_MS).toISOString();
+  return `${local.slice(0, 10)} ${local.slice(11, 16)}`;
+}

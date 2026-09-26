@@ -17,6 +17,8 @@ import {
   type SessionManager,
 } from './src/auth/session-manager';
 import { getApiBaseUrl } from './src/config/api';
+import { createDriverExpensesApi } from './src/expenses/driver-expenses-api';
+import { createDriverReceiptsApi } from './src/receipts/driver-receipts-api';
 import {
   BootstrapErrorScreen,
   BootstrapScreen,
@@ -64,24 +66,39 @@ function getDefaultSession(): SessionManager | null {
 function AuthenticatedFlow({ user }: { readonly user: AuthUser }) {
   const session = useSession();
   const [selectedTripId, setSelectedTripId] = useState<string | null>(null);
-  const api = useMemo(() => {
+  // One authenticated transport for every driver aggregate. Each API is a
+  // thin binding over the same `createAuthenticatedFetch`, so the token lives
+  // in exactly one place and no screen ever asks the session for it.
+  const apis = useMemo(() => {
     const apiBaseUrl = getApiBaseUrl();
-    return apiBaseUrl === null
-      ? null
-      : createDriverTripsApi(apiBaseUrl, createAuthenticatedFetch(session));
+    if (apiBaseUrl === null) {
+      return null;
+    }
+    const authenticatedFetch = createAuthenticatedFetch(session);
+    return {
+      trips: createDriverTripsApi(apiBaseUrl, authenticatedFetch),
+      expenses: createDriverExpensesApi(apiBaseUrl, authenticatedFetch),
+      receipts: createDriverReceiptsApi(apiBaseUrl, authenticatedFetch),
+    };
   }, [session]);
 
   // Unreachable in a configured build, which is the only kind that can
   // sign in at all; failing closed here beats inventing an endpoint.
-  if (api === null) {
+  if (apis === null) {
     return <UnconfiguredBuildScreen />;
   }
   return selectedTripId === null ? (
-    <DriverHomeScreen api={api} onOpenTrip={setSelectedTripId} user={user} />
+    <DriverHomeScreen
+      api={apis.trips}
+      onOpenTrip={setSelectedTripId}
+      user={user}
+    />
   ) : (
     <DriverTripDetailScreen
-      api={api}
+      api={apis.trips}
+      expensesApi={apis.expenses}
       onBack={() => setSelectedTripId(null)}
+      receiptsApi={apis.receipts}
       tripId={selectedTripId}
     />
   );

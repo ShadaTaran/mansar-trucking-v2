@@ -9,6 +9,10 @@ import {
   View,
 } from 'react-native';
 
+import type { DriverExpensesApi } from '../expenses/driver-expenses-api';
+import { ExpenseDetailView } from '../expenses/ExpenseDetailView';
+import { TripExpensesSection } from '../expenses/TripExpensesSection';
+import type { DriverReceiptsApi } from '../receipts/driver-receipts-api';
 import {
   driverTripMessage,
   isTripNotFound,
@@ -20,6 +24,8 @@ import { formatTripTime, NO_TIME } from '../trips/trip-time';
 interface Props {
   readonly tripId: string;
   readonly api: DriverTripsApi;
+  readonly expensesApi: DriverExpensesApi;
+  readonly receiptsApi: DriverReceiptsApi;
   readonly onBack: () => void;
 }
 
@@ -70,9 +76,20 @@ function statusNote(status: Trip['status']): string | null {
  * and no backend rule — a fresh driver or vehicle status, ownership, the
  * one-running-trip indexes — is second-guessed here.
  */
-export function DriverTripDetailScreen({ tripId, api, onBack }: Props) {
+export function DriverTripDetailScreen({
+  tripId,
+  api,
+  expensesApi,
+  receiptsApi,
+  onBack,
+}: Props) {
   const [state, setState] = useState<LoadState>({ kind: 'loading' });
   const [attempt, setAttempt] = useState(0);
+  // Expense navigation is local to this screen, exactly as trip selection is
+  // local to App: one id, no router, and it disappears when this unmounts.
+  const [selectedExpenseId, setSelectedExpenseId] = useState<string | null>(
+    null,
+  );
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -187,6 +204,20 @@ export function DriverTripDetailScreen({ tripId, api, onBack }: Props) {
     </Pressable>
   );
 
+  // One expense, in place of the trip body. The trip's own state is kept
+  // mounted-in-memory above, so returning lands on the same trip without a
+  // second request and without any App-level route.
+  if (selectedExpenseId !== null) {
+    return (
+      <ExpenseDetailView
+        expenseId={selectedExpenseId}
+        expensesApi={expensesApi}
+        onBack={() => setSelectedExpenseId(null)}
+        receiptsApi={receiptsApi}
+      />
+    );
+  }
+
   if (state.kind === 'loading') {
     return (
       <View style={styles.container}>
@@ -251,6 +282,13 @@ export function DriverTripDetailScreen({ tripId, api, onBack }: Props) {
       </Text>
 
       {note ? <Text style={styles.note}>{note}</Text> : null}
+
+      <TripExpensesSection
+        api={expensesApi}
+        onOpenExpense={setSelectedExpenseId}
+        tripId={tripId}
+        tripStatus={state.trip.status}
+      />
 
       {action && !confirming ? (
         <Pressable

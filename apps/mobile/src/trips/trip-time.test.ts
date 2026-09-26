@@ -1,4 +1,11 @@
-import { formatTripTime, MANILA_LABEL, NO_TIME } from './trip-time';
+import {
+  formatTripTime,
+  MANILA_LABEL,
+  MANILA_OFFSET_SUFFIX,
+  manilaLocalNow,
+  manilaLocalToInstant,
+  NO_TIME,
+} from './trip-time';
 
 describe('formatTripTime', () => {
   it('shows the placeholder for an absent instant', () => {
@@ -108,5 +115,109 @@ describe('formatTripTime', () => {
     expect(formatTripTime('2026-09-24T00:30:00.5Z')).toBe(
       '2026-09-24 08:30 Asia/Manila',
     );
+  });
+});
+
+describe('manilaLocalToInstant', () => {
+  it('states the offset it writes', () => {
+    expect(MANILA_OFFSET_SUFFIX).toBe('+08:00');
+  });
+
+  it.each([
+    ['2026-09-24 08:30', '2026-09-24T08:30:00+08:00'],
+    ['2026-09-24 00:00', '2026-09-24T00:00:00+08:00'],
+    ['2026-09-24 23:59', '2026-09-24T23:59:00+08:00'],
+    ['2026-01-01 12:00', '2026-01-01T12:00:00+08:00'],
+    ['2028-02-29 06:15', '2028-02-29T06:15:00+08:00'],
+  ])('converts Manila-local %s to %s', (input, expected) => {
+    expect(manilaLocalToInstant(input)).toBe(expected);
+  });
+
+  it('accepts the T separator as well as a space', () => {
+    expect(manilaLocalToInstant('2026-09-24T08:30')).toBe(
+      '2026-09-24T08:30:00+08:00',
+    );
+  });
+
+  it('round-trips against formatTripTime', () => {
+    // 08:30 Manila is 00:30 UTC; the pair must agree on that in both
+    // directions or a driver would see a different time than they filed.
+    const instant = manilaLocalToInstant('2026-09-24 08:30');
+    expect(instant).toBe('2026-09-24T08:30:00+08:00');
+    expect(formatTripTime('2026-09-24T00:30:00.000Z')).toBe(
+      '2026-09-24 08:30 Asia/Manila',
+    );
+  });
+
+  it.each([
+    ['an empty string', ''],
+    ['free text', 'this morning'],
+    ['a bare date', '2026-09-24'],
+    ['a bare time', '08:30'],
+    ['seconds included', '2026-09-24 08:30:00'],
+    ['a single-digit hour', '2026-09-24 8:30'],
+    ['a two-digit year', '26-09-24 08:30'],
+    ['slashes', '2026/09/24 08:30'],
+    ['a trailing zone', '2026-09-24 08:30Z'],
+    ['leading whitespace', ' 2026-09-24 08:30'],
+    ['trailing whitespace', '2026-09-24 08:30 '],
+  ])('refuses %s', (_label, value) => {
+    expect(manilaLocalToInstant(value)).toBeNull();
+  });
+
+  it.each([
+    ['29 February in a non-leap year', '2026-02-29 08:30'],
+    ['31 April', '2026-04-31 08:30'],
+    ['month 13', '2026-13-01 08:30'],
+    ['month 00', '2026-00-01 08:30'],
+    ['day 32', '2026-01-32 08:30'],
+    ['day 00', '2026-01-00 08:30'],
+    ['hour 24', '2026-09-24 24:00'],
+    ['minute 60', '2026-09-24 08:60'],
+  ])('refuses %s rather than rolling it forward', (_label, value) => {
+    expect(manilaLocalToInstant(value)).toBeNull();
+  });
+
+  it('never consults the device timezone', () => {
+    const localApis = [
+      'getHours',
+      'getMinutes',
+      'getDate',
+      'getMonth',
+      'getFullYear',
+      'getTimezoneOffset',
+      'toLocaleString',
+      'toLocaleDateString',
+      'toLocaleTimeString',
+    ] as const;
+    const spies = localApis.map((name) => jest.spyOn(Date.prototype, name));
+
+    expect(manilaLocalToInstant('2026-09-24 08:30')).toBe(
+      '2026-09-24T08:30:00+08:00',
+    );
+    expect(manilaLocalNow(Date.UTC(2026, 8, 24, 0, 30))).toBe(
+      '2026-09-24 08:30',
+    );
+
+    for (const spy of spies) {
+      expect(spy).not.toHaveBeenCalled();
+      spy.mockRestore();
+    }
+  });
+});
+
+describe('manilaLocalNow', () => {
+  it.each([
+    [Date.UTC(2026, 8, 24, 0, 30), '2026-09-24 08:30'],
+    [Date.UTC(2026, 8, 23, 16, 0), '2026-09-24 00:00'],
+    [Date.UTC(2026, 8, 24, 15, 59), '2026-09-24 23:59'],
+    [Date.UTC(2025, 11, 31, 16, 0), '2026-01-01 00:00'],
+  ])('renders the Manila wall clock for a given instant', (now, expected) => {
+    expect(manilaLocalNow(now)).toBe(expected);
+  });
+
+  it('produces a value its own parser accepts', () => {
+    const text = manilaLocalNow(Date.UTC(2026, 8, 24, 0, 30));
+    expect(manilaLocalToInstant(text)).toBe('2026-09-24T08:30:00+08:00');
   });
 });

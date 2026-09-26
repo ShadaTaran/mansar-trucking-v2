@@ -7,6 +7,10 @@ import {
   waitFor,
 } from '@testing-library/react-native';
 
+import type { Expense, Page, Receipt } from '@mansar/types';
+
+import type { DriverExpensesApi } from '../expenses/driver-expenses-api';
+import type { DriverReceiptsApi } from '../receipts/driver-receipts-api';
 import type { DriverTripsApi } from '../trips/driver-trips-api';
 import { DriverTripDetailScreen } from './DriverTripDetailScreen';
 
@@ -49,9 +53,72 @@ function fakeApi(script: Script) {
   return api;
 }
 
-async function renderDetail(api: DriverTripsApi, onBack = jest.fn()) {
+const EXPENSE_ID = '019a0000-0000-7000-8000-000000000002';
+
+const expense = (overrides: Partial<Expense> = {}): Expense => ({
+  id: EXPENSE_ID,
+  tripId: TRIP_ID,
+  status: 'SUBMITTED',
+  amount: '1250.00',
+  category: 'FUEL',
+  incurredAt: '2026-09-24T00:30:00.000Z',
+  description: 'Synthetic fuel stop',
+  reviewNote: '',
+  reviewedAt: null,
+  createdAt: '2026-09-24T01:00:00.000Z',
+  updatedAt: '2026-09-24T01:00:00.000Z',
+  ...overrides,
+});
+
+const emptyExpensePage: Page<Expense> = {
+  items: [],
+  page: 1,
+  pageSize: 25,
+  total: 0,
+};
+
+const receiptNotFound = () => httpError(404, 'receipt_not_found');
+
+/** Expense and receipt APIs that answer safely without a network. */
+function fakeExpensesApi(
+  overrides: Partial<DriverExpensesApi> = {},
+): DriverExpensesApi {
+  return {
+    list: jest.fn(() => Promise.resolve(emptyExpensePage)),
+    get: jest.fn(() => Promise.resolve(expense())),
+    create: jest.fn(() => Promise.resolve(expense())),
+    ...overrides,
+  };
+}
+
+function fakeReceiptsApi(
+  overrides: Partial<DriverReceiptsApi> = {},
+): DriverReceiptsApi {
+  return {
+    uploadIntent: jest.fn(() => Promise.reject(new Error('not used'))),
+    confirm: jest.fn(() => Promise.reject(new Error('not used'))),
+    metadata: jest.fn<Promise<Receipt>, [string]>(() =>
+      Promise.reject(receiptNotFound()),
+    ),
+    readAuthorization: jest.fn(() => Promise.reject(new Error('not used'))),
+    ...overrides,
+  };
+}
+
+async function renderDetail(
+  api: DriverTripsApi,
+  onBack = jest.fn(),
+  expensesApi: DriverExpensesApi = fakeExpensesApi(),
+  receiptsApi: DriverReceiptsApi = fakeReceiptsApi(),
+) {
   await render(
-    <DriverTripDetailScreen api={api} onBack={onBack} tripId={TRIP_ID} />,
+    <DriverTripDetailScreen
+      api={api}
+      expensesApi={expensesApi}
+      onBack={onBack}
+      receiptsApi={receiptsApi}
+      tripId={TRIP_ID}
+    />,
   );
   return onBack;
 }
@@ -701,5 +768,128 @@ describe('DriverTripDetailScreen leaving during a mutation', () => {
     screen.unmount();
 
     expect(() => settle().resolve(trip('IN_PROGRESS'))).not.toThrow();
+  });
+});
+
+describe('DriverTripDetailScreen expense integration', () => {
+  it('places the expenses section between the summary and the lifecycle control', async () => {
+    const api = fakeApi({ get: () => Promise.resolve(trip('IN_PROGRESS')) });
+    await renderDetail(api);
+    await screen.findByText('Status: IN_PROGRESS');
+
+    const order = renderedText();
+    // A single-node anchor: the title interpolates origin and destination, so
+    // it renders as several text children rather than one string.
+    const summary = order.indexOf('Scheduled start');
+    const expenses = order.indexOf('Expenses');
+    const lifecycle = order.indexOf('Complete trip');
+    const back = order.indexOf('Back to trips');
+    expect(summary).toBeGreaterThanOrEqual(0);
+    expect(expenses).toBeGreaterThan(summary);
+    expect(lifecycle).toBeGreaterThan(expenses);
+    expect(back).toBeGreaterThan(lifecycle);
+  });
+
+  it('lists the trip-scoped expenses with one request and no fan-out', async () => {
+    const list = jest.fn(() =>
+      Promise.resolve({ items: [expense()], page: 1, pageSize: 25, total: 1 }),
+    );
+    await renderDetail(
+      fakeApi({ get: () => Promise.resolve(trip('IN_PROGRESS')) }),
+      jest.fn(),
+      fakeExpensesApi({ list }),
+    );
+
+    expect(await screen.findByText('₱1,250.00')).toBeOnTheScreen();
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(list).toHaveBeenCalledWith(TRIP_ID, { page: 1, pageSize: 25 });
+  });
+
+  it('opens one expense in place and returns to the same trip', async () => {
+    const get = jest.fn(() => Promise.resolve(trip('IN_PROGRESS')));
+    const list = jest.fn(() =>
+      Promise.resolve({ items: [expense()], page: 1, pageSize: 25, total: 1 }),
+    );
+    await renderDetail(fakeApi({ get }), jest.fn(), fakeExpensesApi({ list }));
+    await screen.findByText('₱1,250.00');
+
+    await fireEvent.press(screen.getByText('₱1,250.00'));
+
+    // The expense replaced the trip body; no App-level route was involved.
+    expect(await screen.findByText('Status: SUBMITTED')).toBeOnTheScreen();
+    expect(screen.getByText('Category: FUEL')).toBeOnTheScreen();
+    expect(screen.queryByText('Status: IN_PROGRESS')).toBeNull();
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Back to trip' }));
+
+    expect(await screen.findByText('Status: IN_PROGRESS')).toBeOnTheScreen();
+    // Returning did not re-request the trip.
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['DRAFT', 'ASSIGNED', 'VERIFIED', 'CLOSED', 'CANCELLED'] as const)(
+    'offers no expense form while %s',
+    async (status) => {
+      await renderDetail(fakeApi({ get: () => Promise.resolve(trip(status)) }));
+      await screen.findByText(`Status: ${status}`);
+      expect(screen.queryByText('Add expense')).toBeNull();
+      expect(screen.queryByLabelText('Amount (PHP)')).toBeNull();
+    },
+  );
+
+  it.each(['IN_PROGRESS', 'COMPLETED'] as const)(
+    'offers the expense form while %s',
+    async (status) => {
+      await renderDetail(fakeApi({ get: () => Promise.resolve(trip(status)) }));
+      await screen.findByText(`Status: ${status}`);
+      expect(screen.getByLabelText('Amount (PHP)')).toBeOnTheScreen();
+    },
+  );
+
+  it('opens expense eligibility after completing the trip, with no optimistic expense', async () => {
+    const list = jest.fn(() => Promise.resolve(emptyExpensePage));
+    const create = jest.fn(() => Promise.resolve(expense()));
+    await renderDetail(
+      fakeApi({
+        get: () => Promise.resolve(trip('IN_PROGRESS')),
+        complete: () => Promise.resolve(trip('COMPLETED')),
+      }),
+      jest.fn(),
+      fakeExpensesApi({ list, create }),
+    );
+    await screen.findByText('Status: IN_PROGRESS');
+
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Complete trip' }),
+    );
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Confirm completion' }),
+    );
+
+    expect(await screen.findByText('Status: COMPLETED')).toBeOnTheScreen();
+    // Still expensable, and nothing was filed by the transition itself.
+    expect(screen.getByLabelText('Amount (PHP)')).toBeOnTheScreen();
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('never renders a driver id or storage detail', async () => {
+    await renderDetail(
+      fakeApi({ get: () => Promise.resolve(trip('IN_PROGRESS')) }),
+      jest.fn(),
+      fakeExpensesApi({
+        list: () =>
+          Promise.resolve({
+            items: [expense()],
+            page: 1,
+            pageSize: 25,
+            total: 1,
+          }),
+      }),
+    );
+    await screen.findByText('₱1,250.00');
+
+    const shown = renderedText();
+    expect(shown).not.toContain('019a0000-0000-7000-8000-00000000000d');
+    expect(shown).not.toMatch(/objectKey|bucket|x-amz|signature|policy/i);
   });
 });

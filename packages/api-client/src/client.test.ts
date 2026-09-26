@@ -4,6 +4,7 @@ import {
   ApiError,
   createApiClientConfig,
   isApiError,
+  requestCreated,
   requestJson,
   requestNoContent,
   type HttpResponse,
@@ -98,5 +99,126 @@ describe('requestJson', () => {
     expect(JSON.stringify({ ...error, message: error.message })).not.toContain(
       'synthetic.access.token',
     );
+  });
+});
+
+describe('requestCreated', () => {
+  it('accepts a 201 body and hands it to the parser', async () => {
+    const fetch = vi.fn(async () => reply(201, '{"id":"synthetic"}'));
+    const config = createApiClientConfig('https://api.example.test', { fetch });
+    const created = await requestCreated(
+      config,
+      { method: 'POST', path: '/x', body: { amount: '1.00' } },
+      (value) => value as { id: string },
+    );
+    expect(created).toEqual({ id: 'synthetic' });
+    const [url, init] = fetch.mock.calls[0]!;
+    expect(url).toBe('https://api.example.test/x');
+    expect(init.method).toBe('POST');
+    expect(init.headers).toEqual({
+      accept: 'application/json',
+      'content-type': 'application/json',
+    });
+    expect(init.body).toBe('{"amount":"1.00"}');
+  });
+
+  it('refuses a 200, because the expected status is the contract', async () => {
+    // An endpoint that answers 200 where 201 was asked for is not the
+    // endpoint the caller meant to reach, so its body is not adopted.
+    const fetch = vi.fn(async () => reply(200, '{"id":"synthetic"}'));
+    const config = createApiClientConfig('https://api.example.test', { fetch });
+    const error = (await requestCreated(
+      config,
+      { method: 'POST', path: '/x' },
+      (value) => value,
+    ).catch((e: unknown) => e)) as ApiError;
+    expect(isApiError(error)).toBe(true);
+    expect(error.kind).toBe('http');
+    expect(error.status).toBe(200);
+  });
+
+  it('treats malformed 201 JSON as an invalid response', async () => {
+    const fetch = vi.fn(async () => reply(201, 'not json at all'));
+    const config = createApiClientConfig('https://api.example.test', { fetch });
+    const error = (await requestCreated(
+      config,
+      { method: 'POST', path: '/x' },
+      (value) => value,
+    ).catch((e: unknown) => e)) as ApiError;
+    expect(error.kind).toBe('invalid_response');
+    expect(error.status).toBe(201);
+  });
+
+  it('treats a parser rejection on a well-formed 201 as an invalid response', async () => {
+    const fetch = vi.fn(async () => reply(201, '{"unexpected":1}'));
+    const config = createApiClientConfig('https://api.example.test', { fetch });
+    const error = (await requestCreated(
+      config,
+      { method: 'POST', path: '/x' },
+      () => null,
+    ).catch((e: unknown) => e)) as ApiError;
+    expect(error.kind).toBe('invalid_response');
+  });
+
+  it('shapes a documented error code the same way requestJson does', async () => {
+    const fetch = vi.fn(async () =>
+      reply(409, '{"message":"trip_not_expensable"}'),
+    );
+    const config = createApiClientConfig('https://api.example.test', { fetch });
+    const error = (await requestCreated(
+      config,
+      { method: 'POST', path: '/x' },
+      (value) => value,
+    ).catch((e: unknown) => e)) as ApiError;
+    expect(error.kind).toBe('http');
+    expect(error.status).toBe(409);
+    expect(error.code).toBe('trip_not_expensable');
+  });
+
+  it('drops unexpected server text instead of echoing it', async () => {
+    const fetch = vi.fn(async () =>
+      reply(500, '{"message":"PrismaClientKnownRequestError P2002"}'),
+    );
+    const config = createApiClientConfig('https://api.example.test', { fetch });
+    const error = (await requestCreated(
+      config,
+      { method: 'POST', path: '/x', accessToken: 'synthetic.access.token' },
+      (value) => value,
+    ).catch((e: unknown) => e)) as ApiError;
+    expect(error.code).toBeNull();
+    const serialized = JSON.stringify({ ...error, message: error.message });
+    expect(serialized).not.toContain('Prisma');
+    expect(serialized).not.toContain('synthetic.access.token');
+  });
+
+  it('reports a network failure without leaking the cause', async () => {
+    const fetch = vi.fn(() => Promise.reject(new Error('socket hang up')));
+    const config = createApiClientConfig('https://api.example.test', { fetch });
+    const error = (await requestCreated(
+      config,
+      { method: 'POST', path: '/x' },
+      (value) => value,
+    ).catch((e: unknown) => e)) as ApiError;
+    expect(error.kind).toBe('network');
+    expect(error.message).not.toContain('socket');
+  });
+
+  it('leaves requestJson and requestNoContent on their own statuses', async () => {
+    const config = (status: number, text: string) =>
+      createApiClientConfig('https://api.example.test', {
+        fetch: vi.fn(async () => reply(status, text)),
+      });
+    // requestJson still refuses 201...
+    const jsonError = (await requestJson(
+      config(201, '{"ok":true}'),
+      { method: 'POST', path: '/x' },
+      (value) => value,
+    ).catch((e: unknown) => e)) as ApiError;
+    expect(jsonError.kind).toBe('http');
+    expect(jsonError.status).toBe(201);
+    // ...and requestNoContent still requires exactly 204.
+    await expect(
+      requestNoContent(config(204, ''), { method: 'POST', path: '/x' }),
+    ).resolves.toBeUndefined();
   });
 });

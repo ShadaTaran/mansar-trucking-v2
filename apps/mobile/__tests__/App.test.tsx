@@ -55,6 +55,8 @@ const TRIP = {
 };
 
 const EMPTY_TRIP_PAGE = { items: [], page: 1, pageSize: 25, total: 0 };
+/** The same empty-page shape answers the trip-scoped expense listing. */
+const EMPTY_EXPENSE_PAGE = EMPTY_TRIP_PAGE;
 
 /**
  * Answers the driver-trips requests the authenticated flow now makes on
@@ -312,9 +314,14 @@ describe('App driver trip flow', () => {
       async (input: unknown) => {
         const url = String(input);
         urls.push(url);
-        const body = url.includes(`/driver/trips/${TRIP.id}`)
-          ? TRIP
-          : { items: [TRIP], page: 1, pageSize: 25, total: 1 };
+        // The expense listing is trip-scoped, so its path *starts with* the
+        // trip detail path; it must be matched first or the trip body would
+        // answer it.
+        const body = url.includes('/expenses')
+          ? EMPTY_EXPENSE_PAGE
+          : url.includes(`/driver/trips/${TRIP.id}`)
+            ? TRIP
+            : { items: [TRIP], page: 1, pageSize: 25, total: 1 };
         return {
           status: 200,
           text: async () => JSON.stringify(body),
@@ -342,12 +349,56 @@ describe('App driver trip flow', () => {
     expect(screen.queryByText('My trips')).toBeNull();
     expect(urls).toContain(`http://10.0.2.2:3001/driver/trips/${TRIP.id}`);
 
+    // The trip-scoped expense listing travelled the same transport.
+    expect(urls).toContain(
+      `http://10.0.2.2:3001/driver/trips/${TRIP.id}/expenses?page=1&pageSize=25`,
+    );
+
     await fireEvent.press(
       screen.getByRole('button', { name: 'Back to trips' }),
     );
 
     expect(await screen.findByText('My trips')).toBeOnTheScreen();
     expect(screen.queryByText('Origin: Synthetic Origin')).toBeNull();
+  });
+
+  it('shares one authenticated transport across trips and expenses', async () => {
+    const sent: Array<{ url: string; init: unknown }> = [];
+    globalThis.fetch = jest.fn(async (input: unknown, init: unknown) => {
+      const url = String(input);
+      sent.push({ url, init });
+      const body = url.includes('/expenses')
+        ? EMPTY_EXPENSE_PAGE
+        : url.includes(`/driver/trips/${TRIP.id}`)
+          ? TRIP
+          : { items: [TRIP], page: 1, pageSize: 25, total: 1 };
+      return {
+        status: 200,
+        text: async () => JSON.stringify(body),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+
+    await signedInDriver();
+    await screen.findByText('Synthetic Origin → Synthetic Destination');
+    await fireEvent.press(
+      screen.getByText('Synthetic Origin → Synthetic Destination'),
+    );
+    await screen.findByText('Status: ASSIGNED');
+
+    const driverCalls = sent.filter((call) => call.url.includes('/driver/'));
+    const expenseCalls = driverCalls.filter((call) =>
+      call.url.includes('/expenses'),
+    );
+    expect(expenseCalls.length).toBeGreaterThan(0);
+    // Every aggregate carries the same token, in the same one header, and no
+    // screen ever obtained it for itself.
+    for (const call of driverCalls) {
+      const headers = (call.init as { headers: Record<string, string> })
+        .headers;
+      expect(headers.authorization).toBe('Bearer synthetic.access.8');
+      expect(call.url).not.toMatch(/synthetic\.access|synthetic-refresh/);
+    }
+    expect(renderedText()).not.toMatch(/synthetic\.access|synthetic-refresh/);
   });
 
   it('never puts a token in a trip URL or body', async () => {

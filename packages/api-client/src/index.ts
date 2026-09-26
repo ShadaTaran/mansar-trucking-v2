@@ -17,6 +17,7 @@ export {
   type RequestSpec,
   createApiClientConfig,
   isApiError,
+  requestCreated,
   requestJson,
   requestNoContent,
 } from './client.js';

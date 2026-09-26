@@ -5,6 +5,9 @@ import {
   createApiClientConfig,
   createAuthApi,
   isTripStatus,
+  requestCreated,
+  requestJson,
+  requestNoContent,
 } from './index.js';
 
 describe('@mansar/api-client', () => {
@@ -29,5 +32,13 @@ describe('@mansar/api-client', () => {
       'me',
       'refresh',
     ]);
+  });
+
+  it('exposes one request helper per success-status contract', () => {
+    // 200, 201 and 204 are three different endpoint contracts, so the entry
+    // point offers three functions rather than one with a status argument.
+    expect(typeof requestJson).toBe('function');
+    expect(typeof requestCreated).toBe('function');
+    expect(typeof requestNoContent).toBe('function');
   });
 });

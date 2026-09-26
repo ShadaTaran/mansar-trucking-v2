@@ -171,6 +171,77 @@ export interface Expense {
 }
 
 /**
+ * The receipt attached to one expense, as the API returns it (Stage 6D).
+ *
+ * Metadata only. The binary never passes through this API: a client uploads
+ * it straight to object storage under a short-lived authorization, and the
+ * server confirms afterwards that the object really arrived (ADR 0009).
+ *
+ * `objectKey` is deliberately absent. Where the binary physically lives is
+ * the server's business — exposing it would leak the storage layout and hand
+ * a caller a value only the server should ever name.
+ *
+ * `confirmedAt` is the whole lifecycle. Null means an upload was authorized
+ * but no object has been verified yet, and such a receipt is not yet
+ * evidence of anything; non-null means the object was found in storage with
+ * exactly the declared size and type, and the row is immutable from then on.
+ */
+export interface Receipt {
+  readonly id: string;
+  readonly expenseId: string;
+  readonly contentType: string;
+  readonly byteSize: number;
+  /** Set when the upload was verified in storage; null while pending. */
+  readonly confirmedAt: string | null;
+  readonly createdAt: string;
+}
+
+/**
+ * A short-lived authorization to upload one receipt binary.
+ *
+ * A discriminated union because the transport is the provider's, not the
+ * contract's: the selected provider signs a **POST** (only a POST policy can
+ * bind a maximum body size, so the store itself refuses an oversize upload),
+ * while a PUT-only provider would return the other branch. Keeping both
+ * shapes here means changing provider changes a server-side adapter rather
+ * than this contract.
+ *
+ * `fields` and `headers` are opaque and must be reproduced verbatim, or the
+ * signature fails. They carry ordinary signing material — never a secret key
+ * — and the whole authorization is **bearer**: whoever holds it can perform
+ * that one upload until `expiresAt`. It is returned only to the caller that
+ * asked for it, and never logged, audited or stored.
+ */
+export type ReceiptUploadAuthorization =
+  | {
+      readonly receiptId: string;
+      readonly method: 'POST';
+      readonly url: string;
+      /** Send verbatim as multipart form fields, alongside the file. */
+      readonly fields: Readonly<Record<string, string>>;
+      readonly expiresAt: string;
+    }
+  | {
+      readonly receiptId: string;
+      readonly method: 'PUT';
+      readonly url: string;
+      /** Send verbatim as request headers. */
+      readonly headers: Readonly<Record<string, string>>;
+      readonly expiresAt: string;
+    };
+
+/**
+ * A short-lived authorization to read one confirmed receipt binary.
+ *
+ * Also a bearer capability, and a much shorter-lived one: it is minted for
+ * an image about to be displayed, not stored or shared.
+ */
+export interface ReceiptReadAuthorization {
+  readonly url: string;
+  readonly expiresAt: string;
+}
+
+/**
  * Temporary workspace-resolution probe.
  *
  * Consumed by other workspaces (api-client now; web/mobile once scaffolded)

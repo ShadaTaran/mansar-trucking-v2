@@ -8,10 +8,12 @@
  * reviewer learns only that their decision did not land, never which of the
  * three happened, so the code leaks nothing about a concurrent actor.
  *
- * `expenseNotModifiable` belongs to the frozen Stage 6 contract and is
- * declared here so the public error namespace stays in one place, as
- * DRIVER_ERROR and TRIP_ERROR already do. Stage 6B has no editable or
- * receipt mutation, so no route returns it yet.
+ * `expenseNotModifiable` means one thing, frozen in Stage 6D: a receipt
+ * mutation that requires the expense to stay open was requested after the
+ * expense left SUBMITTED. It is never the answer for a receipt that is
+ * itself closed — a confirmed receipt on a still-open expense is
+ * `receipt_not_modifiable`, because telling the caller to reopen an expense
+ * that was never the obstacle would send them to fix the wrong thing.
  */
 export const EXPENSE_ERROR = {
   expenseNotFound: 'expense_not_found',

@@ -10,6 +10,9 @@ import {
   type ExpenseStatus,
   MANSAR_PACKAGE_PROBE,
   type Page,
+  type Receipt,
+  type ReceiptReadAuthorization,
+  type ReceiptUploadAuthorization,
   type Trip,
   TRIP_STATUSES,
   type TripStatus,
@@ -135,6 +138,99 @@ describe('@mansar/types', () => {
     expect(Object.keys(expense)).not.toContain('submittedByUserId');
     // Money is a string on the wire, never an IEEE-754 double.
     expect(typeof expense.amount).toBe('string');
+  });
+
+  it('describes a receipt as metadata only, never naming where the binary lives', () => {
+    const receipt: Receipt = {
+      id: '019a0000-0000-7000-8000-000000000003',
+      expenseId: '019a0000-0000-7000-8000-000000000002',
+      contentType: 'image/jpeg',
+      byteSize: 128_000,
+      confirmedAt: null,
+      createdAt: '2026-09-01T00:00:00.000Z',
+    };
+
+    expect(Object.keys(receipt)).toEqual([
+      'id',
+      'expenseId',
+      'contentType',
+      'byteSize',
+      'confirmedAt',
+      'createdAt',
+    ]);
+    // Where the object physically lives is the server's business: the key,
+    // the bucket and the endpoint never cross the wire.
+    expect(Object.keys(receipt)).not.toContain('objectKey');
+    expect(Object.keys(receipt)).not.toContain('bucket');
+    expect(Object.keys(receipt)).not.toContain('endpoint');
+    expect(Object.keys(receipt)).not.toContain('url');
+  });
+
+  it('leaves confirmedAt nullable, because a pending upload is not evidence', () => {
+    const pending: Receipt['confirmedAt'] = null;
+    const confirmed: Receipt['confirmedAt'] = '2026-09-01T00:00:00.000Z';
+    expect(pending).toBeNull();
+    expect(typeof confirmed).toBe('string');
+  });
+
+  it('describes the POST branch of an upload authorization exactly', () => {
+    const authorization: ReceiptUploadAuthorization = {
+      receiptId: '019a0000-0000-7000-8000-000000000003',
+      method: 'POST',
+      url: 'https://storage.example.test/upload',
+      fields: { key: 'synthetic', policy: 'synthetic-policy' },
+      expiresAt: '2026-09-01T00:05:00.000Z',
+    };
+
+    expect(Object.keys(authorization)).toEqual([
+      'receiptId',
+      'method',
+      'url',
+      'fields',
+      'expiresAt',
+    ]);
+    // The union discriminates on `method`, so narrowing reaches `fields`
+    // without a cast and could never reach `headers`.
+    if (authorization.method === 'POST') {
+      expect(authorization.fields.key).toBe('synthetic');
+    }
+    expect(Object.keys(authorization)).not.toContain('headers');
+  });
+
+  it('describes the PUT branch of an upload authorization exactly', () => {
+    // No provider selected in Stage 6 returns this branch. It exists so that
+    // moving to a PUT-only provider changes a server-side adapter rather
+    // than this contract.
+    const authorization: ReceiptUploadAuthorization = {
+      receiptId: '019a0000-0000-7000-8000-000000000003',
+      method: 'PUT',
+      url: 'https://storage.example.test/object',
+      headers: { 'Content-Type': 'image/png' },
+      expiresAt: '2026-09-01T00:05:00.000Z',
+    };
+
+    expect(Object.keys(authorization)).toEqual([
+      'receiptId',
+      'method',
+      'url',
+      'headers',
+      'expiresAt',
+    ]);
+    if (authorization.method === 'PUT') {
+      expect(authorization.headers['Content-Type']).toBe('image/png');
+    }
+    expect(Object.keys(authorization)).not.toContain('fields');
+  });
+
+  it('describes a read authorization as a URL and an expiry, and nothing else', () => {
+    const authorization: ReceiptReadAuthorization = {
+      url: 'https://storage.example.test/read/synthetic?signature=synthetic',
+      expiresAt: '2026-09-01T00:01:00.000Z',
+    };
+
+    expect(Object.keys(authorization)).toEqual(['url', 'expiresAt']);
+    expect(Object.keys(authorization)).not.toContain('objectKey');
+    expect(Object.keys(authorization)).not.toContain('bucket');
   });
 
   it('pages trips with the shared Page type', () => {

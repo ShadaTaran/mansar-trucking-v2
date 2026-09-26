@@ -222,11 +222,56 @@ model Expense {
   createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt   DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  trip Trip @relation(fields: [tripId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  trip    Trip     @relation(fields: [tripId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  /// At most one receipt image, ever (Stage 6D).
+  receipt Receipt?
 
   @@index([status, incurredAt, id], map: "expenses_status_incurred_at_id_idx")
   @@index([tripId, incurredAt, id], map: "expenses_trip_id_incurred_at_id_idx")
   @@map("expenses")
+}
+
+/// The receipt image backing one expense (Stage 6D, ADR 0009). Metadata
+/// only: the binary lives in object storage and never enters PostgreSQL or
+/// passes through the API.
+///
+/// **At most one receipt row per expense, ever.** `expense_id` is unique, so
+/// a retry reuses the same row and the same key rather than accumulating
+/// abandoned objects — Stage 6 has no cleanup mechanism, and a model that
+/// stranded a row per attempt would need one. A pending row's declaration
+/// may still be corrected; once `confirmed_at` is set the row is immutable
+/// and no further upload is ever authorized for it.
+///
+/// `object_key` is server-generated (`receipts/{expenseId}/{receiptId}`),
+/// never accepted from a client and never returned on the wire. It is unique
+/// as a storage-integrity invariant: one object locator must never be
+/// claimed by two rows.
+///
+/// There is no `status`: `confirmed_at` is the entire lifecycle, and a second
+/// representation of it would only be an invariant to keep in step. There is
+/// no `updated_at`, because a confirmed row never changes again. The
+/// uploading identity is the audit row's actor, not a column here (ADR 0002).
+///
+/// Two CHECK constraints are added by hand in the migration and are
+/// invisible to `db:diff:check` (docs/database.md §15), so
+/// `test/receipts-persistence.int-spec.ts` proves each against a real
+/// database:
+///   - `receipts_byte_size_range`        1 byte .. 10 MiB, integers only
+///   - `receipts_content_type_allowed`   exactly JPEG, PNG or WebP
+model Receipt {
+  id          String    @id @default(uuid(7)) @db.Uuid
+  expenseId   String    @unique(map: "receipts_expense_id_key") @map("expense_id") @db.Uuid
+  /// Server-generated storage locator. Never on the wire, never audited.
+  objectKey   String    @unique(map: "receipts_object_key_key") @map("object_key") @db.Text
+  contentType String    @map("content_type") @db.Text
+  byteSize    Int       @map("byte_size")
+  /// Set once the object was verified in storage; null while pending.
+  confirmedAt DateTime? @map("confirmed_at") @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  expense Expense @relation(fields: [expenseId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@map("receipts")
 }
 
 /// Append-only record of significant actions. Survives actor deletion.

@@ -9,9 +9,13 @@ and active-trip location tracking.
 **Under development.** The web, API, mobile, and database foundations are in
 place, along with authentication, driver and vehicle management, and the trip
 lifecycle end to end — administered on the web, executed in the driver app.
-A staging environment exists for development verification. Expenses,
-receipts, maintenance and location tracking are not built yet. The system is
-not production-ready or in live business use.
+Expenses and receipts are built: expense submission and review, receipt upload
+directly to private object storage, the admin web expense and receipt
+workflow, the driver mobile expense and receipt workflow, and verification
+against real staging object storage. A staging environment exists for
+development verification. Maintenance and active-trip location tracking are
+not built yet. The system is not deployed to production, is not
+production-ready, and is not in live business use.
 
 ## What this is
 
@@ -43,6 +47,7 @@ docs/
   database.md
   drivers-vehicles.md
   trips.md
+  expenses-receipts.md
   security.md
   staging-deployment.md
   adr/                architecture decision records
@@ -89,5 +94,9 @@ the git-ignored `dist/` directories as a side effect; `build` does the same.
 - [Trips](docs/trips.md): trip fields and lifecycle, the assignment boundary,
   scheduling and exclusion constraints, ADMIN and DRIVER APIs, admin web
   screens, driver mobile flow
+- [Expenses and receipts](docs/expenses-receipts.md): expense states, fields
+  and money rules, ADMIN and DRIVER APIs, the receipt lifecycle and
+  direct-to-storage upload, admin web and driver mobile workflows, storage
+  configuration
 - [Staging deployment](docs/staging-deployment.md): Railway staging topology,
   service settings, environment variables, migration order, smoke checklist

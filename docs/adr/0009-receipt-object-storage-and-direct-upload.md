@@ -177,3 +177,40 @@ the evaluation.
 **Proxying binaries through the API** — rejected in Stage 0 and not reopened.
 It would route receipt images through Nest and contradict the frozen
 architecture.
+
+## Implementation verification (Stage 6G)
+
+An addendum, not a revision. The decision above is unchanged: the provider
+selection, the presigned POST transport, the `ReceiptStorage` port, the
+no-delete decision, Railway as primary with Cloudflare R2 as runner-up, and the
+private-bucket decision all stand exactly as accepted. This section records only
+what was observed when the decision was implemented and verified.
+
+The staging bucket now exists and was verified end to end:
+
+- created in Railway's `sin` region (Asia Pacific, Singapore), as planned above
+- URL style verified as **virtual-host**
+- the bucket-provided S3 signing `REGION` is **`auto`**, which is not the same
+  value as the physical region
+- the five `RECEIPT_STORAGE_*` values are wired through Railway bucket
+  **reference expressions**, so no secret was typed, copied or recorded —
+  the mechanism this ADR relies on, confirmed in practice
+- a real round trip passed against the provider: presigned **POST** upload,
+  server-side **HeadObject** verification, and presigned **GET** read returning
+  the uploaded bytes with an exactly matching SHA-256
+- confirmation was also shown to depend on the real HeadObject: confirming
+  before any upload answered `receipt_upload_incomplete` rather than succeeding
+
+**Provider CORS compatibility.** The deployed staging CORS rule includes
+`AllowedHeaders: ["*"]` and `MaxAgeSeconds: 3000`, because Railway/Tigris
+rejected the simpler origin-and-method-only rule this ADR described with
+`InvalidArgument` / HTTP 400. These are provider-compatibility fields. The
+original origin and method security boundary did **not** change: the exact
+staging web origin plus `http://localhost:3000` only, `POST`, `GET` and `HEAD`
+only, and no wildcard origin, `PUT` or `DELETE`. `AllowedHeaders: ["*"]`
+permits request headers on a preflight and is not a wildcard origin.
+
+This note creates no production bucket and does not alter this ADR's position
+on production storage: the production bucket and its region remain deliberately
+neither created nor frozen, and the data-residency question above is still open
+should a requirement ever be identified.

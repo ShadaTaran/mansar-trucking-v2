@@ -64,6 +64,35 @@ export const EXPENSE_CATEGORIES = [
 
 export type ExpenseCategory = (typeof EXPENSE_CATEGORIES)[number];
 
+/**
+ * Frozen maintenance lifecycle (Stage 7, ADR 0010). Mirrors the database enum
+ * `maintenance_status`; the API asserts the two stay identical.
+ *
+ * A record is created `OPEN` and leaves it exactly once, to `COMPLETED` or
+ * `CANCELLED`. Both are terminal: there is no reopen and no return to
+ * `OPEN`, and no application delete.
+ */
+export const MAINTENANCE_STATUSES = ['OPEN', 'COMPLETED', 'CANCELLED'] as const;
+
+export type MaintenanceStatus = (typeof MAINTENANCE_STATUSES)[number];
+
+/**
+ * Frozen maintenance categories (Stage 7). Mirrors the database enum
+ * `maintenance_category`; the API asserts the two stay identical.
+ *
+ * Unrelated to `EXPENSE_CATEGORIES`, which classifies a trip cost. The two
+ * share the member name `REPAIR` and nothing else.
+ */
+export const MAINTENANCE_CATEGORIES = [
+  'PREVENTIVE',
+  'REPAIR',
+  'INSPECTION',
+  'TIRE',
+  'OTHER',
+] as const;
+
+export type MaintenanceCategory = (typeof MAINTENANCE_CATEGORIES)[number];
+
 /** One page of a listing endpoint. */
 export interface Page<T> {
   readonly items: readonly T[];
@@ -239,6 +268,46 @@ export type ReceiptUploadAuthorization =
 export interface ReceiptReadAuthorization {
   readonly url: string;
   readonly expiresAt: string;
+}
+
+/**
+ * One maintenance job on one vehicle, as the API returns it (Stage 7).
+ *
+ * A vehicle-scoped work log, not a statement about availability: an `OPEN`
+ * record does not mean the vehicle is unavailable, and maintenance never
+ * writes `Vehicle.status` (ADR 0010). A vehicle may carry several records,
+ * including several `OPEN` ones, and may have none at all.
+ *
+ * The record carries no trip, no driver, no submitter, no vendor and no
+ * attachment. Ownership is the vehicle, and the acting identity lives in the
+ * audit trail.
+ */
+export interface MaintenanceRecord {
+  readonly id: string;
+  readonly vehicleId: string;
+  readonly status: MaintenanceStatus;
+  readonly category: MaintenanceCategory;
+  /**
+   * When the work began, which is not when the row was filed. A business
+   * instant supplied by the caller, so past work can be recorded after the
+   * fact. ISO 8601 in UTC.
+   */
+  readonly startedAt: string;
+  /** Set exactly when the status is `COMPLETED`; null otherwise. */
+  readonly completedAt: string | null;
+  /** The reading taken at this job, or null when none was recorded. */
+  readonly odometer: number | null;
+  /**
+   * PHP, as a decimal string with **exactly two** fractional digits
+   * (`"12500.00"`), or null when no cost was recorded. Never a JavaScript
+   * number: the API refuses to hand a monetary value to a consumer through an
+   * IEEE-754 double. `"0.00"` is legitimate — warranty and goodwill work
+   * costs nothing — and a negative cost is not.
+   */
+  readonly cost: string | null;
+  readonly description: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
 }
 
 /**

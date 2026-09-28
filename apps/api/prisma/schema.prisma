@@ -75,7 +75,7 @@ model Driver {
   createdAt     DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt     DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  user User? @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  user  User?  @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   trips Trip[]
 
   @@map("drivers")
@@ -95,7 +95,8 @@ model Vehicle {
   createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt       DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  trips Trip[]
+  trips              Trip[]
+  maintenanceRecords MaintenanceRecord[]
 
   @@map("vehicles")
 }
@@ -272,6 +273,67 @@ model Receipt {
   expense Expense @relation(fields: [expenseId], references: [id], onDelete: Restrict, onUpdate: NoAction)
 
   @@map("receipts")
+}
+
+/// Frozen maintenance lifecycle (Stage 7, ADR 0010). Mirrors the shared tuple
+/// `MAINTENANCE_STATUSES` in @mansar/types; the API asserts the two stay
+/// identical. COMPLETED and CANCELLED are terminal.
+enum MaintenanceStatus {
+  OPEN
+  COMPLETED
+  CANCELLED
+
+  @@map("maintenance_status")
+}
+
+/// Frozen maintenance categories (Stage 7). Mirrors the shared tuple
+/// `MAINTENANCE_CATEGORIES` in @mansar/types. Unrelated to ExpenseCategory,
+/// which classifies a trip cost; the shared `REPAIR` name implies no link.
+enum MaintenanceCategory {
+  PREVENTIVE
+  REPAIR
+  INSPECTION
+  TIRE
+  OTHER
+
+  @@map("maintenance_category")
+}
+
+/// One maintenance job on one vehicle: a vehicle-scoped work log (ADR 0010).
+///
+/// Maintenance never writes `Vehicle.status`, so nothing here derives from or
+/// constrains vehicle availability. A vehicle may carry zero, one or several
+/// records, including several OPEN ones — there is deliberately no
+/// one-open-job uniqueness constraint. Rows are never deleted.
+///
+/// Hand-extended in the migration (docs/database.md §15), invisible to
+/// `db:diff:check`:
+///   - `maintenance_records_completion_consistency`  completed_at set exactly when COMPLETED
+///   - `maintenance_records_completion_order`        completed_at >= started_at
+///   - `maintenance_records_odometer_non_negative`   odometer >= 0 when present
+///   - `maintenance_records_cost_non_negative`       cost >= 0 when present (0.00 is legal)
+model MaintenanceRecord {
+  id          String              @id @default(uuid(7)) @db.Uuid
+  vehicleId   String              @map("vehicle_id") @db.Uuid
+  status      MaintenanceStatus   @default(OPEN)
+  category    MaintenanceCategory
+  /// When the work began, which is not when the row was filed.
+  startedAt   DateTime            @map("started_at") @db.Timestamptz(3)
+  /// Server-stored on completion; null while OPEN and on CANCELLED.
+  completedAt DateTime?           @map("completed_at") @db.Timestamptz(3)
+  /// The reading taken at this job. Never written back to the vehicle.
+  odometer    Int?
+  /// PHP, two decimal places, nullable. 0.00 is legal; negative is not.
+  cost        Decimal?            @db.Decimal(12, 2)
+  description String              @default("") @db.Text
+  createdAt   DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  vehicle Vehicle @relation(fields: [vehicleId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@index([vehicleId, startedAt, id], map: "maintenance_records_vehicle_id_started_at_id_idx")
+  @@index([status, startedAt, id], map: "maintenance_records_status_started_at_id_idx")
+  @@map("maintenance_records")
 }
 
 /// Append-only record of significant actions. Survives actor deletion.

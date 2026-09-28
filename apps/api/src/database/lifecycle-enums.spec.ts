@@ -2,6 +2,8 @@ import {
   DRIVER_STATUSES,
   EXPENSE_CATEGORIES,
   EXPENSE_STATUSES,
+  MAINTENANCE_CATEGORIES,
+  MAINTENANCE_STATUSES,
   TRIP_STATUSES,
   VEHICLE_STATUSES,
 } from '@mansar/types';
@@ -11,6 +13,8 @@ import {
   DriverStatus,
   ExpenseCategory,
   ExpenseStatus,
+  MaintenanceCategory,
+  MaintenanceStatus,
   TripStatus,
   VehicleStatus,
 } from '../generated/prisma/enums.js';
@@ -44,5 +48,19 @@ describe('lifecycle enums match @mansar/types', () => {
   it('ExpenseCategory is exactly EXPENSE_CATEGORIES', () => {
     expect(Object.values(ExpenseCategory)).toEqual([...EXPENSE_CATEGORIES]);
     expect(Object.keys(ExpenseCategory)).toEqual([...EXPENSE_CATEGORIES]);
+  });
+
+  it('MaintenanceStatus is exactly MAINTENANCE_STATUSES', () => {
+    expect(Object.values(MaintenanceStatus)).toEqual([...MAINTENANCE_STATUSES]);
+    expect(Object.keys(MaintenanceStatus)).toEqual([...MAINTENANCE_STATUSES]);
+  });
+
+  it('MaintenanceCategory is exactly MAINTENANCE_CATEGORIES', () => {
+    expect(Object.values(MaintenanceCategory)).toEqual([
+      ...MAINTENANCE_CATEGORIES,
+    ]);
+    expect(Object.keys(MaintenanceCategory)).toEqual([
+      ...MAINTENANCE_CATEGORIES,
+    ]);
   });
 });

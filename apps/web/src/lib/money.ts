@@ -1,11 +1,16 @@
 /**
  * Peso amounts, handled as strings from end to end.
  *
- * An expense amount is `Decimal(12, 2)` in PostgreSQL and crosses the wire as
- * a decimal *string* precisely so no consumer can round it through an
- * IEEE-754 double. That invariant does not stop at the API boundary: nothing
- * here calls `Number`, `parseFloat`, `parseInt` or `Intl.NumberFormat`, all of
- * which would need a `number` to work with.
+ * Every peso amount in this application — an expense amount, a maintenance
+ * cost — is `Decimal(12, 2)` in PostgreSQL and crosses the wire as a decimal
+ * *string* precisely so no consumer can round it through an IEEE-754 double.
+ * That invariant does not stop at the API boundary: nothing here calls
+ * `Number`, `parseFloat`, `parseInt` or `Intl.NumberFormat`, all of which
+ * would need a `number` to work with.
+ *
+ * The *shape* is shared; the domain rules are not. An expense amount must be
+ * greater than zero and a maintenance cost may be exactly zero, so each has
+ * its own validator below rather than one function with a flag.
  *
  * `Intl.NumberFormat` deserves a word, because it is the obvious reach. Its
  * output would be correct for every value `Decimal(12, 2)` can hold — but it
@@ -62,6 +67,29 @@ export function isValidExpenseAmountInput(value: string): boolean {
 /** True for the exact shape an API response carries. */
 export function isExpenseAmountResponse(value: string): boolean {
   return RESPONSE_PATTERN.test(value) && isPositive(value);
+}
+
+/**
+ * True for a value the API would accept as a maintenance cost.
+ *
+ * The same decimal shape as an expense amount, with one deliberate
+ * difference: **zero is valid**. Warranty and goodwill work legitimately
+ * costs nothing, so the `> 0` refinement above is not applied here — exactly
+ * as `maintenance.schemas.ts` states it. That is why this is a separate
+ * function rather than a flag on the expense one: the two domains disagree
+ * about zero, and a shared function with a parameter would let a future
+ * caller pick the wrong rule silently.
+ *
+ * `null` is a different statement again — no cost was recorded, rather than
+ * free — and is not a string, so it never reaches this check.
+ */
+export function isValidMaintenanceCostInput(value: string): boolean {
+  return INPUT_PATTERN.test(value);
+}
+
+/** The exact shape a maintenance cost response carries; zero included. */
+export function isMaintenanceCostResponse(value: string): boolean {
+  return RESPONSE_PATTERN.test(value);
 }
 
 /** `1250` → `1,250`, by string position only. */

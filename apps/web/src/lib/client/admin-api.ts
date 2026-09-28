@@ -6,6 +6,11 @@ import {
   type Expense,
   type ExpenseCategory,
   type ExpenseStatus,
+  MAINTENANCE_CATEGORIES,
+  MAINTENANCE_STATUSES,
+  type MaintenanceCategory,
+  type MaintenanceRecord,
+  type MaintenanceStatus,
   type Page,
   type Receipt,
   type ReceiptReadAuthorization,
@@ -17,7 +22,7 @@ import {
   type VehicleStatus,
 } from '@mansar/types';
 
-import { isExpenseAmountResponse } from '../money';
+import { isExpenseAmountResponse, isMaintenanceCostResponse } from '../money';
 import { authenticatedFetch } from './authenticated-fetch';
 
 /**
@@ -959,6 +964,236 @@ export function createReceiptReadAuthorization(
   );
 }
 
+/** Sourced from the shared tuples, so the UI cannot drift from the API. */
+const MAINTENANCE_STATUS_VALUES: readonly string[] = MAINTENANCE_STATUSES;
+const MAINTENANCE_CATEGORY_VALUES: readonly string[] = MAINTENANCE_CATEGORIES;
+
+/**
+ * A maintenance cost on the wire: the canonical two-place decimal string, or
+ * null when none was recorded. Unlike an expense amount, `"0.00"` is a real
+ * value — warranty work costs nothing — so the zero-inclusive rule is used.
+ *
+ * A JSON *number* returns undefined rather than being converted: a monetary
+ * value that arrived as a double has already lost precision, and accepting it
+ * would put a float in the money path the whole codebase refuses.
+ */
+function nullableCost(value: unknown): string | null | undefined {
+  if (value === null) {
+    return null;
+  }
+  return typeof value === 'string' && isMaintenanceCostResponse(value)
+    ? value
+    : undefined;
+}
+
+/**
+ * Fail-closed MaintenanceRecord parser.
+ *
+ * The wire contract is flat, exactly as Trip's is: a record carries a
+ * `vehicleId`, never a nested Vehicle, and no trip or driver appears at all
+ * because maintenance has neither (ADR 0010). Nothing here invents one.
+ *
+ * `completedAt` is the whole lifecycle signal the row carries beyond
+ * `status`: it is set exactly when the status is COMPLETED. The two are not
+ * cross-checked here — the API owns that CHECK constraint, and duplicating it
+ * in the browser would mean two places to keep in step.
+ */
+export function parseMaintenanceRecord(
+  value: unknown,
+): MaintenanceRecord | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const id = str(value.id);
+  const vehicleId = str(value.vehicleId);
+  const status = str(value.status);
+  const category = str(value.category);
+  const startedAt = str(value.startedAt);
+  const completedAt = nullableStr(value.completedAt);
+  const odometer = nullableInt(value.odometer);
+  const cost = nullableCost(value.cost);
+  const description = str(value.description);
+  const createdAt = str(value.createdAt);
+  const updatedAt = str(value.updatedAt);
+  if (
+    id === null ||
+    vehicleId === null ||
+    status === null ||
+    !MAINTENANCE_STATUS_VALUES.includes(status) ||
+    category === null ||
+    !MAINTENANCE_CATEGORY_VALUES.includes(category) ||
+    startedAt === null ||
+    completedAt === undefined ||
+    odometer === undefined ||
+    cost === undefined ||
+    description === null ||
+    createdAt === null ||
+    updatedAt === null
+  ) {
+    return null;
+  }
+  return {
+    id,
+    vehicleId,
+    status: status as MaintenanceStatus,
+    category: category as MaintenanceCategory,
+    startedAt,
+    completedAt,
+    odometer,
+    cost,
+    description,
+    createdAt,
+    updatedAt,
+  };
+}
+
+/**
+ * Creation body. `vehicleId` is absent on purpose: the vehicle comes from the
+ * route, and carrying it in the body too would invite the two to disagree.
+ * `status` and `completedAt` are absent because a record is always created
+ * OPEN and the lifecycle moves only through its own endpoints.
+ *
+ * `odometer` and `cost` are optional over a nullable type because an omitted
+ * key and an explicit null are different requests to this API.
+ */
+export interface CreateMaintenanceInput {
+  readonly category: MaintenanceCategory;
+  readonly startedAt: string;
+  readonly description: string;
+  readonly odometer?: number | null;
+  readonly cost?: string | null;
+}
+
+/** Editable fields only; the caller sends just what changed. */
+export type UpdateMaintenanceInput = Partial<CreateMaintenanceInput>;
+
+/**
+ * Completion finalizes both facts at once, so both keys are required — an
+ * omitted cost and an explicit null mean different things to the API, and
+ * only the second is a caller deliberately recording no final cost.
+ */
+export interface CompleteMaintenanceInput {
+  readonly completedAt: string;
+  readonly cost: string | null;
+}
+
+/**
+ * Three filters and paging, and nothing else. There is deliberately no `q`
+ * (the API has no free-text search over maintenance), no sort control, and no
+ * trip or driver filter — a maintenance record has neither.
+ */
+export interface ListMaintenanceQuery {
+  readonly vehicleId?: string;
+  readonly status?: MaintenanceStatus | '';
+  readonly category?: MaintenanceCategory | '';
+  readonly page?: number;
+  readonly pageSize?: number;
+}
+
+function maintenanceListPath(query: ListMaintenanceQuery): string {
+  const params = new URLSearchParams();
+  if (query.vehicleId) {
+    params.set('vehicleId', query.vehicleId);
+  }
+  if (query.status) {
+    params.set('status', query.status);
+  }
+  if (query.category) {
+    params.set('category', query.category);
+  }
+  if (query.page !== undefined) {
+    params.set('page', String(query.page));
+  }
+  if (query.pageSize !== undefined) {
+    params.set('pageSize', String(query.pageSize));
+  }
+  const search = params.toString();
+  return search ? `/maintenance?${search}` : '/maintenance';
+}
+
+export function listMaintenance(
+  query: ListMaintenanceQuery = {},
+): Promise<AdminApiResult<Page<MaintenanceRecord>>> {
+  return request(maintenanceListPath(query), {}, (value) =>
+    parsePage(value, parseMaintenanceRecord),
+  );
+}
+
+export function getMaintenance(
+  id: string,
+): Promise<AdminApiResult<MaintenanceRecord>> {
+  return request(
+    `/maintenance/${encodeURIComponent(id)}`,
+    {},
+    parseMaintenanceRecord,
+  );
+}
+
+/**
+ * Creation is vehicle-scoped because the API says so: a maintenance record
+ * only exists against a vehicle. The answer is 201, which the shared
+ * `response.ok` handling already accepts.
+ *
+ * Deliberately no eligibility check on the vehicle's status. Maintenance is
+ * independent of `Vehicle.status` (ADR 0010), so a RETIRED vehicle can still
+ * have work recorded against it.
+ */
+export function createVehicleMaintenance(
+  vehicleId: string,
+  input: CreateMaintenanceInput,
+): Promise<AdminApiResult<MaintenanceRecord>> {
+  return request(
+    `/vehicles/${encodeURIComponent(vehicleId)}/maintenance`,
+    { method: 'POST', body: input },
+    parseMaintenanceRecord,
+  );
+}
+
+export function updateMaintenance(
+  id: string,
+  patch: UpdateMaintenanceInput,
+): Promise<AdminApiResult<MaintenanceRecord>> {
+  return request(
+    `/maintenance/${encodeURIComponent(id)}`,
+    { method: 'PATCH', body: patch },
+    parseMaintenanceRecord,
+  );
+}
+
+/**
+ * Completion sends a JSON body, unlike cancellation.
+ *
+ * The input type already requires both keys, so `cost: null` is serialized
+ * rather than dropped — `JSON.stringify` keeps an explicit null and only
+ * omits `undefined`, which is exactly the distinction the API depends on.
+ */
+export function completeMaintenance(
+  id: string,
+  input: CompleteMaintenanceInput,
+): Promise<AdminApiResult<MaintenanceRecord>> {
+  return request(
+    `/maintenance/${encodeURIComponent(id)}/complete`,
+    { method: 'POST', body: input },
+    parseMaintenanceRecord,
+  );
+}
+
+/**
+ * Cancellation takes no request body at all — not even an empty object —
+ * exactly like the trip lifecycle transitions. The API normalizes an absent
+ * body to `{}` itself, so sending one would only add a content-type header
+ * the server does not need.
+ */
+export function cancelMaintenance(
+  id: string,
+): Promise<AdminApiResult<MaintenanceRecord>> {
+  return request(
+    `/maintenance/${encodeURIComponent(id)}/cancel`,
+    { method: 'POST' },
+    parseMaintenanceRecord,
+  );
+}
+
 /**
  * Safe, user-facing text for a failed call; never raw server output.
  *
@@ -1009,6 +1244,13 @@ const ERROR_MESSAGES: Readonly<Record<string, string>> = {
     'The uploaded file does not match the receipt details. Choose the file again and retry.',
   receipt_storage_unavailable:
     'Receipt storage is not available right now. Expense details and review are unaffected — please try the receipt again later.',
+  maintenance_not_found: 'This maintenance record no longer exists.',
+  maintenance_not_editable:
+    'This maintenance record can no longer be edited. Refresh to see its current status.',
+  maintenance_not_completable:
+    'This maintenance record can no longer be completed. Refresh to see its current status.',
+  maintenance_not_cancellable:
+    'This maintenance record can no longer be cancelled. Refresh to see its current status.',
   invalid_request: 'Please check the values you entered.',
   too_many_requests: 'Too many attempts. Please wait a minute and try again.',
 };

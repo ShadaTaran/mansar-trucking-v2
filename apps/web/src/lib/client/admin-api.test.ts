@@ -1,12 +1,18 @@
-import { TRIP_STATUSES } from '@mansar/types';
+import {
+  MAINTENANCE_CATEGORIES,
+  MAINTENANCE_STATUSES,
+  TRIP_STATUSES,
+} from '@mansar/types';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   adminErrorMessage,
   approveExpense,
   assignTrip,
+  cancelMaintenance,
   cancelTrip,
   closeTrip,
+  completeMaintenance,
   confirmExpenseReceipt,
   createDriver,
   createReceiptReadAuthorization,
@@ -14,14 +20,17 @@ import {
   createTrip,
   createTripExpense,
   createVehicle,
+  createVehicleMaintenance,
   getDriver,
   getExpense,
   getExpenseReceipt,
+  getMaintenance,
   getTrip,
   getVehicle,
   linkDriverUser,
   listDrivers,
   listExpenses,
+  listMaintenance,
   listTrips,
   listVehicles,
   rejectExpense,
@@ -29,6 +38,7 @@ import {
   setVehicleStatus,
   unlinkDriverUser,
   updateDriver,
+  updateMaintenance,
   updateTrip,
   updateVehicle,
   verifyTrip,
@@ -1146,6 +1156,467 @@ describe('adminErrorMessage', () => {
     );
     expect(
       adminErrorMessage({ status: 400, validationMessages: ['x is required'] }),
+    ).toBe('Please check the values you entered.');
+  });
+});
+
+const MAINTENANCE_ID = '019a0000-0000-7000-8000-00000000007c';
+
+const MAINTENANCE = {
+  id: MAINTENANCE_ID,
+  vehicleId: VEHICLE_ID,
+  status: 'OPEN',
+  category: 'PREVENTIVE',
+  startedAt: '2026-09-24T00:30:00.000Z',
+  completedAt: null,
+  odometer: 125000,
+  cost: '12500.00',
+  description: 'Synthetic preventive service',
+  createdAt: '2026-09-24T01:00:00.000Z',
+  updatedAt: '2026-09-24T01:00:00.000Z',
+};
+
+const MAINTENANCE_PAGE = {
+  items: [MAINTENANCE],
+  page: 1,
+  pageSize: 25,
+  total: 1,
+};
+
+describe('maintenance parsing', () => {
+  it('parses the whole wire shape exactly', async () => {
+    installFetch(() => json(200, MAINTENANCE));
+    const result = await getMaintenance(MAINTENANCE_ID);
+    expect(result).toEqual({ ok: true, data: MAINTENANCE });
+  });
+
+  it('rebuilds the record field by field rather than casting the payload', async () => {
+    // An extra upstream property must not ride along into the UI.
+    installFetch(() =>
+      json(200, { ...MAINTENANCE, vehiclePlateNumber: 'SYN 0001' }),
+    );
+    const result = await getMaintenance(MAINTENANCE_ID);
+    expect(result.ok && Object.keys(result.data).sort()).toEqual([
+      'category',
+      'completedAt',
+      'cost',
+      'createdAt',
+      'description',
+      'id',
+      'odometer',
+      'startedAt',
+      'status',
+      'updatedAt',
+      'vehicleId',
+    ]);
+  });
+
+  it.each([...MAINTENANCE_STATUSES])('parses the status %s', async (status) => {
+    // COMPLETED carries a completion instant; the other two do not.
+    const completedAt =
+      status === 'COMPLETED' ? '2026-09-25T02:00:00.000Z' : null;
+    installFetch(() => json(200, { ...MAINTENANCE, status, completedAt }));
+    const result = await getMaintenance(MAINTENANCE_ID);
+    expect(result.ok && result.data.status).toBe(status);
+    expect(result.ok && result.data.completedAt).toBe(completedAt);
+  });
+
+  it.each([...MAINTENANCE_CATEGORIES])(
+    'parses the category %s',
+    async (category) => {
+      installFetch(() => json(200, { ...MAINTENANCE, category }));
+      const result = await getMaintenance(MAINTENANCE_ID);
+      expect(result.ok && result.data.category).toBe(category);
+    },
+  );
+
+  it.each([[null], ['0.00'], ['99.50'], ['9999999999.99']])(
+    'accepts the response cost %s as given',
+    async (cost) => {
+      installFetch(() => json(200, { ...MAINTENANCE, cost }));
+      const result = await getMaintenance(MAINTENANCE_ID);
+      expect(result.ok && result.data.cost).toBe(cost);
+      if (cost !== null) {
+        // Never routed through Number: it stays the exact string.
+        expect(result.ok && typeof result.data.cost).toBe('string');
+      }
+    },
+  );
+
+  it('accepts a zero cost, which an expense amount would refuse', async () => {
+    installFetch(() => json(200, { ...MAINTENANCE, cost: '0.00' }));
+    const result = await getMaintenance(MAINTENANCE_ID);
+    expect(result.ok && result.data.cost).toBe('0.00');
+  });
+
+  it.each([[null], [0], [125000]])(
+    'accepts the odometer %s',
+    async (odometer) => {
+      installFetch(() => json(200, { ...MAINTENANCE, odometer }));
+      const result = await getMaintenance(MAINTENANCE_ID);
+      expect(result.ok && result.data.odometer).toBe(odometer);
+    },
+  );
+
+  it('accepts an empty description', async () => {
+    installFetch(() => json(200, { ...MAINTENANCE, description: '' }));
+    const result = await getMaintenance(MAINTENANCE_ID);
+    expect(result.ok && result.data.description).toBe('');
+  });
+
+  it.each([
+    ['an unknown status', { status: 'IN_PROGRESS' }],
+    ['a lowercase status', { status: 'open' }],
+    ['an expense status', { status: 'SUBMITTED' }],
+    ['an unknown category', { category: 'BODYWORK' }],
+    ['a lowercase category', { category: 'repair' }],
+    ['an expense category', { category: 'FUEL' }],
+    ['a cost with one fractional digit', { cost: '99.5' }],
+    ['a cost with no fractional digits', { cost: '99' }],
+    ['a cost with three fractional digits', { cost: '99.500' }],
+    ['a negative cost', { cost: '-1.00' }],
+    ['a cost in exponent notation', { cost: '1e3' }],
+    ['a cost with eleven integer digits', { cost: '10000000000.00' }],
+    ['a numeric cost', { cost: 12500 }],
+    ['a numeric zero cost', { cost: 0 }],
+    ['a fractional odometer', { odometer: 1.5 }],
+    ['a string odometer', { odometer: '125000' }],
+    ['a missing id', { id: undefined }],
+    ['a missing vehicleId', { vehicleId: undefined }],
+    ['a missing startedAt', { startedAt: undefined }],
+    ['a missing description', { description: undefined }],
+    ['a missing createdAt', { createdAt: undefined }],
+    ['a missing updatedAt', { updatedAt: undefined }],
+    ['a missing status', { status: undefined }],
+    ['a missing category', { category: undefined }],
+    ['a missing completedAt', { completedAt: undefined }],
+    ['a non-string vehicleId', { vehicleId: 7 }],
+    ['a non-string description', { description: 7 }],
+  ])('fails closed on %s', async (_label, patch) => {
+    installFetch(() => json(200, { ...MAINTENANCE, ...patch }));
+    const result = await getMaintenance(MAINTENANCE_ID);
+    expect(result).toEqual({
+      ok: false,
+      status: 200,
+      code: 'invalid_response',
+    });
+  });
+
+  it.each([
+    ['a string payload', 'maintenance'],
+    ['an array payload', [MAINTENANCE]],
+    ['a null payload', null],
+    ['a numeric payload', 7],
+  ])('fails closed on %s', async (_label, body) => {
+    installFetch(() => json(200, body));
+    const result = await getMaintenance(MAINTENANCE_ID);
+    expect(result).toEqual({
+      ok: false,
+      status: 200,
+      code: 'invalid_response',
+    });
+  });
+
+  it('invalidates the whole page when one item is malformed', async () => {
+    installFetch(() =>
+      json(200, {
+        ...MAINTENANCE_PAGE,
+        items: [MAINTENANCE, { ...MAINTENANCE, status: 'IN_PROGRESS' }],
+        total: 2,
+      }),
+    );
+    const result = await listMaintenance();
+    // Half a page is never better than none: a partial listing would look
+    // authoritative while silently hiding a record.
+    expect(result).toEqual({
+      ok: false,
+      status: 200,
+      code: 'invalid_response',
+    });
+  });
+
+  it('invalidates a page whose envelope is malformed', async () => {
+    installFetch(() => json(200, { ...MAINTENANCE_PAGE, total: '1' }));
+    const result = await listMaintenance();
+    expect(result).toEqual({
+      ok: false,
+      status: 200,
+      code: 'invalid_response',
+    });
+  });
+
+  it('parses a well-formed page', async () => {
+    installFetch(() => json(200, MAINTENANCE_PAGE));
+    const result = await listMaintenance();
+    expect(result).toEqual({ ok: true, data: MAINTENANCE_PAGE });
+  });
+});
+
+describe('maintenance requests', () => {
+  it('serializes only the supplied list filters', async () => {
+    const calls = installFetch(() => json(200, MAINTENANCE_PAGE));
+    await listMaintenance({
+      vehicleId: VEHICLE_ID,
+      status: 'COMPLETED',
+      category: 'REPAIR',
+      page: 2,
+      pageSize: 50,
+    });
+    expect(calls).toEqual([
+      {
+        url: `/api/backend/maintenance?vehicleId=${VEHICLE_ID}&status=COMPLETED&category=REPAIR&page=2&pageSize=50`,
+        method: 'GET',
+        body: undefined,
+        headers: undefined,
+      },
+    ]);
+  });
+
+  it('omits every absent filter', async () => {
+    const calls = installFetch(() => json(200, MAINTENANCE_PAGE));
+    await listMaintenance();
+    expect(calls[0]!.url).toBe('/api/backend/maintenance');
+  });
+
+  it('treats an empty status or category as no filter at all', async () => {
+    const calls = installFetch(() => json(200, MAINTENANCE_PAGE));
+    await listMaintenance({ status: '', category: '', page: 1, pageSize: 25 });
+    expect(calls[0]!.url).toBe('/api/backend/maintenance?page=1&pageSize=25');
+  });
+
+  it('never sends a search, sort, trip or driver parameter', async () => {
+    const calls = installFetch(() => json(200, MAINTENANCE_PAGE));
+    await listMaintenance({
+      vehicleId: VEHICLE_ID,
+      status: 'OPEN',
+      category: 'TIRE',
+      page: 1,
+      pageSize: 25,
+    });
+    for (const forbidden of ['q=', 'sort=', 'tripId=', 'driverId=']) {
+      expect(calls[0]!.url).not.toContain(forbidden);
+    }
+  });
+
+  it('reads one record by id', async () => {
+    const calls = installFetch(() => json(200, MAINTENANCE));
+    await getMaintenance(MAINTENANCE_ID);
+    expect(calls).toEqual([
+      {
+        url: `/api/backend/maintenance/${MAINTENANCE_ID}`,
+        method: 'GET',
+        body: undefined,
+        headers: undefined,
+      },
+    ]);
+  });
+
+  it('creates against the vehicle route, with the vehicle only in the path', async () => {
+    const calls = installFetch(() => json(201, MAINTENANCE));
+    await createVehicleMaintenance(VEHICLE_ID, {
+      category: 'PREVENTIVE',
+      startedAt: '2026-09-24T00:30:00.000Z',
+      description: 'Synthetic preventive service',
+      odometer: 125000,
+      cost: '12500.00',
+    });
+    expect(calls[0]!.url).toBe(
+      `/api/backend/vehicles/${VEHICLE_ID}/maintenance`,
+    );
+    expect(calls[0]!.method).toBe('POST');
+    expect(calls[0]!.body).toEqual({
+      category: 'PREVENTIVE',
+      startedAt: '2026-09-24T00:30:00.000Z',
+      description: 'Synthetic preventive service',
+      odometer: 125000,
+      cost: '12500.00',
+    });
+    // The API rejects an unknown property, and a vehicleId in the body could
+    // disagree with the one in the route.
+    expect(calls[0]!.body).not.toHaveProperty('vehicleId');
+    expect(calls[0]!.body).not.toHaveProperty('status');
+    expect(calls[0]!.body).not.toHaveProperty('completedAt');
+  });
+
+  it('creates with the optional fields explicitly null', async () => {
+    const calls = installFetch(() => json(201, MAINTENANCE));
+    await createVehicleMaintenance(VEHICLE_ID, {
+      category: 'OTHER',
+      startedAt: '2026-09-24T00:30:00.000Z',
+      description: '',
+      odometer: null,
+      cost: null,
+    });
+    expect(calls[0]!.body).toEqual({
+      category: 'OTHER',
+      startedAt: '2026-09-24T00:30:00.000Z',
+      description: '',
+      odometer: null,
+      cost: null,
+    });
+  });
+
+  it('creates with the optional fields omitted', async () => {
+    const calls = installFetch(() => json(201, MAINTENANCE));
+    await createVehicleMaintenance(VEHICLE_ID, {
+      category: 'INSPECTION',
+      startedAt: '2026-09-24T00:30:00.000Z',
+      description: 'Synthetic annual inspection',
+    });
+    expect(Object.keys(calls[0]!.body as object).sort()).toEqual([
+      'category',
+      'description',
+      'startedAt',
+    ]);
+  });
+
+  it('patches only the supplied fields', async () => {
+    const calls = installFetch(() => json(200, MAINTENANCE));
+    await updateMaintenance(MAINTENANCE_ID, { description: 'Synthetic note' });
+    expect(calls[0]!.url).toBe(`/api/backend/maintenance/${MAINTENANCE_ID}`);
+    expect(calls[0]!.method).toBe('PATCH');
+    expect(calls[0]!.body).toEqual({ description: 'Synthetic note' });
+  });
+
+  it('patches an explicit null to clear odometer and cost', async () => {
+    const calls = installFetch(() => json(200, MAINTENANCE));
+    await updateMaintenance(MAINTENANCE_ID, { odometer: null, cost: null });
+    // An omitted key and an explicit null are different requests here.
+    expect(calls[0]!.body).toEqual({ odometer: null, cost: null });
+    expect(Object.keys(calls[0]!.body as object).sort()).toEqual([
+      'cost',
+      'odometer',
+    ]);
+  });
+
+  it('completes with both keys, including a null cost', async () => {
+    const calls = installFetch(() =>
+      json(200, {
+        ...MAINTENANCE,
+        status: 'COMPLETED',
+        completedAt: '2026-09-25T02:00:00.000Z',
+        cost: null,
+      }),
+    );
+    await completeMaintenance(MAINTENANCE_ID, {
+      completedAt: '2026-09-25T02:00:00.000Z',
+      cost: null,
+    });
+    expect(calls[0]!.url).toBe(
+      `/api/backend/maintenance/${MAINTENANCE_ID}/complete`,
+    );
+    expect(calls[0]!.method).toBe('POST');
+    expect(calls[0]!.body).toEqual({
+      completedAt: '2026-09-25T02:00:00.000Z',
+      cost: null,
+    });
+    // The API requires the key: omitting it is a 400, not a null cost.
+    expect(Object.keys(calls[0]!.body as object).sort()).toEqual([
+      'completedAt',
+      'cost',
+    ]);
+  });
+
+  it('completes with a zero final cost as a string', async () => {
+    const calls = installFetch(() =>
+      json(200, { ...MAINTENANCE, status: 'COMPLETED', cost: '0.00' }),
+    );
+    await completeMaintenance(MAINTENANCE_ID, {
+      completedAt: '2026-09-25T02:00:00.000Z',
+      cost: '0.00',
+    });
+    expect(calls[0]!.body).toEqual({
+      completedAt: '2026-09-25T02:00:00.000Z',
+      cost: '0.00',
+    });
+  });
+
+  it('cancels with no request body at all', async () => {
+    const calls = installFetch(() =>
+      json(200, { ...MAINTENANCE, status: 'CANCELLED' }),
+    );
+    await cancelMaintenance(MAINTENANCE_ID);
+    expect(calls).toEqual([
+      {
+        url: `/api/backend/maintenance/${MAINTENANCE_ID}/cancel`,
+        method: 'POST',
+        body: undefined,
+        headers: undefined,
+      },
+    ]);
+  });
+
+  it('never touches the vehicle status endpoint', async () => {
+    const calls = installFetch(() => json(200, MAINTENANCE));
+    await updateMaintenance(MAINTENANCE_ID, { category: 'REPAIR' });
+    await cancelMaintenance(MAINTENANCE_ID);
+    for (const call of calls) {
+      expect(call.url).not.toContain('/status');
+    }
+  });
+
+  it('surfaces a lifecycle conflict as its own code', async () => {
+    installFetch(() =>
+      json(409, { statusCode: 409, message: 'maintenance_not_editable' }),
+    );
+    const result = await updateMaintenance(MAINTENANCE_ID, {
+      category: 'REPAIR',
+    });
+    expect(result).toEqual({
+      ok: false,
+      status: 409,
+      code: 'maintenance_not_editable',
+    });
+  });
+});
+
+describe('maintenance error wording', () => {
+  it.each([
+    ['maintenance_not_found', 'This maintenance record no longer exists.'],
+    [
+      'maintenance_not_editable',
+      'This maintenance record can no longer be edited. Refresh to see its current status.',
+    ],
+    [
+      'maintenance_not_completable',
+      'This maintenance record can no longer be completed. Refresh to see its current status.',
+    ],
+    [
+      'maintenance_not_cancellable',
+      'This maintenance record can no longer be cancelled. Refresh to see its current status.',
+    ],
+  ])('maps %s', (code, message) => {
+    expect(adminErrorMessage({ status: 409, code })).toBe(message);
+  });
+
+  it('never leaks database or ORM internals through a maintenance error', () => {
+    for (const code of [
+      'maintenance_not_found',
+      'maintenance_not_editable',
+      'maintenance_not_completable',
+      'maintenance_not_cancellable',
+    ]) {
+      const message = adminErrorMessage({ status: 409, code });
+      for (const forbidden of [
+        'prisma',
+        'select',
+        'update',
+        'constraint',
+        'maintenance_records',
+        '23514',
+      ]) {
+        expect(message.toLowerCase()).not.toContain(forbidden);
+      }
+    }
+  });
+
+  it('uses the existing generic wording for a chronology 400', () => {
+    // The API answers a completedAt-before-startedAt body with a plain 400.
+    expect(
+      adminErrorMessage({
+        status: 400,
+        code: 'completedAt must be on or after startedAt',
+      }),
     ).toBe('Please check the values you entered.');
   });
 });

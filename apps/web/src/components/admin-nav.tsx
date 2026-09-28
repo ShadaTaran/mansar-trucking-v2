@@ -6,10 +6,16 @@ import { useState } from 'react';
 
 import { requestLogout } from '@/lib/client/logout';
 
+/**
+ * Maintenance sits directly after Vehicles: it is fleet work on fleet master
+ * data, so the two belong next to each other and both come before the
+ * operational sections that consume a vehicle.
+ */
 const LINKS = [
   { href: '/dashboard', label: 'Dashboard' },
   { href: '/drivers', label: 'Drivers' },
   { href: '/vehicles', label: 'Vehicles' },
+  { href: '/maintenance', label: 'Maintenance' },
   { href: '/trips', label: 'Trips' },
   { href: '/expenses', label: 'Expenses' },
 ] as const;

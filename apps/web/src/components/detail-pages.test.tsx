@@ -45,14 +45,33 @@ const VEHICLE = {
 };
 
 function installFetch(handler: (url: string) => Response) {
+  const urls: string[] = [];
   vi.stubGlobal(
     'fetch',
-    vi.fn(async (input: RequestInfo | URL) => handler(String(input))),
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      urls.push(url);
+      return handler(url);
+    }),
   );
+  return urls;
 }
 
 const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), { status });
+
+const EMPTY_MAINTENANCE_PAGE = { items: [], page: 1, pageSize: 25, total: 0 };
+
+/**
+ * VehicleDetail now embeds the maintenance section, so the two requests it
+ * makes have to be told apart. A single catch-all would hand a Vehicle object
+ * to the maintenance parser, which correctly refuses it — a failure that would
+ * look like a bug in this component rather than in the mock.
+ */
+const vehicleScene = (url: string) =>
+  url.startsWith('/api/backend/maintenance')
+    ? json(200, EMPTY_MAINTENANCE_PAGE)
+    : json(200, VEHICLE);
 
 beforeEach(() => {
   resetAuthenticatedFetchForTests();
@@ -117,10 +136,12 @@ describe('DriverDetail', () => {
 
 describe('VehicleDetail', () => {
   it('loads the record and offers editing and the status control', async () => {
-    installFetch(() => json(200, VEHICLE));
+    installFetch(vehicleScene);
     render(<VehicleDetail vehicleId={VEHICLE_ID} />);
 
-    expect(screen.getByRole('status')).toHaveTextContent('Loading vehicle…');
+    expect(screen.getAllByRole('status')[0]).toHaveTextContent(
+      'Loading vehicle…',
+    );
 
     expect(
       await screen.findByRole('heading', { level: 1, name: 'SYN 0001' }),
@@ -130,6 +151,36 @@ describe('VehicleDetail', () => {
       'IN_MAINTENANCE',
     );
     expect(screen.getByText('2026-09-01 08:30 UTC')).toBeInTheDocument();
+  });
+
+  it('shows the maintenance section once the vehicle has loaded', async () => {
+    const urls = installFetch(vehicleScene);
+    render(<VehicleDetail vehicleId={VEHICLE_ID} />);
+
+    expect(
+      await screen.findByRole('heading', { level: 2, name: 'Maintenance' }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Recording maintenance does not change the vehicle's operational status.",
+      ),
+    ).toBeInTheDocument();
+    // Scoped to this vehicle, with no status filter: the vehicle's page shows
+    // its whole history, not just the outstanding work.
+    expect(urls).toContain(
+      `/api/backend/maintenance?vehicleId=${VEHICLE_ID}&page=1&pageSize=25`,
+    );
+    expect(urls.some((url) => url.includes('status='))).toBe(false);
+  });
+
+  it('offers maintenance entry even though this vehicle is IN_MAINTENANCE', async () => {
+    // Vehicle.status is not an eligibility input for maintenance (ADR 0010).
+    installFetch(vehicleScene);
+    render(<VehicleDetail vehicleId={VEHICLE_ID} />);
+
+    expect(
+      await screen.findByRole('button', { name: 'Add maintenance' }),
+    ).toBeEnabled();
   });
 
   it('shows a clear not-found state', async () => {

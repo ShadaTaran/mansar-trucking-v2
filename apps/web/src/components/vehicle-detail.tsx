@@ -7,6 +7,7 @@ import { useEffect, useState } from 'react';
 import { adminErrorMessage, getVehicle } from '@/lib/client/admin-api';
 
 import { VehicleForm } from './vehicle-form';
+import { VehicleMaintenance } from './vehicle-maintenance';
 import { VehicleStatusControl } from './vehicle-status';
 
 /** Readable UTC timestamp; no timezone business logic. */
@@ -96,6 +97,10 @@ export function VehicleDetail({ vehicleId }: { readonly vehicleId: string }) {
 
       <VehicleForm vehicle={vehicle} onSaved={setVehicle} />
       <VehicleStatusControl vehicle={vehicle} onChanged={setVehicle} />
+      {/* Given only the id: maintenance is independent of the operational
+          status above it, so the status is not an input to this section and a
+          RETIRED vehicle can still have work recorded (ADR 0010). */}
+      <VehicleMaintenance vehicleId={vehicle.id} />
     </main>
   );
 }

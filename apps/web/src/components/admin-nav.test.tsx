@@ -36,7 +36,7 @@ afterEach(() => {
 });
 
 describe('AdminNav', () => {
-  it('links to the five admin areas', () => {
+  it('links to the six admin areas', () => {
     render(<AdminNav />);
     expect(screen.getByRole('link', { name: 'Dashboard' })).toHaveAttribute(
       'href',
@@ -49,6 +49,10 @@ describe('AdminNav', () => {
     expect(screen.getByRole('link', { name: 'Vehicles' })).toHaveAttribute(
       'href',
       '/vehicles',
+    );
+    expect(screen.getByRole('link', { name: 'Maintenance' })).toHaveAttribute(
+      'href',
+      '/maintenance',
     );
     expect(screen.getByRole('link', { name: 'Trips' })).toHaveAttribute(
       'href',
@@ -64,14 +68,22 @@ describe('AdminNav', () => {
     render(<AdminNav />);
     const links = screen.getAllByRole('link').map((link) => link.textContent);
     // Expenses comes last: overview, then master data, then operations,
-    // and an expense only exists downstream of a trip.
+    // and an expense only exists downstream of a trip. Maintenance sits with
+    // Vehicles because it is work on that master data, not an operation on it.
     expect(links).toEqual([
       'Dashboard',
       'Drivers',
       'Vehicles',
+      'Maintenance',
       'Trips',
       'Expenses',
     ]);
+  });
+
+  it('places Maintenance directly after Vehicles', () => {
+    render(<AdminNav />);
+    const links = screen.getAllByRole('link').map((link) => link.textContent);
+    expect(links.indexOf('Maintenance')).toBe(links.indexOf('Vehicles') + 1);
   });
 
   it('marks the current section, including its sub-routes', () => {
@@ -97,11 +109,51 @@ describe('AdminNav', () => {
       'aria-current',
       'page',
     );
-    for (const other of ['Dashboard', 'Drivers', 'Vehicles', 'Expenses']) {
+    for (const other of [
+      'Dashboard',
+      'Drivers',
+      'Vehicles',
+      'Maintenance',
+      'Expenses',
+    ]) {
       expect(screen.getByRole('link', { name: other })).not.toHaveAttribute(
         'aria-current',
       );
     }
+  });
+
+  it('marks Maintenance current on /maintenance', () => {
+    pathname.value = '/maintenance';
+    render(<AdminNav />);
+    expect(screen.getByRole('link', { name: 'Maintenance' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+    for (const other of [
+      'Dashboard',
+      'Drivers',
+      'Vehicles',
+      'Trips',
+      'Expenses',
+    ]) {
+      expect(screen.getByRole('link', { name: other })).not.toHaveAttribute(
+        'aria-current',
+      );
+    }
+  });
+
+  it('does not mark Maintenance current on a vehicle route', () => {
+    // The two are adjacent in the nav but are separate sections: a vehicle
+    // page is not a maintenance page, even though it embeds that section.
+    pathname.value = '/vehicles/019a0000-0000-7000-8000-00000000000e';
+    render(<AdminNav />);
+    expect(screen.getByRole('link', { name: 'Vehicles' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+    expect(
+      screen.getByRole('link', { name: 'Maintenance' }),
+    ).not.toHaveAttribute('aria-current');
   });
 
   it.each(['/expenses', '/expenses/019a0000-0000-7000-8000-000000000002'])(
@@ -113,7 +165,13 @@ describe('AdminNav', () => {
         'aria-current',
         'page',
       );
-      for (const other of ['Dashboard', 'Drivers', 'Vehicles', 'Trips']) {
+      for (const other of [
+        'Dashboard',
+        'Drivers',
+        'Vehicles',
+        'Maintenance',
+        'Trips',
+      ]) {
         expect(screen.getByRole('link', { name: other })).not.toHaveAttribute(
           'aria-current',
         );

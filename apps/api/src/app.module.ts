@@ -5,6 +5,7 @@ import { DatabaseModule } from './database/database.module.js';
 import { DriversModule } from './drivers/drivers.module.js';
 import { ExpensesModule } from './expenses/expenses.module.js';
 import { HealthController } from './health/health.controller.js';
+import { MaintenanceModule } from './maintenance/maintenance.module.js';
 import { ReceiptsModule } from './receipts/receipts.module.js';
 import { TripsModule } from './trips/trips.module.js';
 import { VehiclesModule } from './vehicles/vehicles.module.js';
@@ -18,6 +19,7 @@ import { VehiclesModule } from './vehicles/vehicles.module.js';
     TripsModule,
     ExpensesModule,
     ReceiptsModule,
+    MaintenanceModule,
   ],
   controllers: [HealthController],
 })

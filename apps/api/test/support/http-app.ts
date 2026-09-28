@@ -7,6 +7,7 @@ import { AppModule } from '../../src/app.module.js';
 import { configureApp } from '../../src/app.setup.js';
 import { AuthService } from '../../src/auth/auth.service.js';
 import { PrismaService } from '../../src/database/prisma.service.js';
+import { MaintenanceService } from '../../src/maintenance/maintenance.service.js';
 import { DriversService } from '../../src/drivers/drivers.service.js';
 import { TripsService } from '../../src/trips/trips.service.js';
 import { VehiclesService } from '../../src/vehicles/vehicles.service.js';
@@ -34,6 +35,7 @@ export interface TestAppOptions {
   readonly driversService?: object;
   readonly vehiclesService?: object;
   readonly tripsService?: object;
+  readonly maintenanceService?: object;
   readonly trustProxyHops?: number;
   /** Raw RATE_LIMIT_CLIENT_IP_SOURCE value for this app; omitted = unset. */
   readonly rateLimitClientIpSource?: string;
@@ -72,6 +74,11 @@ export async function createTestApp(
       builder = builder
         .overrideProvider(TripsService)
         .useValue(options.tripsService);
+    }
+    if (options.maintenanceService) {
+      builder = builder
+        .overrideProvider(MaintenanceService)
+        .useValue(options.maintenanceService);
     }
     const moduleRef = await builder.compile();
     const app = configureApp(moduleRef.createNestApplication(), {

@@ -15,6 +15,7 @@ import {
   type ReceiptUploadAuthorization,
   type Trip,
   TRIP_STATUSES,
+  type TripLocationSample,
   type TripStatus,
   VEHICLE_STATUSES,
   type VehicleStatus,
@@ -231,6 +232,107 @@ describe('@mansar/types', () => {
     expect(Object.keys(authorization)).toEqual(['url', 'expiresAt']);
     expect(Object.keys(authorization)).not.toContain('objectKey');
     expect(Object.keys(authorization)).not.toContain('bucket');
+  });
+
+  it('describes a location sample as eight trip-scoped wire fields', () => {
+    const sample: TripLocationSample = {
+      id: '019a0000-0000-7000-8000-000000000004',
+      tripId: '019a0000-0000-7000-8000-000000000001',
+      sampleId: '019a0000-0000-7000-8000-0000000000a1',
+      latitude: 14.599512,
+      longitude: 120.984222,
+      accuracy: 8.5,
+      recordedAt: '2026-09-01T00:00:00.000Z',
+      receivedAt: '2026-09-01T00:00:30.000Z',
+    };
+
+    expect(Object.keys(sample)).toEqual([
+      'id',
+      'tripId',
+      'sampleId',
+      'latitude',
+      'longitude',
+      'accuracy',
+      'recordedAt',
+      'receivedAt',
+    ]);
+    // Ownership is the trip (ADR 0004). A driver, vehicle, login or device
+    // column here is exactly the affordance that would make a free-standing
+    // location timeline easy to query by accident.
+    for (const absent of [
+      'driverId',
+      'vehicleId',
+      'userId',
+      'deviceId',
+      'createdAt',
+      'updatedAt',
+      'speed',
+      'heading',
+      'altitude',
+      'provider',
+      'isMock',
+      'mockLocation',
+      'status',
+    ]) {
+      expect(Object.keys(sample)).not.toContain(absent);
+    }
+  });
+
+  it('carries coordinates as numbers and both instants as strings', () => {
+    const sample: TripLocationSample = {
+      id: '019a0000-0000-7000-8000-000000000004',
+      tripId: '019a0000-0000-7000-8000-000000000001',
+      sampleId: '019a0000-0000-7000-8000-0000000000a2',
+      latitude: -33.8688,
+      longitude: 151.2093,
+      accuracy: 0,
+      recordedAt: '2026-09-01T00:00:00.000Z',
+      receivedAt: '2026-09-01T00:00:00.000Z',
+    };
+
+    // A position is a measurement, not money: no decimal-string rule applies.
+    expect(typeof sample.latitude).toBe('number');
+    expect(typeof sample.longitude).toBe('number');
+    expect(typeof sample.accuracy).toBe('number');
+    // Instants cross the boundary as ISO 8601 strings, as everywhere else.
+    expect(typeof sample.recordedAt).toBe('string');
+    expect(typeof sample.receivedAt).toBe('string');
+  });
+
+  it('leaves accuracy nullable, because a device may report none', () => {
+    const unknown: TripLocationSample['accuracy'] = null;
+    const reported: TripLocationSample['accuracy'] = 12.25;
+    expect(unknown).toBeNull();
+    expect(typeof reported).toBe('number');
+  });
+
+  it('distinguishes a late offline delivery from a current fix', () => {
+    // receivedAt may be far later than recordedAt: the sample was captured
+    // while the trip ran and uploaded once connectivity returned (ADR 0011).
+    const late: TripLocationSample = {
+      id: '019a0000-0000-7000-8000-000000000005',
+      tripId: '019a0000-0000-7000-8000-000000000001',
+      sampleId: '019a0000-0000-7000-8000-0000000000a3',
+      latitude: 14.6,
+      longitude: 121.0,
+      accuracy: null,
+      recordedAt: '2026-09-01T02:00:00.000Z',
+      receivedAt: '2026-09-01T09:30:00.000Z',
+    };
+
+    expect(Date.parse(late.receivedAt)).toBeGreaterThan(
+      Date.parse(late.recordedAt),
+    );
+  });
+
+  it('pages location samples with the shared Page type', () => {
+    const page: Page<TripLocationSample> = {
+      items: [],
+      page: 1,
+      pageSize: 25,
+      total: 0,
+    };
+    expect(page.items).toEqual([]);
   });
 
   it('pages trips with the shared Page type', () => {

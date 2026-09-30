@@ -311,6 +311,53 @@ export interface MaintenanceRecord {
 }
 
 /**
+ * One position observed during a trip, as the API returns it.
+ *
+ * Trip-scoped by construction (ADR 0004): the sample carries no driver, no
+ * vehicle, no login identity and no device, because ownership is the trip and
+ * location history is never a free-standing driver or vehicle timeline. There
+ * is no status and no lifecycle — a sample is an immutable observation, which
+ * is also why it carries no `updatedAt`.
+ *
+ * Coordinates are plain JSON numbers rather than decimal strings. A position
+ * is a measurement with metres of instrument error, never an exact monetary
+ * quantity that is summed or formatted, so the decimal-string rule used by
+ * `Expense.amount` does not apply. Valid coordinates are finite numbers and
+ * cross the API boundary directly as JSON numbers.
+ */
+export interface TripLocationSample {
+  /** Row identity, a server-generated UUID v7. */
+  readonly id: string;
+  /** The owning trip. */
+  readonly tripId: string;
+  /**
+   * Device-generated UUID v7 identifying this one observation. Ingestion is
+   * idempotent on it, and it is globally unique rather than unique per trip.
+   */
+  readonly sampleId: string;
+  /** WGS 84 latitude in decimal degrees. */
+  readonly latitude: number;
+  /** WGS 84 longitude in decimal degrees. */
+  readonly longitude: number;
+  /**
+   * Horizontal accuracy in metres, or null when the device reported none.
+   * Never negative.
+   */
+  readonly accuracy: number | null;
+  /**
+   * When the device observed the position. Device-reported, so it is a
+   * plausible instant rather than an attested one (ADR 0011). ISO 8601 in UTC.
+   */
+  readonly recordedAt: string;
+  /**
+   * When the server received the sample, which may be much later than
+   * `recordedAt` for a sample delivered from the offline queue. ISO 8601 in
+   * UTC.
+   */
+  readonly receivedAt: string;
+}
+
+/**
  * Temporary workspace-resolution probe.
  *
  * Consumed by other workspaces (api-client now; web/mobile once scaffolded)

@@ -12,9 +12,14 @@ lifecycle end to end — administered on the web, executed in the driver app.
 Expenses and receipts are built: expense submission and review, receipt upload
 directly to private object storage, the admin web expense and receipt
 workflow, the driver mobile expense and receipt workflow, and verification
-against real staging object storage. A staging environment exists for
-development verification. Maintenance and active-trip location tracking are
-not built yet. The system is not deployed to production, is not
+against real staging object storage. Vehicle maintenance is built: an
+ADMIN-only, vehicle-scoped work log with a frozen
+`OPEN → COMPLETED | CANCELLED` lifecycle, a top-level worklist and history,
+and a maintenance section on each vehicle — deliberately independent of the
+vehicle's operational status. A staging environment exists for development
+verification, and both the maintenance API and the deployed admin web
+maintenance screens have been verified against it. Active-trip location
+tracking is not built yet. The system is not deployed to production, is not
 production-ready, and is not in live business use.
 
 ## What this is
@@ -48,6 +53,7 @@ docs/
   drivers-vehicles.md
   trips.md
   expenses-receipts.md
+  maintenance.md
   security.md
   staging-deployment.md
   adr/                architecture decision records
@@ -98,5 +104,8 @@ the git-ignored `dist/` directories as a side effect; `build` does the same.
   and money rules, ADMIN and DRIVER APIs, the receipt lifecycle and
   direct-to-storage upload, admin web and driver mobile workflows, storage
   configuration
+- [Vehicle maintenance](docs/maintenance.md): the maintenance lifecycle and
+  fields, its independence from vehicle status, the ADMIN API and database
+  invariants, admin web screens, and staging verification
 - [Staging deployment](docs/staging-deployment.md): Railway staging topology,
   service settings, environment variables, migration order, smoke checklist

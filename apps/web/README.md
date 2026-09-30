@@ -20,10 +20,21 @@ Implemented so far:
   draft, edit its text, assign or re-assign a driver, vehicle and schedule,
   and cancel, verify or close it. Actions appear only where the lifecycle
   allows them. [docs/trips.md](../../docs/trips.md)
+- **Expense and receipt administration** — `/expenses`, `/expenses/[id]`:
+  review submitted expenses and view their receipts.
+  [docs/expenses-receipts.md](../../docs/expenses-receipts.md)
+- **Maintenance administration** — `/maintenance` and the maintenance section
+  of `/vehicles/[id]`: the worklist and full history with status, category and
+  vehicle filtering and server paging; create a record; edit one while `OPEN`;
+  complete or cancel it behind a confirmation. Terminal records are read-only,
+  with no delete and no reopen. Recording maintenance never changes the
+  vehicle's operational status.
+  [docs/maintenance.md](../../docs/maintenance.md)
 
 Screens live under the `(admin)` route group behind `/login`. Starting and
-completing a trip belong to the driver app, not here. Expenses, receipts,
-maintenance and location tracking arrive in later stages.
+completing a trip belong to the driver app, not here. There is no
+`/maintenance/[id]` page: a record's controls live on the vehicle it belongs
+to. Active-trip location tracking arrives in a later stage.
 
 ## Commands
 

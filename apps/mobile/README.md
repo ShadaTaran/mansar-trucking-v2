@@ -12,10 +12,13 @@ Implemented so far — a deliberately thin execution MVP:
   notes and status
 - **Start** for an `ASSIGNED` trip and **Complete** for an `IN_PROGRESS` one,
   each behind a confirmation
+- **DRIVER expense submission and the receipt upload/view workflow**, with the
+  receipt binary uploaded directly to private object storage —
+  [docs/expenses-receipts.md](../../docs/expenses-receipts.md)
 
 The trip contract is documented in [docs/trips.md](../../docs/trips.md).
-Location sharing, the offline queue, expenses and receipts are **not**
-implemented and arrive in later stages; nothing here is stubbed for them.
+Location sharing and the offline queue are **not** implemented yet and arrive
+in the active-trip tracking stage; nothing here is stubbed for them.
 
 Native identity: project `MansarDriver`, display name "Mansar Driver",
 Android application id `com.mansar.driver`.

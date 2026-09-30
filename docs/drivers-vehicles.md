@@ -6,8 +6,10 @@ screens, and how driver deactivation interacts with authentication. The
 separation of drivers from login accounts is [ADR 0002](adr/0002-users-and-drivers-are-separate.md);
 authentication itself is [authentication.md](authentication.md).
 
-Trips, assignment, expenses, maintenance records and location tracking are
-**not** part of this; see §11.
+Trips, assignment, expenses and location tracking are **not** part of this;
+see §11. Vehicle maintenance is its own domain and is deliberately
+**independent** of the vehicle lifecycle documented here — see §12 and
+[maintenance.md](maintenance.md).
 
 ## 1. Driver
 
@@ -67,8 +69,10 @@ stored value by `vehicles_plate_number_key`; a concurrent duplicate surfaces
 as `409 duplicate_plate_number`.
 
 There is **no monotonic odometer rule** in Stage 4: an admin may correct a
-reading upward or downward, or clear it. Odometer business rules belong to
-the stages that own trips and maintenance.
+reading upward or downward, or clear it. `current_odometer` is written only by
+an admin editing the vehicle. A maintenance record may carry its own odometer
+reading, but that value is an observation taken at the job and is **never**
+synchronized back into `current_odometer` (§12).
 
 ## 3. Authorization
 
@@ -259,3 +263,35 @@ their existing `ASSIGNED` trips. Those trips simply cannot be started while
 the resource is non-active; an administrator re-assigns or cancels them
 deliberately. A lifecycle change to a record is never a silent bulk edit of
 operational work.
+
+## 12. How maintenance relates to vehicles
+
+Vehicle maintenance is a separate, vehicle-scoped domain
+([maintenance.md](maintenance.md)). The relationship is deliberately narrow:
+a maintenance record points at a vehicle, and nothing else crosses between
+them.
+
+**`Vehicle.status` is independent from maintenance.** Creating, editing,
+completing or cancelling a maintenance record never writes the vehicle row at
+all — not `status`, and not `current_odometer`. The maintenance odometer is an
+observation recorded at that job, never a fleet reading synchronized back.
+
+**Vehicle status remains an explicit ADMIN action.** `POST /vehicles/:id/status`
+(§5) is the only operational availability control. Nothing in the maintenance
+domain moves a vehicle to `IN_MAINTENANCE`, and nothing moves it back.
+
+**A non-`ACTIVE` vehicle may still have maintenance recorded.** Maintenance is
+accepted against `ACTIVE`, `IN_MAINTENANCE` and `RETIRED` vehicles alike — a
+retired truck still accrues work worth writing down — so there is no
+maintenance `vehicle_not_active` error. That code belongs to trip assignment
+(§11) and has no meaning here.
+
+**Maintenance does not touch trips.** It never creates, cancels, reassigns,
+advances, reverses or detaches an assigned, running or historical trip, and it
+reads none.
+
+The two facts stay independent in both directions: an open maintenance record
+does not mean a vehicle is unavailable, and a vehicle in `IN_MAINTENANCE` is
+not evidence that an open record exists. The reasoning, and the rejected
+alternative of automating status from the maintenance lifecycle, is
+[ADR 0010](adr/0010-maintenance-records-do-not-own-vehicle-status.md).

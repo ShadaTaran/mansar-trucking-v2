@@ -779,6 +779,128 @@ Production
       0 buckets**, verified before the run, after expense creation, after the
       object upload and at the end
 
+## 12d. Stage 7 maintenance verification (performed)
+
+The Stage 7 vehicle maintenance feature set verified against the real staging
+API, the real BFF and the deployed admin web application, with synthetic data
+only and without printing a password, token, cookie or Authorization value.
+The feature itself is [maintenance.md](maintenance.md).
+
+Deployed runtime lineage
+
+- [x] commit `5886a58f05ab994436083c3c68089d9b0d07e009`,
+      `test: increase mobile Jest timeout`
+- [x] GitHub Actions run #29, run id `36445648285`, attempt 1 — success
+- [x] `quality` job `109007152071` — success
+- [x] `database` job `109007152014` — success
+- [x] `mansar-api` deployment `9d6b6746-3453-43a8-aa1d-a9e6c6e5421d` — success
+      on `5886a58f…`, branch `main`
+- [x] `mansar-web` deployment `2ba78edd-7efd-48db-a83f-0461d116c640` — success
+      on the same commit
+- [x] PostgreSQL deployment `ec7e5cbc-28a3-4cbe-afc8-e4a7df74adb3` unchanged.
+      Stage 7's migration was already applied, so the API start-up step found
+      **7 migrations and nothing pending**
+
+Why the deployed runtime is a test-only commit
+
+- [x] the Stage 7C feature commit is
+      `55318fafbdda549c21abde2c0a4eef8290d45906`,
+      `feat: add maintenance admin web` — that commit introduced the feature
+- [x] its CI run (#28) failed on an **unrelated, pre-existing** mobile test,
+      `apps/mobile/src/expenses/ExpenseDetailView.test.tsx`, which exceeded
+      Jest's 5000 ms default on a cold, contended runner. The `apps/mobile`
+      tree is byte-identical between the parent commit and `55318faf…`, and
+      the same test had passed on the parent
+- [x] because CI was red, Railway's **Wait for CI** gate skipped both
+      deployments for `55318faf…`; they are recorded `SKIPPED` and never built
+- [x] the remediation commit `5886a58f…` changed **one file**,
+      `apps/mobile/jest.config.js`, adding `testTimeout: 15000`. It touched no
+      feature code: all eighteen Stage 7C blobs are identical across the two
+      commits
+- [x] fresh CI (#29) passed, and the natural Railway deployment then produced
+      the runtime tested below
+
+The maintenance feature was introduced by `55318faf…`; `5886a58f…` only raised
+a mobile test timeout so CI could go green and the deployment could proceed.
+
+Stage 7D.1 — authenticated API and BFF
+
+The ADMIN and DRIVER identities were entered interactively; the **passwords**
+were entered through hidden prompts and never reached a command argument, an
+environment variable, a file or a log.
+
+- [x] ADMIN authentication through the BFF succeeded
+- [x] DRIVER role denial confirmed: the admin web BFF refuses a DRIVER login
+      with `403`, and a DRIVER bearer received `403` on both `GET /maintenance`
+      and `GET /maintenance/:id`
+- [x] record **A**: created `OPEN` → edited while `OPEN` → `COMPLETED`
+- [x] record **B**: created `OPEN` → `CANCELLED`
+- [x] terminal operations correctly refused with `409`: a second completion
+      (`maintenance_not_completable`), a second cancellation
+      (`maintenance_not_cancellable`) and a `PATCH` on a terminal record
+      (`maintenance_not_editable`)
+- [x] `vehicleId`, `status`, `category` and `page`/`pageSize` filters behaved
+      as specified
+- [x] both records kept their terminal state across a **fresh ADMIN session**
+- [x] the vehicle's `status` and `currentOdometer` were unchanged throughout
+- [x] the vehicle's existing trip was unchanged and no trip was created
+
+Stage 7D.2 — deployed admin web UI
+
+The ADMIN sign-in was performed by the operator in the browser.
+
+- [x] `/maintenance` rendered, opening on `OPEN`, with all-status history
+      reachable — selecting `All` omits the `status` parameter entirely
+- [x] status, category and vehicle filters each changed the rendered list
+- [x] the vehicle-detail maintenance section rendered, carrying its
+      independence notice
+- [x] record **D**: created `OPEN` → edited (category, odometer, cost,
+      description) → `COMPLETED`
+- [x] record **E**: created `OPEN` → `CANCELLED`
+- [x] terminal controls disappeared after each terminal transition; no delete
+      and no reopen control exists
+- [x] the completion cost replaced the draft cost
+- [x] Asia/Manila conversion round-tripped exactly in both directions
+- [x] values persisted across refresh and navigation
+- [x] the vehicle remained `ACTIVE` with `currentOdometer` `50`, and its
+      `updatedAt` still predated the whole exercise
+- [x] the known trip remained `COMPLETED` on the same vehicle and driver
+
+Retained data
+
+- [x] intentionally retained as synthetic staging history, because **Stage 7
+      defines no delete operation**:
+
+```
+A  01a0e985-eb6d-753b-8c61-2bdcc98b7f92   COMPLETED   (7D.1)
+B  01a0e985-f5d2-77da-bd91-b1f46c42d476   CANCELLED   (7D.1)
+D  01a0e9a2-2add-7072-be56-703e2ce2fd22   COMPLETED   (7D.2)
+E  01a0e9a5-1424-7710-8024-2c1ee15e9bf4   CANCELLED   (7D.2)
+```
+
+- [x] no PostgreSQL row and no storage object was modified directly
+
+Limitation
+
+- [x] **non-`ACTIVE` real staging case: not exercised**, because no safe
+      existing synthetic `IN_MAINTENANCE` or `RETIRED` fixture existed, and
+      changing a real vehicle's status merely to manufacture the case was out
+      of scope
+- [x] that frozen behaviour — maintenance accepted against a non-`ACTIVE`
+      vehicle, with no `vehicle_not_active` error — remains covered by the
+      automated API integration suite, `test/maintenance-api.int-spec.ts`
+
+Runtime health
+
+- [x] both deployments remained `SUCCESS`; the API log showed no crash, no
+      unhandled exception, no 5xx and no database constraint error, and the
+      web log showed a clean `next start`
+
+Production
+
+- [x] untouched throughout: the `production` environment has **0 services and
+      0 buckets**, verified before and after the run
+
 ## 13. Not in scope for staging
 
 Config-as-code (`railway.toml`, Dockerfile), custom domains, HA/replicas,

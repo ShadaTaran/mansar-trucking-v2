@@ -152,9 +152,20 @@ a production admin tool.
 
 ## 13. Current schema
 
-Four migrations exist: `init_users_audit` (users, audit_logs),
-`add_refresh_sessions`, `20260922105701_add_drivers_vehicles` (Stage 4:
-drivers, vehicles) and `20260923065202_add_trips` (Stage 5: trips). Tables:
+Seven migrations exist:
+
+| Migration                                | Stage | Adds                  |
+| ---------------------------------------- | ----- | --------------------- |
+| `20260919092331_init_users_audit`        | —     | `users`, `audit_logs` |
+| `20260919141003_add_refresh_sessions`    | —     | `refresh_sessions`    |
+| `20260922105701_add_drivers_vehicles`    | 4     | `drivers`, `vehicles` |
+| `20260923065202_add_trips`               | 5     | `trips`               |
+| `20260925060019_add_expenses`            | 6     | `expenses`            |
+| `20260925143446_add_receipts`            | 6     | `receipts`            |
+| `20260927234424_add_maintenance_records` | 7     | `maintenance_records` |
+
+The Stage 6 expense and receipt tables are documented in
+[expenses-receipts.md](expenses-receipts.md) rather than repeated here. Tables:
 
 - `users`: login identity; `password_hash` holds a self-describing Argon2id
   PHC string and is omitted from every Prisma result unless a query selects
@@ -261,6 +272,54 @@ to domain errors by SQLSTATE and index name
 real database by `test/trips-persistence.int-spec.ts`; behaviour by
 `test/trips-api.int-spec.ts` and `test/driver-trips-api.int-spec.ts`. Trip
 rows are never deleted by the application; see [trips.md](trips.md).
+
+Stage 7 added one table and two enums (`maintenance_status` =
+`OPEN | COMPLETED | CANCELLED`, `maintenance_category` =
+`PREVENTIVE | REPAIR | INSPECTION | TIRE | OTHER`):
+
+- `maintenance_records`: one maintenance job on one vehicle. `vehicle_id` is
+  `NOT NULL` and its foreign key `maintenance_records_vehicle_id_fkey` is
+  **`ON DELETE RESTRICT ON UPDATE NO ACTION`**, so a vehicle with maintenance
+  history cannot be deleted.
+  `status` defaults to `'OPEN'`; `category` has no default. `started_at` is
+  `TIMESTAMPTZ(3) NOT NULL` and is supplied by the caller, not the server, so
+  historical work can be recorded. `completed_at` is a nullable
+  `TIMESTAMPTZ(3)`, `odometer` a nullable `INTEGER`, `cost` a nullable
+  `DECIMAL(12, 2)`, and `description` is `TEXT NOT NULL DEFAULT ''`.
+
+Two indexes serve the two implemented listings, both with `id` as the
+deterministic tie-breaker: `maintenance_records_vehicle_id_started_at_id_idx`
+on `(vehicle_id, started_at, id)` for a vehicle's own history, and
+`maintenance_records_status_started_at_id_idx` on `(status, started_at, id)`
+for the top-level worklist, which opens on `OPEN`.
+
+Four hand-written CHECK constraints (§15) carry the invariants Prisma cannot
+express:
+
+- `maintenance_records_completion_consistency` — a `COMPLETED` row has a
+  completion instant and an `OPEN` or `CANCELLED` row has none. Mirrors
+  `expenses_review_consistency`.
+- `maintenance_records_completion_order` —
+  `completed_at IS NULL OR completed_at >= started_at`. Equality is allowed,
+  for an instantaneous job.
+- `maintenance_records_odometer_non_negative` —
+  `odometer IS NULL OR odometer >= 0`. Deliberately no monotonic rule: a lower
+  historical reading is a correction, not a violation.
+- `maintenance_records_cost_non_negative` — `cost IS NULL OR cost >= 0`.
+  Unlike `expenses_amount_positive`, **zero is permitted**: warranty work
+  legitimately costs nothing, and `NULL` means no cost was recorded, which is
+  not the same as free.
+
+**Multiple `OPEN` rows per vehicle are permitted** — there is no unique or
+partial index limiting concurrent open jobs. These constraints protect row
+consistency only; the `OPEN → terminal` transition rules and post-terminal
+immutability are API semantics enforced by conditional lifecycle claims, not
+by columns, and `Vehicle.status` is deliberately unrelated to any row here
+([ADR 0010](adr/0010-maintenance-records-do-not-own-vehicle-status.md)).
+Every object above is asserted against a real database by
+`test/maintenance-persistence.int-spec.ts`; behaviour by
+`test/maintenance-api.int-spec.ts`. Maintenance rows are never deleted by the
+application — there is no delete route; see [maintenance.md](maintenance.md).
 
 ## 14. Conventions
 

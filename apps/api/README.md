@@ -20,9 +20,17 @@ Implemented so far:
 - **DRIVER trip lifecycle**: a driver's own trips, Start and Complete, with
   the schedule and one-running-trip invariants enforced by PostgreSQL itself
   — [docs/trips.md](../../docs/trips.md)
+- **expenses and receipts**: ADMIN review and DRIVER submission, with the
+  receipt binary uploaded directly to private object storage —
+  [docs/expenses-receipts.md](../../docs/expenses-receipts.md)
+- **ADMIN vehicle maintenance**: a vehicle-scoped work log with the frozen
+  `OPEN → COMPLETED | CANCELLED` lifecycle, terminal and with no delete or
+  reopen. Maintenance never writes `Vehicle.status` or the vehicle odometer
+  ([ADR 0010](../../docs/adr/0010-maintenance-records-do-not-own-vehicle-status.md))
+  — [docs/maintenance.md](../../docs/maintenance.md)
 - health (liveness) and readiness endpoints
 
-Expenses, receipts, maintenance and location tracking arrive in later stages.
+Active-trip location tracking arrives in a later stage.
 
 ## Endpoints
 
@@ -40,8 +48,13 @@ Every other route requires a bearer access token. The `/drivers` and
 `/vehicles` routes are ADMIN-only
 ([docs/drivers-vehicles.md](../../docs/drivers-vehicles.md)); `/trips` is
 ADMIN-only and `/driver/trips` DRIVER-only
-([docs/trips.md](../../docs/trips.md)). See the authentication guide for
-token, request/response and error-code shapes.
+([docs/trips.md](../../docs/trips.md)); `/expenses` is ADMIN-only and
+`/driver/expenses` DRIVER-only
+([docs/expenses-receipts.md](../../docs/expenses-receipts.md)); `/maintenance`
+is ADMIN-only, with creation under `/vehicles/:vehicleId/maintenance`
+([docs/maintenance.md](../../docs/maintenance.md)). There is no DRIVER
+maintenance API. See the authentication guide for token, request/response and
+error-code shapes.
 
 ## Commands
 

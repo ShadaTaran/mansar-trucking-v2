@@ -173,3 +173,96 @@ export const listDriverTripsSchema = z.strictObject({
     .optional(),
 });
 export type ListDriverTripsQuery = z.infer<typeof listDriverTripsSchema>;
+
+/** The frozen Stage 8 batch window: one sample at minimum, 100 at most. */
+export const MIN_LOCATION_SAMPLES = 1;
+export const MAX_LOCATION_SAMPLES = 100;
+
+/**
+ * WGS 84 decimal degrees, bounded to the real range.
+ *
+ * Zod 4's `z.number()` already rejects `NaN` and both infinities at the type
+ * check, so a non-finite coordinate never reaches the range test. That is
+ * asserted directly in `trips.schemas.spec.ts` rather than trusted to stay a
+ * default: the column CHECKs refuse non-finite values too, so a regression
+ * here would surface as a 500 rather than as a stored bad row — but a 400 is
+ * the answer the client is owed.
+ */
+function degrees(field: string, limit: number) {
+  return z
+    .number({ error: `${field} must be a number` })
+    .min(-limit, { error: `${field} must be at least -${limit}` })
+    .max(limit, { error: `${field} must be at most ${limit}` });
+}
+
+/**
+ * Horizontal accuracy in metres, or `null` when the device reported none.
+ * Required rather than optional: "no accuracy was reported" is a fact the
+ * client states, not one the server infers from a missing key.
+ *
+ * Deliberately unbounded above. Discarding a fix too coarse to be useful is a
+ * mobile capture policy (Stage 8C); a coarse sample that was already captured
+ * must still be uploadable, and the column's CHECK bounds only the sign.
+ */
+const accuracy = z
+  .number({ error: 'accuracy must be a number of metres or null' })
+  .min(0, { error: 'accuracy must not be negative' })
+  .nullable();
+
+const locationSampleSchema = z.strictObject({
+  sampleId: entityId('sampleId', 'location sample'),
+  latitude: degrees('latitude', 90),
+  longitude: degrees('longitude', 180),
+  accuracy,
+  recordedAt: instant('recordedAt'),
+});
+
+/**
+ * True unless the batch repeats a `sampleId`.
+ *
+ * Guarded like `isOrderedWindow`: Zod 4 still runs an object-level check after
+ * one of its fields failed, so a malformed batch must not collect a second,
+ * misleading message on top of the one its bad sample already carries.
+ */
+function hasDistinctSampleIds(value: { readonly samples: unknown }): boolean {
+  const { samples } = value;
+  if (!Array.isArray(samples)) {
+    return true;
+  }
+  const ids = samples
+    .map((sample) => (sample as { sampleId?: unknown } | null)?.sampleId)
+    .filter((id): id is string => typeof id === 'string');
+  return new Set(ids).size === ids.length;
+}
+
+/**
+ * One batch from a draining device queue (Stage 8B.2).
+ *
+ * The trip comes from the route and the operational driver from the
+ * authenticated login, so a sample carries neither — nor a `tripId`, `id`,
+ * `receivedAt`, `driverId`, `vehicleId`, `userId` or `deviceId`. Both the body
+ * and each sample are strict, so every one of those is an unknown key.
+ *
+ * A `sampleId` repeated inside one request is a client defect rather than a
+ * data condition, so it fails the whole body here instead of becoming two
+ * independent entries racing each other for the same unique key.
+ */
+export const ingestLocationSamplesSchema = z
+  .strictObject({
+    samples: z
+      .array(locationSampleSchema, { error: 'samples must be an array' })
+      .min(MIN_LOCATION_SAMPLES, {
+        error: 'samples must contain at least one sample',
+      })
+      .max(MAX_LOCATION_SAMPLES, {
+        error: `samples must contain at most ${MAX_LOCATION_SAMPLES} samples`,
+      }),
+  })
+  .refine(hasDistinctSampleIds, {
+    error: 'samples must not repeat a sampleId',
+  });
+export type IngestLocationSamplesBody = z.infer<
+  typeof ingestLocationSamplesSchema
+>;
+/** One parsed sample, with `recordedAt` already a Date. */
+export type LocationSampleInput = IngestLocationSamplesBody['samples'][number];

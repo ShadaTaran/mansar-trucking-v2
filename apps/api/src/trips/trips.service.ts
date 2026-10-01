@@ -23,8 +23,10 @@ import {
   type CreateTripBody,
   DEFAULT_PAGE,
   DEFAULT_PAGE_SIZE,
+  type IngestLocationSamplesBody,
   type ListDriverTripsQuery,
   type ListTripsQuery,
+  type LocationSampleInput,
   type UpdateTripBody,
 } from './trips.schemas.js';
 
@@ -54,6 +56,62 @@ export const ASSIGNABLE_FROM: readonly TripStatus[] = ['DRAFT', 'ASSIGNED'];
 export const CANCELLABLE_FROM: readonly TripStatus[] = ['DRAFT', 'ASSIGNED'];
 export const VERIFIABLE_FROM: TripStatus = 'COMPLETED';
 export const CLOSABLE_FROM: TripStatus = 'VERIFIED';
+
+/**
+ * Trip states that accept a queued location sample (Stage 8, ADR 0011).
+ *
+ * Deliberately wider than capture. A device that was offline while the trip
+ * ran may reconnect only after the office has verified or closed it, and
+ * refusing then would destroy exactly the history the offline queue exists to
+ * preserve. This authorizes **late delivery**, never new capture: capture
+ * stays confined to `IN_PROGRESS` by the first-party tracker, and the window
+ * rules are what keep a late upload honest.
+ */
+export const LOCATION_UPLOADABLE_FROM: readonly TripStatus[] = [
+  'IN_PROGRESS',
+  'COMPLETED',
+  'VERIFIED',
+  'CLOSED',
+];
+
+/**
+ * The frozen tolerance for device-clock disagreement (ADR 0011). `recordedAt`
+ * is reported by the phone and is not attested, so the window check below is a
+ * plausibility test rather than proof of when capture happened.
+ */
+export const MAX_DEVICE_CLOCK_SKEW_MS = 5 * 60 * 1000;
+
+/** The global unique index on `sample_id`, by its exact catalog name. */
+const SAMPLE_ID_KEY = 'trip_location_samples_sample_id_key';
+
+/** Why one sample was refused. Never names a field or a constraint. */
+export type LocationRejectionReason = 'out_of_window' | 'sample_id_conflict';
+
+/**
+ * What became of one submitted sample: the client's own `sampleId` and nothing
+ * else. No row id, no trip, no coordinates, no instants, no driver or vehicle,
+ * and no database detail.
+ */
+export type LocationSampleResult =
+  | { readonly sampleId: string; readonly outcome: 'accepted' }
+  | { readonly sampleId: string; readonly outcome: 'duplicate' }
+  | {
+      readonly sampleId: string;
+      readonly outcome: 'rejected';
+      readonly reason: LocationRejectionReason;
+    };
+
+/** One outcome per submitted sample, in exactly the submitted order. */
+export interface LocationIngestionResult {
+  readonly results: readonly LocationSampleResult[];
+}
+
+/** The trip facts a batch is validated against, read once per request. */
+interface TrackableTrip {
+  readonly id: string;
+  readonly startedAt: Date;
+  readonly completedAt: Date | null;
+}
 
 /** Acting ADMIN, as the controller takes it from the verified access token. */
 export type TripActor = Pick<AuthenticatedPrincipal, 'userId' | 'role'>;
@@ -141,6 +199,39 @@ export function violatedIndex(error: unknown): string | null {
   ) as unknown;
   const index = property(property(cause, 'constraint'), 'index');
   return typeof index === 'string' ? index : null;
+}
+
+/**
+ * Whether a device-reported capture instant is plausible for this trip.
+ *
+ * Three bounds, each tolerating `MAX_DEVICE_CLOCK_SKEW_MS` of clock
+ * disagreement in the direction that would otherwise discard a legitimate
+ * sample: the capture cannot be meaningfully in the server's future, cannot
+ * precede the trip starting, and — once the trip has finished — cannot follow
+ * it ending. There is no *lower* bound against `receivedAt`, because arriving
+ * hours late is precisely what the offline queue does.
+ *
+ * None of this is a database CHECK. A phone whose clock runs ahead would
+ * otherwise fail the insert and destroy a sample it had legitimately captured,
+ * so the window is enforced here and the stored row is allowed to sit slightly
+ * outside the exact lifecycle instants (ADR 0011).
+ */
+function isWithinTripWindow(
+  recordedAt: Date,
+  trip: TrackableTrip,
+  receivedAt: Date,
+): boolean {
+  const at = recordedAt.getTime();
+  if (at > receivedAt.getTime() + MAX_DEVICE_CLOCK_SKEW_MS) {
+    return false;
+  }
+  if (at < trip.startedAt.getTime() - MAX_DEVICE_CLOCK_SKEW_MS) {
+    return false;
+  }
+  return (
+    trip.completedAt === null ||
+    at <= trip.completedAt.getTime() + MAX_DEVICE_CLOCK_SKEW_MS
+  );
 }
 
 type TripReader = Pick<Prisma.TransactionClient, 'trip'>;
@@ -687,6 +778,173 @@ export class TripsService {
       });
       return toTrip(row);
     });
+  }
+
+  /**
+   * Ingests one batch of queued location samples for the driver's own trip
+   * (Stage 8B.2, ADR 0011).
+   *
+   * Two layers, deliberately separate. The *request* either is or is not
+   * allowed to upload against this trip: an unlinked login, a trip that is not
+   * the caller's, and a trip with no trackable window are all answered once,
+   * before any row is written. Each *sample* is then judged on its own, so one
+   * permanently invalid observation cannot stop a device from draining the
+   * valid ones behind it.
+   *
+   * The driver's operational status is deliberately not checked. A driver
+   * deactivated mid-trip would otherwise be left holding a queue that can
+   * never be delivered — the same reasoning that lets them still complete a
+   * running trip.
+   *
+   * Nothing is audited. At a 30-second capture cadence an audit row per sample
+   * would double the volume of the busiest table in the system and copy
+   * coordinates into `audit_logs.metadata`; `trip.started` and
+   * `trip.completed` already bracket the only interval in which capture is
+   * legitimate.
+   */
+  async ingestLocationSamples(input: {
+    readonly actor: TripActor;
+    readonly tripId: string;
+    readonly body: IngestLocationSamplesBody;
+  }): Promise<LocationIngestionResult> {
+    // One server instant for the whole batch: the same value validates every
+    // sample and is stored on every row it accepts, so no sample is ever
+    // checked against one clock reading and persisted with another.
+    const receivedAt = new Date();
+    const trip = await this.trackableTrip(input.actor.userId, input.tripId);
+
+    // Sequential on purpose. Each sample is its own statement so that a unique
+    // collision can be caught and classified; inside a shared transaction the
+    // first 23505 would abort it and the follow-up read would fail instead.
+    const results: LocationSampleResult[] = [];
+    for (const sample of input.body.samples) {
+      results.push(await this.ingestOneSample(trip, sample, receivedAt));
+    }
+    return { results };
+  }
+
+  /**
+   * The trip a batch may be written against, or the single request-level
+   * refusal that applies.
+   *
+   * Ownership is resolved through `drivers.user_id` and the trip is scoped to
+   * that driver, so another driver's trip is indistinguishable from one that
+   * does not exist: same 404, same body. A trip that never started has no
+   * window to validate against and is refused with the same code as one that
+   * is not a tracking target at all.
+   */
+  private async trackableTrip(
+    userId: string,
+    tripId: string,
+  ): Promise<TrackableTrip> {
+    const driverId = await this.linkedDriverIdForRead(userId);
+    const row = await this.prisma.trip.findFirst({
+      where: { id: tripId, driverId },
+      select: { id: true, status: true, startedAt: true, completedAt: true },
+    });
+    if (!row) {
+      throw new NotFoundException(TRIP_ERROR.tripNotFound);
+    }
+    if (
+      row.startedAt === null ||
+      !LOCATION_UPLOADABLE_FROM.includes(row.status)
+    ) {
+      throw new ConflictException(TRIP_ERROR.tripNotTrackable);
+    }
+    return {
+      id: row.id,
+      startedAt: row.startedAt,
+      completedAt: row.completedAt,
+    };
+  }
+
+  /**
+   * Stores one sample, or says why not.
+   *
+   * The insert is attempted rather than guarded by a preceding read: a
+   * read-then-write would let two concurrent uploads of the same `sampleId`
+   * both believe they were first. The global unique index is the arbiter, and
+   * only its violation is caught — any other database failure propagates
+   * untouched rather than being collapsed into `duplicate`.
+   */
+  private async ingestOneSample(
+    trip: TrackableTrip,
+    sample: LocationSampleInput,
+    receivedAt: Date,
+  ): Promise<LocationSampleResult> {
+    const { sampleId } = sample;
+    if (!isWithinTripWindow(sample.recordedAt, trip, receivedAt)) {
+      return { sampleId, outcome: 'rejected', reason: 'out_of_window' };
+    }
+    try {
+      await this.prisma.tripLocationSample.create({
+        data: {
+          tripId: trip.id,
+          sampleId,
+          latitude: sample.latitude,
+          longitude: sample.longitude,
+          accuracy: sample.accuracy,
+          recordedAt: sample.recordedAt,
+          receivedAt,
+        },
+        select: { id: true },
+      });
+      return { sampleId, outcome: 'accepted' };
+    } catch (error) {
+      if (
+        sqlState(error) !== UNIQUE_VIOLATION ||
+        violatedIndex(error) !== SAMPLE_ID_KEY
+      ) {
+        throw error;
+      }
+      return this.classifyTakenSampleId(trip.id, sample);
+    }
+  }
+
+  /**
+   * Classifies a `sampleId` that is already stored: an idempotent retry of the
+   * same observation, or one identifier claiming to be two different ones.
+   *
+   * The stored row is never updated, and the answer names neither the field
+   * that differed nor the trip the existing row belongs to — a collision
+   * against another trip is still just `sample_id_conflict`.
+   */
+  private async classifyTakenSampleId(
+    tripId: string,
+    sample: LocationSampleInput,
+  ): Promise<LocationSampleResult> {
+    const existing = await this.prisma.tripLocationSample.findUnique({
+      where: { sampleId: sample.sampleId },
+      select: {
+        tripId: true,
+        latitude: true,
+        longitude: true,
+        accuracy: true,
+        recordedAt: true,
+      },
+    });
+    if (!existing) {
+      // The row that caused the collision would have to have been deleted
+      // between the insert and this read. There is no delete path for a
+      // location sample, so this is an invariant breach, not a client error.
+      throw new AuthInvariantError('location sample collision vanished');
+    }
+    const sameObservation =
+      existing.tripId === tripId &&
+      existing.latitude === sample.latitude &&
+      existing.longitude === sample.longitude &&
+      // `===` is already null-aware here: null matches only null.
+      existing.accuracy === sample.accuracy &&
+      // Compared as instants, because timestamptz(3) normalizes the offset
+      // form the client sent; `receivedAt` is deliberately not compared.
+      existing.recordedAt.getTime() === sample.recordedAt.getTime();
+    return sameObservation
+      ? { sampleId: sample.sampleId, outcome: 'duplicate' }
+      : {
+          sampleId: sample.sampleId,
+          outcome: 'rejected',
+          reason: 'sample_id_conflict',
+        };
   }
 
   /**

@@ -34,6 +34,18 @@ export const TRIP_ERROR = {
    * answer.
    */
   tripHasPendingExpenses: 'trip_has_pending_expenses',
+  /**
+   * Stage 8B.2: the trip accepts no location samples at all — it never
+   * started, or it is `DRAFT`, `ASSIGNED` or `CANCELLED`. Deliberately one
+   * code for every one of those, like `expense_not_reviewable`: a driver
+   * learns that this trip is not a tracking target, never which condition
+   * applied or what state the trip is in.
+   *
+   * Distinct from `trip_not_startable` and `trip_not_completable`, which
+   * answer a lifecycle *transition* that did not land. This answers a request
+   * to upload against a trip that has no trackable window.
+   */
+  tripNotTrackable: 'trip_not_trackable',
 } as const;
 
 export type TripErrorCode = (typeof TRIP_ERROR)[keyof typeof TRIP_ERROR];

@@ -7,6 +7,7 @@ import com.facebook.react.ReactHost
 import com.facebook.react.ReactNativeApplicationEntryPoint.loadReactNative
 import com.facebook.react.defaults.DefaultReactHost.getDefaultReactHost
 import com.mansar.driver.config.MansarConfigPackage
+import com.mansar.driver.location.TripLocationPackage
 import com.mansar.driver.receipts.ReceiptPickerPackage
 
 class MainApplication : Application(), ReactApplication {
@@ -20,6 +21,8 @@ class MainApplication : Application(), ReactApplication {
           add(MansarConfigPackage())
           // App-local module for choosing one local receipt image.
           add(ReceiptPickerPackage())
+          // App-local module for active-trip location capture and its queue.
+          add(TripLocationPackage())
         },
     )
   }

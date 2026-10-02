@@ -1,3 +1,14 @@
 <resources>
     <string name="app_name">Mansar Driver</string>
+
+    <!--
+      Foreground-service notification text (Stage 8C.1). Fixed and
+      non-sensitive by design: no coordinates, and no trip, driver, user or
+      vehicle identity. The driver is told that recording is happening, and
+      nothing about what was recorded.
+    -->
+    <string name="location_tracking_channel_name">Location tracking</string>
+    <string name="location_tracking_channel_description">Shown while trip location tracking is active.</string>
+    <string name="location_tracking_title">Location tracking</string>
+    <string name="location_tracking_text">Trip location tracking is active</string>
 </resources>

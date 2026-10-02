@@ -120,4 +120,14 @@ dependencies {
     } else {
         implementation jscFlavor
     }
+
+    // Fused location (Stage 8C.1). The only location provider: the app does
+    // not fall back to the AOSP LocationManager, so a build without Google
+    // Play Services simply reports the provider unavailable rather than
+    // capturing through a second, differently-behaved code path.
+    implementation("com.google.android.gms:play-services-location:21.4.0")
+
+    // Local JVM unit tests for the pure-Kotlin location helpers (emission
+    // policy, UUIDv7, timestamp formatting). No Android instrumentation.
+    testImplementation("junit:junit:4.13.2")
 }

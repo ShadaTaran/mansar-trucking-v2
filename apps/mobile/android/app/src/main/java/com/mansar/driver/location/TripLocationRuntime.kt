@@ -6,10 +6,18 @@ import java.util.concurrent.atomic.AtomicReference
  * Process-local state for the one capture session, and the single
  * synchronization domain every session transition passes through.
  *
- * Holds four facts and nothing else: whether capture is running, which login
- * and trip it is running for, and the last fixed error code. It never holds an
- * access token, a refresh token, a password or a coordinate — coordinates
- * exist only as SQLite rows, and tokens only in JavaScript.
+ * Holds five facts and nothing else: whether a capture session is owned,
+ * whether it is paused, which login and trip it belongs to, and the last fixed
+ * error code. It never holds an access token, a refresh token, a password or a
+ * coordinate — coordinates exist only as SQLite rows, and tokens only in
+ * JavaScript.
+ *
+ * `running` means the session is **owned and alive**, not that fixes are
+ * reaching SQLite; `paused` is what distinguishes those. A paused session
+ * keeps its owner, its trip and its foreground service, and admits no sample —
+ * which is what the trip-completion window needs: stop recording, upload the
+ * tail, and either finish or carry on with the *same* session rather than a
+ * new one that would have to pass the start gates again.
  *
  * Deliberately **not persisted**. "Tracking should be running" is not written
  * anywhere, so the capture session cannot resurrect itself after the process
@@ -64,14 +72,40 @@ object TripLocationRuntime {
     BUSY,
   }
 
+  /** What happened when a caller tried to pause or resume a session. */
+  enum class TransitionOutcome {
+    /** The session is now in the requested state, having changed. */
+    CHANGED,
+    /** It was already in the requested state; an idempotent no-op. */
+    UNCHANGED,
+    /** No session is owned at all; an idempotent no-op. */
+    NOT_RUNNING,
+    /** A different owner or trip owns the session; nothing was touched. */
+    BUSY,
+  }
+
+  /** The session and its paused flag, read together. */
+  data class Snapshot(val session: Session?, val paused: Boolean)
+
   /**
-   * The one synchronization domain: claim, end, end-if-active,
-   * capture-if-active and the stop transition all hold this monitor, and so
-   * does every read of [session].
+   * The one synchronization domain: claim, end, end-if-active, capture
+   * admission, pause, resume and the stop transition all hold this monitor,
+   * and so does every read of [session] or [paused].
    */
   private val transition = Any()
 
   private var session: Session? = null
+
+  /**
+   * Whether the owned session is currently admitting fixes.
+   *
+   * Part of the session state and under the same monitor, because every rule
+   * about it is a rule about a transition: a claim starts unpaused, an end
+   * clears it, and capture admission depends on it. A flag living outside the
+   * domain could outlive the session it paused, or let a fix be admitted
+   * against a session that had already been paused.
+   */
+  private var paused = false
 
   /**
    * The last fixed error code.
@@ -89,6 +123,16 @@ object TripLocationRuntime {
 
   val running: Boolean
     get() = synchronized(transition) { session != null }
+
+  /**
+   * Both facts in one critical section.
+   *
+   * Reading `active` and then the paused flag separately could report a
+   * session with the other's pause state, which is exactly the contradiction
+   * a status map must never show.
+   */
+  fun snapshot(): Snapshot =
+    synchronized(transition) { Snapshot(session, paused) }
 
   /**
    * Claims the session for [candidate].
@@ -111,6 +155,9 @@ object TripLocationRuntime {
         current != null -> ClaimOutcome.BUSY
         else -> {
           session = candidate
+          // A new session always begins admitting: a pause belongs to the
+          // session that was paused, never to its successor.
+          paused = false
           ClaimOutcome.CLAIMED
         }
       }
@@ -156,6 +203,82 @@ object TripLocationRuntime {
     }
 
   /**
+   * Runs [capture] with the domain held, and only while [expected] is both the
+   * active session **and** not paused. Returns whether it was admitted.
+   *
+   * Capture has a stricter rule than ownership, so it has its own primitive:
+   * a paused session is still owned, still holds its trip and still runs its
+   * foreground service, and must nevertheless admit no sample. Deciding that
+   * inside the same critical section as the pause transition is what makes the
+   * guarantee absolute — once `pause` has returned, no later call for that
+   * session is admitted, so no further row can be written for it until a
+   * resume.
+   *
+   * The converse ordering matters just as much: a capture that has already
+   * been admitted holds the monitor for its whole decide-and-persist sequence,
+   * so a pause arriving mid-flight waits for it rather than cutting it in
+   * half. Removing the provider callback cannot give either guarantee, because
+   * a callback may already be queued on the worker thread when the pause
+   * begins — which is why this gate, not the unsubscribe, is authoritative.
+   */
+  fun captureIfAdmitted(expected: Session, capture: () -> Unit): Boolean =
+    synchronized(transition) {
+      if (session == expected && !paused) {
+        capture()
+        true
+      } else {
+        false
+      }
+    }
+
+  /**
+   * Pauses [expected], keeping the session, its owner and its trip.
+   *
+   * Session-exact: a pause aimed at a session that has since been stopped or
+   * replaced must not pause whatever happens to be running now, so a mismatch
+   * is [TransitionOutcome.BUSY] and changes nothing. Pausing an
+   * already-paused session is [TransitionOutcome.UNCHANGED] rather than an
+   * error, because a caller retrying a completion sequence should not have to
+   * care which half of it already ran.
+   */
+  fun pause(expected: Session): TransitionOutcome =
+    synchronized(transition) {
+      val current = session
+      when {
+        current == null -> TransitionOutcome.NOT_RUNNING
+        current != expected -> TransitionOutcome.BUSY
+        paused -> TransitionOutcome.UNCHANGED
+        else -> {
+          paused = true
+          TransitionOutcome.CHANGED
+        }
+      }
+    }
+
+  /**
+   * Resumes [expected], which must be the same session that was paused.
+   *
+   * This only reopens admission; restoring the provider subscription is the
+   * service's part, and it does that *before* calling here so that a fix
+   * arriving in between is still refused. A resume whose session has since
+   * ended is [TransitionOutcome.NOT_RUNNING] and resurrects nothing: there is
+   * no path by which a delayed resume can bring a stopped session back.
+   */
+  fun resume(expected: Session): TransitionOutcome =
+    synchronized(transition) {
+      val current = session
+      when {
+        current == null -> TransitionOutcome.NOT_RUNNING
+        current != expected -> TransitionOutcome.BUSY
+        !paused -> TransitionOutcome.UNCHANGED
+        else -> {
+          paused = false
+          TransitionOutcome.CHANGED
+        }
+      }
+    }
+
+  /**
    * Ends [expected]'s session and runs [teardown] in the same critical
    * section, and only if [expected] is still the active session. Returns
    * whether the transition was admitted; a stale caller gets a complete no-op.
@@ -177,6 +300,65 @@ object TripLocationRuntime {
     synchronized(transition) {
       if (session == expected) {
         session = null
+        // A pause cannot outlive the session it paused.
+        paused = false
+        teardown()
+        true
+      } else {
+        false
+      }
+    }
+
+  /**
+   * Reopens admission only when the stored session is the **same object** as
+   * [expected].
+   *
+   * The asynchronous twin of [resume]. A provider registration started for one
+   * session can confirm after that session was stopped and an equal-valued
+   * successor was claimed — same owner, same trip, different generation — and
+   * the value-based [resume] would happily unpause the successor on the
+   * strength of the predecessor's registration. This one refuses, because the
+   * native caller is holding the exact object it started the registration for.
+   *
+   * [resume] keeps value semantics deliberately: a bridge request carries an
+   * owner and a trip, not a generation token, and that is the right way to
+   * authorize "resume the trip I am looking at".
+   */
+  fun resumeIfOwnedInstance(expected: Session): TransitionOutcome =
+    synchronized(transition) {
+      val current = session
+      when {
+        current == null -> TransitionOutcome.NOT_RUNNING
+        current !== expected -> TransitionOutcome.BUSY
+        !paused -> TransitionOutcome.UNCHANGED
+        else -> {
+          paused = false
+          TransitionOutcome.CHANGED
+        }
+      }
+    }
+
+  /**
+   * Ends the session only when the stored one is the **same object** as
+   * [expected], running [teardown] in the same critical section.
+   *
+   * Reference identity, deliberately, and only for this primitive. [Session]
+   * is a data class, so two sessions for the same owner and trip are equal;
+   * that is right for the value questions — is this pause for the session I am
+   * capturing? is this start a repeat? — and wrong for teardown. A service
+   * instance holds the exact object it was promoted for, and a stop followed
+   * by a start of the same trip produces a second, equal object. Value
+   * equality would then let the dying instance end its successor's session.
+   *
+   * So this is the primitive for a resource that holds the exact object:
+   * a service's own destruction, and its own provider failure. Everything
+   * else keeps value semantics.
+   */
+  fun endIfOwnedInstance(expected: Session, teardown: () -> Unit = {}): Boolean =
+    synchronized(transition) {
+      if (session === expected) {
+        session = null
+        paused = false
         teardown()
         true
       } else {
@@ -204,9 +386,42 @@ object TripLocationRuntime {
       val current = session
       if (current != null) {
         session = null
+        paused = false
         teardown(current)
       }
       current
+    }
+
+  /**
+   * Records [code] only while the stored session is the **same object** as
+   * [expected], deciding and writing in one critical section.
+   *
+   * The point is the atomicity, not the comparison. Asking for a snapshot,
+   * checking the generation and then calling [recordError] looks equivalent
+   * and is not: a stop or a replacement can land between the check and the
+   * write, and the code then belongs to a session that never produced it. A
+   * driver would be shown a failure from a trip they already finished.
+   *
+   * Returns [TransitionOutcome.UNCHANGED] when the code was recorded — the
+   * session and the pause are deliberately untouched, because attributing a
+   * failure is not a lifecycle transition — and [TransitionOutcome.BUSY] or
+   * [TransitionOutcome.NOT_RUNNING] when there was nothing of [expected]'s
+   * left to attribute it to.
+   */
+  fun recordErrorIfOwnedInstance(
+    expected: Session,
+    code: String,
+  ): TransitionOutcome =
+    synchronized(transition) {
+      val current = session
+      when {
+        current == null -> TransitionOutcome.NOT_RUNNING
+        current !== expected -> TransitionOutcome.BUSY
+        else -> {
+          lastErrorCode.set(code)
+          TransitionOutcome.UNCHANGED
+        }
+      }
     }
 
   /** The last fixed error code, or null. Never a platform message. */

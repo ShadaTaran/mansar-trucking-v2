@@ -44,6 +44,7 @@ const SAMPLE = {
 
 const STATUS = {
   running: true,
+  paused: false,
   ownerUserId: OWNER,
   tripId: TRIP,
   permission: 'precise',
@@ -110,6 +111,140 @@ describe('status validation', () => {
     fake.setStatus({ lastErrorCode: code });
     await expect(native.getStatus(OWNER)).resolves.toMatchObject({
       lastErrorCode: code,
+    });
+  });
+
+  it('parses an active session as running and not paused', async () => {
+    const status = await native.getStatus(OWNER);
+    expect(status.running).toBe(true);
+    expect(status.paused).toBe(false);
+  });
+
+  it('parses a paused session as running and paused', async () => {
+    // Paused is a state *of* a session: the owner and trip are still there.
+    fake.setStatus({ running: true, paused: true });
+    await expect(native.getStatus(OWNER)).resolves.toMatchObject({
+      running: true,
+      paused: true,
+      ownerUserId: OWNER,
+      tripId: TRIP,
+    });
+  });
+
+  it('parses a stopped session as neither running nor paused', async () => {
+    fake.setStatus({
+      running: false,
+      paused: false,
+      ownerUserId: null,
+      tripId: null,
+    });
+    await expect(native.getStatus(OWNER)).resolves.toMatchObject({
+      running: false,
+      paused: false,
+      ownerUserId: null,
+      tripId: null,
+    });
+  });
+
+  it('rejects a status with no paused field at all', () => {
+    const without: Record<string, unknown> = { ...STATUS };
+    delete without.paused;
+    // Never defaulted: a native build that did not answer is not "not paused".
+    expect(parseTripLocationStatus(without)).toBeNull();
+  });
+
+  it.each(['true', 1, 0, null, {}])(
+    'rejects the non-boolean paused value %p',
+    (paused) => {
+      expect(parseTripLocationStatus({ ...STATUS, paused })).toBeNull();
+    },
+  );
+
+  it('accepts the three legitimate states and nothing else', () => {
+    const stopped = {
+      ...STATUS,
+      running: false,
+      paused: false,
+      ownerUserId: null,
+      tripId: null,
+    };
+    expect(parseTripLocationStatus(stopped)).toMatchObject({
+      running: false,
+      paused: false,
+      ownerUserId: null,
+      tripId: null,
+    });
+    expect(parseTripLocationStatus(STATUS)).toMatchObject({
+      running: true,
+      paused: false,
+      ownerUserId: OWNER,
+      tripId: TRIP,
+    });
+    expect(parseTripLocationStatus({ ...STATUS, paused: true })).toMatchObject({
+      running: true,
+      paused: true,
+    });
+  });
+
+  it.each([
+    [
+      'a stopped session that still names an owner',
+      { running: false, paused: false, ownerUserId: OWNER, tripId: null },
+    ],
+    [
+      'a stopped session that still names a trip',
+      { running: false, paused: false, ownerUserId: null, tripId: TRIP },
+    ],
+    [
+      'a stopped session that names both',
+      { running: false, paused: false, ownerUserId: OWNER, tripId: TRIP },
+    ],
+    [
+      'a running session with no owner',
+      { running: true, paused: false, ownerUserId: null, tripId: TRIP },
+    ],
+    [
+      'a running session with no trip',
+      { running: true, paused: false, ownerUserId: OWNER, tripId: null },
+    ],
+    [
+      'a paused session with no owner',
+      { running: true, paused: true, ownerUserId: null, tripId: TRIP },
+    ],
+    [
+      'a paused session with no trip',
+      { running: true, paused: true, ownerUserId: OWNER, tripId: null },
+    ],
+  ])('rejects %s', (_label, patch) => {
+    // No identity is invented and no field is repaired: the whole status goes.
+    expect(parseTripLocationStatus({ ...STATUS, ...patch })).toBeNull();
+  });
+
+  it('refuses a malformed identity through the wrapper as well', async () => {
+    fake.setStatus({ running: true, paused: false, tripId: null });
+    await expect(native.getStatus(OWNER)).rejects.toMatchObject({
+      failure: 'invalid_native_response',
+    });
+  });
+
+  it('rejects the impossible stopped-but-paused combination', async () => {
+    expect(
+      parseTripLocationStatus({
+        ...STATUS,
+        running: false,
+        paused: true,
+        ownerUserId: null,
+        tripId: null,
+      }),
+    ).toBeNull();
+    fake.setStatus({
+      running: false,
+      paused: true,
+      ownerUserId: null,
+      tripId: null,
+    });
+    await expect(native.getStatus(OWNER)).rejects.toMatchObject({
+      failure: 'invalid_native_response',
     });
   });
 
@@ -503,17 +638,169 @@ describe('argument validation happens before native is called', () => {
 
   it('exposes no whole-queue or per-trip delete helper', () => {
     const surface = Object.keys(native).sort();
-    expect(surface).toEqual([
+    expect(surface).not.toContain('clearQueue');
+    expect(surface).not.toContain('deleteTripSamples');
+    expect(surface).not.toContain('deleteAllSamples');
+  });
+});
+
+describe('pause and resume', () => {
+  it.each([
+    [
+      'pauseTracking',
+      (api: TripLocationNative) => api.pauseTracking(OWNER, TRIP),
+    ],
+    [
+      'resumeTracking',
+      (api: TripLocationNative) => api.resumeTracking(OWNER, TRIP),
+    ],
+  ])(
+    '%s calls native once with the exact owner and trip',
+    async (method, run) => {
+      await run(native);
+      const calls = fake.callsTo(method);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.args).toEqual([OWNER, TRIP]);
+      expect(fake.calls).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    [
+      'pauseTracking',
+      (api: TripLocationNative, o: string, t: string) =>
+        api.pauseTracking(o, t),
+    ],
+    [
+      'resumeTracking',
+      (api: TripLocationNative, o: string, t: string) =>
+        api.resumeTracking(o, t),
+    ],
+  ])(
+    '%s refuses a blank owner or trip before calling native',
+    async (_m, run) => {
+      for (const [owner, trip] of [
+        ['', TRIP],
+        ['   ', TRIP],
+        [OWNER, ''],
+        [OWNER, '  '],
+      ]) {
+        await expect(run(native, owner!, trip!)).rejects.toMatchObject({
+          failure: 'invalid_argument',
+          code: null,
+        });
+      }
+      expect(fake.calls).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    [
+      'pauseTracking',
+      (api: TripLocationNative, o: string, t: string) =>
+        api.pauseTracking(o, t),
+    ],
+    [
+      'resumeTracking',
+      (api: TripLocationNative, o: string, t: string) =>
+        api.resumeTracking(o, t),
+    ],
+  ])('%s trims the ids before they reach native', async (method, run) => {
+    await run(native, `  ${OWNER} `, ` ${TRIP}  `);
+    expect(fake.callsTo(method)[0]!.args).toEqual([OWNER, TRIP]);
+  });
+
+  it.each([
+    [
+      'pauseTracking',
+      (api: TripLocationNative) => api.pauseTracking(OWNER, TRIP),
+    ],
+    [
+      'resumeTracking',
+      (api: TripLocationNative) => api.resumeTracking(OWNER, TRIP),
+    ],
+  ])('%s validates the status it is given back', async (_m, run) => {
+    fake.setStatus({ permission: 'coarse' });
+    await expect(run(native)).rejects.toMatchObject({
+      failure: 'invalid_native_response',
+    });
+    fake.setStatus({
+      permission: 'precise',
+      running: false,
+      paused: true,
+      ownerUserId: null,
+      tripId: null,
+    });
+    await expect(run(native)).rejects.toMatchObject({
+      failure: 'invalid_native_response',
+    });
+  });
+
+  it('returns the paused status a pause produced', async () => {
+    fake.setStatus({ running: true, paused: true });
+    await expect(native.pauseTracking(OWNER, TRIP)).resolves.toMatchObject({
+      running: true,
+      paused: true,
+      tripId: TRIP,
+    });
+  });
+
+  it('returns the active status a resume produced', async () => {
+    fake.setStatus({ running: true, paused: false });
+    await expect(native.resumeTracking(OWNER, TRIP)).resolves.toMatchObject({
+      running: true,
+      paused: false,
+      tripId: TRIP,
+    });
+  });
+
+  it.each(['pauseTracking', 'resumeTracking'])(
+    '%s narrows a frozen rejection code and drops the message',
+    async (method) => {
+      fake.rejectNext(
+        method,
+        Object.assign(new Error('SecurityException: lost permission'), {
+          code: 'location_permission_required',
+        }),
+      );
+      const failure = (await (
+        method === 'pauseTracking'
+          ? native.pauseTracking(OWNER, TRIP)
+          : native.resumeTracking(OWNER, TRIP)
+      ).catch((error: unknown) => error)) as TripLocationError;
+      expect(failure.failure).toBe('native_rejected');
+      expect(failure.code).toBe('location_permission_required');
+      expect(failure.message).not.toMatch(/SecurityException|permission lost/);
+    },
+  );
+
+  it.each(['pauseTracking', 'resumeTracking'])(
+    '%s drops an unrecognised rejection code',
+    async (method) => {
+      fake.rejectNext(
+        method,
+        Object.assign(new Error('boom'), { code: 'location_paused_failed' }),
+      );
+      await expect(
+        method === 'pauseTracking'
+          ? native.pauseTracking(OWNER, TRIP)
+          : native.resumeTracking(OWNER, TRIP),
+      ).rejects.toMatchObject({ failure: 'native_rejected', code: null });
+    },
+  );
+
+  it('exposes exactly the nine operations, pause and resume included', () => {
+    expect(Object.keys(native).sort()).toEqual([
       'acknowledgeDroppedSamples',
       'deleteQueuedSamples',
       'getStatus',
       'incrementAttempts',
+      'pauseTracking',
       'readQueuedSamples',
+      'resumeTracking',
       'startTracking',
       'stopTracking',
     ]);
-    expect(surface).not.toContain('clearQueue');
-    expect(surface).not.toContain('deleteTripSamples');
   });
 });
 

@@ -16,6 +16,7 @@ export type MockPermission = 'none' | 'approximate' | 'precise';
 
 export interface MockStatus {
   running: boolean;
+  paused: boolean;
   ownerUserId: string | null;
   tripId: string | null;
   permission: string;
@@ -44,6 +45,7 @@ interface Call {
 
 const STOPPED: MockStatus = {
   running: false,
+  paused: false,
   ownerUserId: null,
   tripId: null,
   permission: 'precise',
@@ -112,6 +114,17 @@ const NativeTripLocation = {
   },
   stopTracking: async () => {
     record('stopTracking');
+    return __tripLocationFake.status;
+  },
+  // Deliberately no pause/resume state machine here: the fake records the
+  // call and returns whatever status the test set, so a test asserts what the
+  // JavaScript makes of a status rather than what the fake would.
+  pauseTracking: async (ownerUserId: string, tripId: string) => {
+    record('pauseTracking', ownerUserId, tripId);
+    return __tripLocationFake.status;
+  },
+  resumeTracking: async (ownerUserId: string, tripId: string) => {
+    record('resumeTracking', ownerUserId, tripId);
     return __tripLocationFake.status;
   },
   readQueuedSamples: async (ownerUserId: string, limit: number) => {

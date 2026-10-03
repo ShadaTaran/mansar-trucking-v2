@@ -73,7 +73,23 @@ export interface QueuedLocationSample {
 
 /** What the native layer is currently doing, and what it is able to do. */
 export interface TripLocationStatus {
+  /**
+   * Whether a capture session is owned and alive.
+   *
+   * Not "fixes are reaching the queue": a paused session is still running,
+   * still owns its trip and still shows its notification. `paused` is what
+   * distinguishes those two.
+   */
   running: boolean;
+  /**
+   * Whether the owned session is currently admitting fixes.
+   *
+   * True only while `running` is true. It exists for the completion window:
+   * capture stops, the queue tail uploads, and the same session either ends or
+   * carries on — without surrendering the foreground service and without
+   * passing the start gates again.
+   */
+  paused: boolean;
   /** The login whose session is being captured, or null when stopped. */
   ownerUserId: string | null;
   /** The trip being recorded against, or null when stopped. */
@@ -131,6 +147,43 @@ export interface Spec extends TurboModule {
 
   /** Stops capture. Every queued row is preserved. */
   stopTracking(): Promise<TripLocationStatus>;
+
+  /**
+   * Pauses capture without giving up the session.
+   *
+   * The owner and trip are arguments rather than implied, so a stale caller
+   * cannot pause whichever session happens to be running: a mismatch is
+   * refused with `location_tracking_busy` and changes nothing. Pausing an
+   * already-paused session, or pausing when nothing runs, is a no-op that
+   * simply reports the status.
+   *
+   * No row is deleted, the foreground service stays up, and the owner and trip
+   * are retained — which is what makes the matching resume cheap.
+   */
+  pauseTracking(
+    ownerUserId: string,
+    tripId: string,
+  ): Promise<TripLocationStatus>;
+
+  /**
+   * Resumes a paused session on the service it already has.
+   *
+   * Deliberately not gated on a visibly foregrounded activity, unlike
+   * `startTracking`: the session and its notification were alive throughout,
+   * so a trip that is still in progress after a refused completion can carry
+   * on capturing even though the app went to the background while the request
+   * was in flight. If the provider cannot be restored the session stays
+   * paused and the call is refused with a fixed code; it never reports a
+   * capture it is not performing.
+   *
+   * `startTracking` with the same owner and trip does **not** resume a paused
+   * session — only this does — so ordinary reconciliation cannot reopen
+   * capture in the middle of a completion window.
+   */
+  resumeTracking(
+    ownerUserId: string,
+    tripId: string,
+  ): Promise<TripLocationStatus>;
 
   /**
    * Up to `limit` of this owner's rows, ordered `recordedAt` then `sampleId`.

@@ -13,10 +13,12 @@ import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReadableArray
 import com.facebook.react.bridge.ReadableType
+import com.facebook.react.bridge.UiThreadUtil
 import com.facebook.react.bridge.WritableMap
 import com.google.android.gms.common.ConnectionResult
 import com.google.android.gms.common.GoogleApiAvailability
 import com.mansar.driver.specs.NativeTripLocationSpec
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * The bridge between JavaScript and native location capture (Stage 8C.1).
@@ -79,9 +81,14 @@ class TripLocationModule(private val reactContext: ReactApplicationContext) :
    * first one has unsent samples.
    */
   private fun statusMap(ownerUserId: String): WritableMap {
-    val session = TripLocationRuntime.active
+    // One snapshot, not two reads: `running` and `paused` describe the same
+    // session, and reading them separately could report one session's pause
+    // state against another's identity.
+    val snapshot = TripLocationRuntime.snapshot()
+    val session = snapshot.session
     val map = Arguments.createMap()
     map.putBoolean("running", session != null)
+    map.putBoolean("paused", snapshot.paused)
     map.putString("ownerUserId", session?.ownerUserId)
     map.putString("tripId", session?.tripId)
     map.putString("permission", permissionState())
@@ -207,7 +214,11 @@ class TripLocationModule(private val reactContext: ReactApplicationContext) :
     val current = TripLocationRuntime.active
     if (current == candidate) {
       // Idempotent. Deliberately does not clear the last error either: an
-      // operational failure must not be erased because JS asked again.
+      // operational failure must not be erased because JS asked again — and
+      // deliberately does not resume a paused session, because ordinary
+      // reconciliation calling start() again must not reopen capture in the
+      // middle of a completion window. Only resumeTracking() may do that; the
+      // status returned here reports `paused` honestly.
       resolveStatus(owner, promise)
       return
     }
@@ -283,6 +294,90 @@ class TripLocationModule(private val reactContext: ReactApplicationContext) :
     // cleared and nothing was started, and the honest answer is the current
     // status rather than a start failure that never happened.
     resolveStatus(owner, promise)
+  }
+
+  /**
+   * Pauses capture for one owner and trip, keeping the session.
+   *
+   * The owner and trip are arguments rather than implied, so a stale screen
+   * cannot pause whatever session happens to be running — a mismatch is
+   * refused with the ordinary busy code and changes nothing.
+   */
+  override fun pauseTracking(
+    ownerUserId: String,
+    tripId: String,
+    promise: Promise,
+  ) {
+    transitionTracking(ownerUserId, tripId, promise, resuming = false)
+  }
+
+  /** Resumes a paused owner-and-trip session on its existing service. */
+  override fun resumeTracking(
+    ownerUserId: String,
+    tripId: String,
+    promise: Promise,
+  ) {
+    transitionTracking(ownerUserId, tripId, promise, resuming = true)
+  }
+
+  /**
+   * The shared body of pause and resume.
+   *
+   * Both validate their ids locally first, both are session-exact, and both
+   * report the resulting status rather than a boolean, so the caller learns
+   * `running`, `paused` and the counts in one answer. Neither starts or stops
+   * a service, and neither touches a queued row.
+   */
+  private fun transitionTracking(
+    ownerUserId: String,
+    tripId: String,
+    promise: Promise,
+    resuming: Boolean,
+  ) {
+    val owner = ownerUserId.trim()
+    val trip = tripId.trim()
+    if (owner.isEmpty() || trip.isEmpty()) {
+      reject(promise, TripLocationErrors.INVALID_ARGUMENT)
+      return
+    }
+    val target = TripLocationRuntime.Session(ownerUserId = owner, tripId = trip)
+
+    // One completion per invocation, enforced rather than assumed. A resume
+    // finishes on a provider callback, and a superseding pause or a service
+    // destruction can reach for the same waiter, so the guard is what makes
+    // "resolve once or reject once, never both, never twice" a property of the
+    // code instead of a convention.
+    val settled = AtomicBoolean(false)
+    val settle: (TrackingTransition) -> Unit = { result ->
+      if (settled.compareAndSet(false, true)) {
+        when (result) {
+          // Nothing running is an idempotent no-op, not a failure, and a
+          // superseded resume resolves with the real status — which reports
+          // `paused` honestly — rather than claiming a capture that a newer
+          // pause has already closed.
+          is TrackingTransition.Applied,
+          is TrackingTransition.NotRunning,
+          is TrackingTransition.Superseded -> resolveStatus(owner, promise)
+          is TrackingTransition.Busy ->
+            reject(promise, TripLocationErrors.TRACKING_BUSY)
+          // Already recorded by the service; rejecting with the same fixed
+          // code keeps the bridge contract and never carries platform text.
+          is TrackingTransition.Failed -> reject(promise, result.code)
+        }
+      }
+    }
+
+    // The TurboModule method may arrive on the native-modules thread, while
+    // the service's subscription, session fields and pending-resume identity
+    // are main-looper state. Dispatching here is what keeps all of that
+    // single-threaded, so identity comparisons need no second lock.
+    UiThreadUtil.runOnUiThread {
+      if (resuming) {
+        TripLocationService.resume(target, settle)
+      } else {
+        TripLocationService.pause(target, settle)
+      }
+    }
   }
 
   /**
@@ -458,6 +553,7 @@ class TripLocationModule(private val reactContext: ReactApplicationContext) :
   private fun stoppedStatusMap(): WritableMap {
     val map = Arguments.createMap()
     map.putBoolean("running", false)
+    map.putBoolean("paused", false)
     map.putString("ownerUserId", null)
     map.putString("tripId", null)
     map.putString("permission", permissionState())

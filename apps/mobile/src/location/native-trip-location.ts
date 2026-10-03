@@ -23,6 +23,12 @@ import type {
  * an operational failure; so an id that is blank, a limit outside 1..100 or a
  * duplicated sample id is refused *before* native is called.
  *
+ * The same applies to the pause pair: `pauseTracking` and `resumeTracking`
+ * are transport, not policy. They carry an owner and a trip so the native side
+ * can refuse a transition aimed at a session it does not own, and they report
+ * the resulting status rather than a boolean — but *when* a trip should pause
+ * is a decision made above this layer.
+ *
  * What it deliberately is not: it performs no capture, owns no lifecycle
  * decision, holds no credential and reads no token. It never logs — not a
  * coordinate, not an id, not an instant — and never surfaces a platform
@@ -61,7 +67,10 @@ export type TripLocationErrorCode = (typeof TRIP_LOCATION_ERROR_CODES)[number];
 
 /** Native status, once every field has been validated. */
 export interface TripLocationStatus {
+  /** The session is owned and alive — not necessarily admitting fixes. */
   readonly running: boolean;
+  /** The owned session is paused: no fix may reach the queue until resumed. */
+  readonly paused: boolean;
   readonly ownerUserId: string | null;
   readonly tripId: string | null;
   readonly permission: TripLocationPermission;
@@ -151,6 +160,14 @@ export interface TripLocationNative {
     tripId: string,
   ): Promise<TripLocationStatus>;
   stopTracking(): Promise<TripLocationStatus>;
+  pauseTracking(
+    ownerUserId: string,
+    tripId: string,
+  ): Promise<TripLocationStatus>;
+  resumeTracking(
+    ownerUserId: string,
+    tripId: string,
+  ): Promise<TripLocationStatus>;
   readQueuedSamples(
     ownerUserId: string,
     limit: number,
@@ -264,6 +281,7 @@ export function parseTripLocationStatus(
     return null;
   }
   const running = bool(value.running);
+  const paused = bool(value.paused);
   const ownerUserId = nullableStr(value.ownerUserId);
   const tripId = nullableStr(value.tripId);
   const permission = value.permission;
@@ -275,6 +293,7 @@ export function parseTripLocationStatus(
   const lastErrorCode = value.lastErrorCode;
   if (
     running === undefined ||
+    paused === undefined ||
     ownerUserId === undefined ||
     tripId === undefined ||
     !isPermission(permission) ||
@@ -287,8 +306,26 @@ export function parseTripLocationStatus(
   ) {
     return null;
   }
+  // The three states are the whole vocabulary, and each one fixes all four
+  // identity fields:
+  //
+  //   STOPPED  running false, paused false, owner null,     trip null
+  //   ACTIVE   running true,  paused false, owner non-null, trip non-null
+  //   PAUSED   running true,  paused true,  owner non-null, trip non-null
+  //
+  // Anything else is a combination the native side cannot be in, and every
+  // repair would be an invention: a pause with nothing running, a stopped
+  // session that still names a trip, or a running one that names neither an
+  // owner nor a trip. The whole status is refused instead.
+  const consistent = running
+    ? ownerUserId !== null && tripId !== null
+    : !paused && ownerUserId === null && tripId === null;
+  if (!consistent) {
+    return null;
+  }
   return {
     running,
+    paused,
     ownerUserId,
     tripId,
     permission,
@@ -485,6 +522,25 @@ export function createNativeTripLocation(
 
     stopTracking: async () =>
       requireStatus(await callNative(() => module.stopTracking())),
+
+    // Both carry the owner and trip for the same reason `startTracking` does:
+    // the native side refuses a transition aimed at a session it does not
+    // own, so a stale caller cannot pause or resume somebody else's capture.
+    pauseTracking: async (ownerUserId, tripId) => {
+      const owner = requireId(ownerUserId);
+      const trip = requireId(tripId);
+      return requireStatus(
+        await callNative(() => module.pauseTracking(owner, trip)),
+      );
+    },
+
+    resumeTracking: async (ownerUserId, tripId) => {
+      const owner = requireId(ownerUserId);
+      const trip = requireId(tripId);
+      return requireStatus(
+        await callNative(() => module.resumeTracking(owner, trip)),
+      );
+    },
 
     readQueuedSamples: async (ownerUserId, limit) => {
       const owner = requireId(ownerUserId);

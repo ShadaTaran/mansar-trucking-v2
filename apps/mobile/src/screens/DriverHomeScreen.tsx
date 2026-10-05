@@ -10,7 +10,8 @@ import {
   View,
 } from 'react-native';
 
-import { useSession } from '../auth/auth-context';
+import { useLocationLifecycle } from '../location/location-context';
+import { TrackingStatusSection } from '../location/TrackingStatusSection';
 import {
   driverTripMessage,
   TRIP_FALLBACK,
@@ -51,6 +52,16 @@ type ListState =
 
 const INITIAL_REQUEST: ListRequest = { status: null, page: 1, nonce: 0 };
 
+/**
+ * Shown when the lifecycle refused to sign out.
+ *
+ * Fixed wording, never a native or platform message: the driver needs to
+ * know they are *still signed in* and that retrying is the next step, and
+ * nothing about why the device could not stop its own service.
+ */
+export const SIGN_OUT_BLOCKED_MESSAGE =
+  'Tracking could not be stopped, so you are still signed in. Try again.';
+
 interface Props {
   readonly user: AuthUser;
   readonly api: DriverTripsApi;
@@ -66,8 +77,9 @@ interface Props {
  * loaded is never filtered again in the client.
  */
 export function DriverHomeScreen({ user, api, onOpenTrip }: Props) {
-  const session = useSession();
+  const location = useLocationLifecycle();
   const [signingOut, setSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
   const [request, setRequest] = useState<ListRequest>(INITIAL_REQUEST);
   const [state, setState] = useState<ListState>({ kind: 'loading' });
 
@@ -110,9 +122,23 @@ export function DriverHomeScreen({ user, api, onOpenTrip }: Props) {
       return;
     }
     setSigningOut(true);
-    // Local state is cleared first, which unmounts this screen; the API
-    // revocation continues best-effort in the background.
-    await session.logout();
+    setSignOutError(null);
+    // Deliberately not `session.logout()`. Signing out has to stop capture and
+    // upload whatever is still queued *while the credentials exist*, and only
+    // the orchestrator can order those steps; clearing auth first would make
+    // the final upload impossible and would unmount this screen before it
+    // could run. Clearing auth is the last thing that orchestration does.
+    try {
+      await location.signOut();
+      // On success this screen is unmounted by the auth state change, so
+      // nothing is reset here.
+    } catch {
+      // The lifecycle refused, which means capture could not be proven
+      // stopped and the driver is still authenticated. The only safe thing
+      // to show is a fixed sentence and a usable button.
+      setSignOutError(SIGN_OUT_BLOCKED_MESSAGE);
+      setSigningOut(false);
+    }
   };
 
   const total = state.kind === 'ready' ? state.page.total : 0;
@@ -126,6 +152,19 @@ export function DriverHomeScreen({ user, api, onOpenTrip }: Props) {
       <Text style={styles.title}>Mansar Driver</Text>
       <Text style={styles.line}>Signed in as {user.email}</Text>
       <Text style={styles.line}>Role: {user.role}</Text>
+
+      <TrackingStatusSection
+        onAcknowledgeGap={() => {
+          void location.acknowledgeDroppedSamples();
+        }}
+        onEnableTracking={() => {
+          void location.requestOrRetryTracking();
+        }}
+        onRetry={() => {
+          void location.retryReconcile();
+        }}
+        state={location.state}
+      />
 
       <Text style={styles.heading}>My trips</Text>
 
@@ -221,6 +260,12 @@ export function DriverHomeScreen({ user, api, onOpenTrip }: Props) {
           </View>
         )
       ) : null}
+
+      {signOutError === null ? null : (
+        <Text accessibilityRole="alert" style={styles.error}>
+          {signOutError}
+        </Text>
+      )}
 
       <Pressable
         accessibilityRole="button"

@@ -27,6 +27,10 @@ import {
 } from '../src/test/fake-auth-api';
 
 jest.mock('react-native-keychain');
+// The trip-location spec calls TurboModuleRegistry.getEnforcing at import
+// time, and the authenticated flow now builds the native wrapper; the
+// manual mock stands in for the service, provider and SQLite queue.
+jest.mock('../src/specs/NativeTripLocation');
 
 const { __keychainFake: keychain } = jest.requireMock<
   typeof import('../__mocks__/react-native-keychain')
@@ -34,6 +38,9 @@ const { __keychainFake: keychain } = jest.requireMock<
 const { __mansarConfigFake: nativeConfig } = jest.requireMock<
   typeof import('../src/specs/__mocks__/NativeMansarConfig')
 >('../src/specs/NativeMansarConfig');
+const { __tripLocationFake: tripLocation } = jest.requireMock<
+  typeof import('../src/specs/__mocks__/NativeTripLocation')
+>('../src/specs/NativeTripLocation');
 
 const PASSWORD = 'synthetic password value';
 
@@ -103,6 +110,7 @@ function renderedText(): string {
 beforeEach(() => {
   keychain.reset();
   nativeConfig.reset();
+  tripLocation.reset();
   resetDefaultSessionForTests();
   api = createFakeAuthApi();
   session = newSession();
@@ -439,6 +447,107 @@ describe('App driver trip flow', () => {
       await screen.findByRole('button', { name: 'Sign in' }),
     ).toBeOnTheScreen();
     expect(screen.queryByText('My trips')).toBeNull();
+    expect(keychain.entries.size).toBe(0);
+  });
+
+  it('mounts the location lifecycle above the trip screens, for this driver only', async () => {
+    await signedInDriver();
+
+    // The flow reconciled against the native session on mount, and the
+    // driver can see what tracking is doing.
+    expect(await screen.findByText('Trip tracking')).toBeOnTheScreen();
+    await waitFor(() =>
+      expect(tripLocation.callsTo('getStatus').length).toBeGreaterThan(0),
+    );
+    // Every owner-scoped call carries this login's id, so a second driver
+    // on the same device can never drain or stop the first one's session.
+    for (const call of tripLocation.calls) {
+      if (call.method !== 'stopTracking') {
+        expect(call.args[0]).toBe(DRIVER.id);
+      }
+    }
+    expect(renderedText()).not.toMatch(/synthetic\.access|synthetic-refresh/);
+  });
+
+  it('keeps the one lifecycle while a trip is opened and closed', async () => {
+    const urls = stubTripFetch();
+    (globalThis.fetch as jest.Mock).mockImplementation(
+      async (input: unknown) => {
+        const url = String(input);
+        urls.push(url);
+        const body = url.includes('/expenses')
+          ? EMPTY_EXPENSE_PAGE
+          : url.includes(`/driver/trips/${TRIP.id}`)
+            ? TRIP
+            : EMPTY_TRIP_PAGE;
+        return {
+          status: 200,
+          text: async () => JSON.stringify(body),
+        } as unknown as Response;
+      },
+    );
+    await signedInDriver();
+    await screen.findByText('Trip tracking');
+    const reconciliations = tripLocation.callsTo('stopTracking').length;
+
+    // The provider lives above the screen swap, so neither opening a trip
+    // nor pressing Back may rebuild it — a rebuild would reconcile again
+    // and would destroy a running capture session on the way.
+    (globalThis.fetch as jest.Mock).mockImplementation(
+      async (input: unknown) => {
+        const url = String(input);
+        const body = url.includes('/expenses')
+          ? EMPTY_EXPENSE_PAGE
+          : url.includes(`/driver/trips/${TRIP.id}`)
+            ? TRIP
+            : { items: [TRIP], page: 1, pageSize: 25, total: 1 };
+        return {
+          status: 200,
+          text: async () => JSON.stringify(body),
+        } as unknown as Response;
+      },
+    );
+    await fireEvent.press(screen.getByRole('button', { name: 'Assigned' }));
+    await fireEvent.press(
+      await screen.findByText('Synthetic Origin → Synthetic Destination'),
+    );
+    await screen.findByText('Status: ASSIGNED');
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Back to trips' }),
+    );
+    await screen.findByText('My trips');
+
+    expect(tripLocation.callsTo('stopTracking')).toHaveLength(reconciliations);
+    expect(screen.getByText('Trip tracking')).toBeOnTheScreen();
+  });
+
+  it('consults the queue while still authenticated, then clears the session', async () => {
+    tripLocation.setStatus({
+      running: true,
+      ownerUserId: DRIVER.id,
+      tripId: TRIP.id,
+      pendingCount: 1,
+    });
+    let nativeCallsAtLogout: string[] = [];
+    api.logout.mockImplementation(async () => {
+      nativeCallsAtLogout = tripLocation.calls.map((call) => call.method);
+    });
+    await signedInDriver();
+    await screen.findByText('Trip tracking');
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Sign out' }));
+    await screen.findByRole('button', { name: 'Sign in' });
+
+    // By the time the refresh token was revoked, capture had been stopped
+    // and the queue had been read for one last upload. Reversing those two
+    // would make the final upload impossible.
+    expect(nativeCallsAtLogout).toContain('stopTracking');
+    expect(nativeCallsAtLogout).toContain('readQueuedSamples');
+    // Nothing was deleted and no gap was acknowledged on the driver's
+    // behalf: whatever could not be uploaded is still there to retry.
+    const methods = tripLocation.calls.map((call) => call.method);
+    expect(methods).not.toContain('deleteQueuedSamples');
+    expect(methods).not.toContain('acknowledgeDroppedSamples');
     expect(keychain.entries.size).toBe(0);
   });
 });

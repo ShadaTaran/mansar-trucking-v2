@@ -18,6 +18,12 @@ import {
 } from './src/auth/session-manager';
 import { getApiBaseUrl } from './src/config/api';
 import { createDriverExpensesApi } from './src/expenses/driver-expenses-api';
+import { createDriverLocationApi } from './src/location/driver-location-api';
+import { LocationProvider } from './src/location/location-context';
+import { createLocationDrain } from './src/location/location-drain';
+import { createLocationPermissions } from './src/location/location-permissions';
+import { createNativeTripLocation } from './src/location/native-trip-location';
+import { createTripLocationOrchestrator } from './src/location/trip-location-orchestrator';
 import { createDriverReceiptsApi } from './src/receipts/driver-receipts-api';
 import {
   BootstrapErrorScreen,
@@ -58,10 +64,17 @@ function getDefaultSession(): SessionManager | null {
 /**
  * The signed-in driver flow: the trip list, or one trip.
  *
- * Navigation is one piece of local state, not a library. The trips API is
- * built once here from the session, so every trip request goes through the
- * existing authenticated fetch; when authentication ends this component
+ * Navigation is one piece of local state, not a library. Every driver
+ * aggregate is built once here from the session, so each request goes through
+ * the existing authenticated fetch; when authentication ends this component
  * unmounts and the selected trip disappears with it.
+ *
+ * This is also the location ownership point, and deliberately the only one.
+ * The native wrapper, the owner-scoped drain and the lifecycle orchestrator
+ * are built here — above the home/detail swap — so exactly one of each exists
+ * per signed-in driver and pressing Back cannot destroy a running capture
+ * session. A screen never builds them, and never sees the native module, the
+ * drain or the session behind them.
  */
 function AuthenticatedFlow({ user }: { readonly user: AuthUser }) {
   const session = useSession();
@@ -69,38 +82,66 @@ function AuthenticatedFlow({ user }: { readonly user: AuthUser }) {
   // One authenticated transport for every driver aggregate. Each API is a
   // thin binding over the same `createAuthenticatedFetch`, so the token lives
   // in exactly one place and no screen ever asks the session for it.
-  const apis = useMemo(() => {
+  const stack = useMemo(() => {
     const apiBaseUrl = getApiBaseUrl();
     if (apiBaseUrl === null) {
       return null;
     }
     const authenticatedFetch = createAuthenticatedFetch(session);
+    const trips = createDriverTripsApi(apiBaseUrl, authenticatedFetch);
+    const native = createNativeTripLocation();
+    // The drain is owner-scoped, not trip-scoped: rows preserved from a trip
+    // that ended days ago still have to reach the server, so it outlives every
+    // trip and is built once per signed-in driver.
+    const drain = createLocationDrain({
+      ownerUserId: user.id,
+      queue: native,
+      api: createDriverLocationApi(apiBaseUrl, authenticatedFetch),
+    });
     return {
-      trips: createDriverTripsApi(apiBaseUrl, authenticatedFetch),
+      trips,
       expenses: createDriverExpensesApi(apiBaseUrl, authenticatedFetch),
       receipts: createDriverReceiptsApi(apiBaseUrl, authenticatedFetch),
+      createOrchestrator: (
+        onChange: Parameters<
+          typeof createTripLocationOrchestrator
+        >[0]['onChange'],
+      ) =>
+        createTripLocationOrchestrator({
+          ownerUserId: user.id,
+          trips,
+          native,
+          drain,
+          permissions: createLocationPermissions(),
+          session,
+          onChange,
+        }),
     };
-  }, [session]);
+  }, [session, user.id]);
 
   // Unreachable in a configured build, which is the only kind that can
   // sign in at all; failing closed here beats inventing an endpoint.
-  if (apis === null) {
+  if (stack === null) {
     return <UnconfiguredBuildScreen />;
   }
-  return selectedTripId === null ? (
-    <DriverHomeScreen
-      api={apis.trips}
-      onOpenTrip={setSelectedTripId}
-      user={user}
-    />
-  ) : (
-    <DriverTripDetailScreen
-      api={apis.trips}
-      expensesApi={apis.expenses}
-      onBack={() => setSelectedTripId(null)}
-      receiptsApi={apis.receipts}
-      tripId={selectedTripId}
-    />
+  return (
+    <LocationProvider create={stack.createOrchestrator}>
+      {selectedTripId === null ? (
+        <DriverHomeScreen
+          api={stack.trips}
+          onOpenTrip={setSelectedTripId}
+          user={user}
+        />
+      ) : (
+        <DriverTripDetailScreen
+          api={stack.trips}
+          expensesApi={stack.expenses}
+          onBack={() => setSelectedTripId(null)}
+          receiptsApi={stack.receipts}
+          tripId={selectedTripId}
+        />
+      )}
+    </LocationProvider>
   );
 }
 

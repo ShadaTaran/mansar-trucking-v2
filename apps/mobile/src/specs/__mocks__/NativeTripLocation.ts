@@ -6,10 +6,17 @@
  * report, the rows it should hand back, or the fixed code it should reject
  * with, then assert what the Stage 8C.2 JavaScript makes of it.
  *
- * Deliberately **no behaviour of its own** — no capture, no filtering, no
- * queue, no network. It records the calls it received and returns what the
- * test told it to. Anything the JS tracker and drainer are responsible for is
- * therefore testable without a single line of Android code.
+ * Almost no behaviour of its own — no capture, no filtering, no queue, no
+ * network. Most operations record the call and return the status the test
+ * supplied, so anything the JS tracker and drainer are responsible for is
+ * testable without a single line of Android code.
+ *
+ * The one exception is a **successful `stopTracking`**, which enforces the
+ * real module's STOPPED ownership invariant: a stop that resolves has ended
+ * the owned session, so the fake stops reporting one. Returning a live
+ * session from a resolved stop would let an application-level test pass
+ * against behaviour the device cannot produce. Queue counts are untouched —
+ * stopping capture is not clearing the queue.
  */
 
 export type MockPermission = 'none' | 'approximate' | 'precise';
@@ -113,7 +120,18 @@ const NativeTripLocation = {
     return __tripLocationFake.status;
   },
   stopTracking: async () => {
+    // Recorded first, and deliberately not in a `finally`: a rejected stop
+    // must leave the status exactly as the test configured it, so a
+    // stop-failure test can still represent "the session may still be
+    // running".
     record('stopTracking');
+    __tripLocationFake.status = {
+      ...__tripLocationFake.status,
+      running: false,
+      paused: false,
+      ownerUserId: null,
+      tripId: null,
+    };
     return __tripLocationFake.status;
   },
   // Deliberately no pause/resume state machine here: the fake records the

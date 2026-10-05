@@ -10,11 +10,16 @@ import {
 
 import { AuthProvider } from '../auth/auth-context';
 import type { SessionManager } from '../auth/session-manager';
+import { LocationProvider } from '../location/location-context';
+import type {
+  TrackingProjection,
+  TripLocationOrchestrator,
+} from '../location/trip-location-orchestrator';
 import type {
   DriverTripsApi,
   ListDriverTripsQuery,
 } from '../trips/driver-trips-api';
-import { DriverHomeScreen } from './DriverHomeScreen';
+import { DriverHomeScreen, SIGN_OUT_BLOCKED_MESSAGE } from './DriverHomeScreen';
 
 const DRIVER: AuthUser = {
   id: '019a0000-0000-7000-8000-000000000001',
@@ -64,6 +69,70 @@ function fakeApi(list: DriverTripsApi['list']) {
   return { api, queries };
 }
 
+const PROJECTION: TrackingProjection = {
+  phase: 'inactive',
+  tripId: null,
+  permission: 'precise',
+  locationServicesEnabled: true,
+  playServicesAvailable: true,
+  notificationsEnabled: true,
+  pendingCount: 0,
+  droppedCount: 0,
+  nativeErrorCode: null,
+  drainOutcome: null,
+  completionUnknown: false,
+  problem: null,
+  signingOut: false,
+  busy: false,
+};
+
+/**
+ * A lifecycle double.
+ *
+ * The screen may reach tracking only through these methods, so recording
+ * them is how a test can tell delegation from a screen doing the work
+ * itself. No native module is loaded: the provider and the status section
+ * import the orchestrator for its types only.
+ */
+function fakeLifecycle(
+  projection: Partial<TrackingProjection> = {},
+  over: Partial<Pick<TripLocationOrchestrator, 'signOut'>> = {},
+) {
+  const calls: string[] = [];
+  const state = { ...PROJECTION, ...projection };
+  const note = (name: string) => {
+    calls.push(name);
+  };
+  const orchestrator: TripLocationOrchestrator = {
+    state: () => state,
+    initialize: async () => note('initialize'),
+    startTrip: async () => {
+      note('startTrip');
+      return TRIP;
+    },
+    completeTrip: async () => {
+      note('completeTrip');
+      return TRIP;
+    },
+    signOut: async () => {
+      // Recorded before the scripted answer, so a refusal still proves
+      // that the screen asked the lifecycle rather than the session.
+      note('signOut');
+      await (over.signOut ?? (async () => undefined))();
+    },
+    retryReconcile: async () => note('retryReconcile'),
+    requestOrRetryTracking: async () => note('requestOrRetryTracking'),
+    acknowledgeDroppedSamples: async () => note('acknowledgeDroppedSamples'),
+    onForeground: async () => note('onForeground'),
+    dispose: () => note('dispose'),
+  };
+  return {
+    orchestrator,
+    calls,
+    count: (name: string) => calls.filter((one) => one === name).length,
+  };
+}
+
 const logout = jest.fn(() => Promise.resolve());
 const session = {
   logout,
@@ -71,10 +140,16 @@ const session = {
   subscribe: () => () => undefined,
 } as unknown as SessionManager;
 
-async function renderHome(api: DriverTripsApi, onOpenTrip = jest.fn()) {
+async function renderHome(
+  api: DriverTripsApi,
+  onOpenTrip = jest.fn(),
+  lifecycle = fakeLifecycle(),
+) {
   await render(
     <AuthProvider session={session}>
-      <DriverHomeScreen api={api} onOpenTrip={onOpenTrip} user={DRIVER} />
+      <LocationProvider create={() => lifecycle.orchestrator}>
+        <DriverHomeScreen api={api} onOpenTrip={onOpenTrip} user={DRIVER} />
+      </LocationProvider>
     </AuthProvider>,
   );
   return onOpenTrip;
@@ -355,14 +430,117 @@ describe('DriverHomeScreen actions', () => {
     expect(onOpenTrip).toHaveBeenCalledTimes(1);
   });
 
-  it('still signs out', async () => {
+  it('signs out through the lifecycle, never by clearing auth first', async () => {
     const { api } = fakeApi(() => Promise.resolve(page([])));
-    await renderHome(api);
+    const lifecycle = fakeLifecycle();
+    await renderHome(api, jest.fn(), lifecycle);
     await screen.findByText('No trips found.');
 
     await fireEvent.press(screen.getByRole('button', { name: 'Sign out' }));
 
-    await waitFor(() => expect(logout).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(lifecycle.count('signOut')).toBe(1));
+    // Clearing the session here would unmount this screen before the
+    // queued positions could be uploaded, so the screen must not: the
+    // orchestrator clears auth last, after the final drain.
+    expect(logout).not.toHaveBeenCalled();
+  });
+
+  it('keeps the driver signed in when the lifecycle refuses', async () => {
+    const { api } = fakeApi(() => Promise.resolve(page([])));
+    // The shape the orchestrator rejects with when a native stop cannot
+    // be proven. Its message is deliberately noisy here so the test can
+    // prove none of it is shown.
+    const refusal = Object.assign(
+      new Error('location lifecycle refused: location_queue_error'),
+      { name: 'TrackingLifecycleError', problem: 'tracking_unavailable' },
+    );
+    let attempts = 0;
+    const lifecycle = fakeLifecycle(
+      {},
+      {
+        signOut: async () => {
+          attempts += 1;
+          if (attempts === 1) {
+            throw refusal;
+          }
+        },
+      },
+    );
+    await renderHome(api, jest.fn(), lifecycle);
+    await screen.findByText('No trips found.');
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Sign out' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      SIGN_OUT_BLOCKED_MESSAGE,
+    );
+    // Still signed in, still on this screen, and the way out is usable
+    // again: a disabled button here would strand the driver.
+    expect(
+      screen.getByText('Signed in as driver@example.test'),
+    ).toBeOnTheScreen();
+    expect(screen.getByRole('button', { name: 'Sign out' })).not.toBeDisabled();
+    expect(logout).not.toHaveBeenCalled();
+    // No native code and no exception name reaches the driver.
+    expect(renderedText()).not.toContain('location_queue_error');
+    expect(renderedText()).not.toContain('TrackingLifecycleError');
+    expect(renderedText()).not.toContain('tracking_unavailable');
+
+    // The retry is an ordinary second press, and it is allowed to work.
+    await fireEvent.press(screen.getByRole('button', { name: 'Sign out' }));
+    await waitFor(() => expect(lifecycle.count('signOut')).toBe(2));
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(logout).not.toHaveBeenCalled();
+  });
+
+  it('shows what tracking is doing, above the trip list', async () => {
+    const { api } = fakeApi(() => Promise.resolve(page([TRIP])));
+    await renderHome(
+      api,
+      jest.fn(),
+      fakeLifecycle({ phase: 'active', tripId: TRIP.id, pendingCount: 2 }),
+    );
+    await screen.findByText('Status: ASSIGNED');
+
+    expect(screen.getByText('Trip tracking')).toBeOnTheScreen();
+    expect(screen.getByText('Tracking this trip')).toBeOnTheScreen();
+    expect(
+      screen.getByText(/2 recorded positions waiting to upload/),
+    ).toBeOnTheScreen();
+    const order = renderedText();
+    expect(order.indexOf('Trip tracking')).toBeLessThan(
+      order.indexOf('My trips'),
+    );
+    // The trip id it tracks is not something the driver is shown.
+    expect(order).not.toContain(TRIP.id);
+  });
+
+  it('routes every tracking control to the lifecycle', async () => {
+    const { api } = fakeApi(() => Promise.resolve(page([])));
+    const lifecycle = fakeLifecycle({
+      phase: 'unavailable',
+      permission: 'none',
+      problem: 'lookup_failed',
+      droppedCount: 2,
+    });
+    await renderHome(api, jest.fn(), lifecycle);
+    await screen.findByText('No trips found.');
+
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Enable tracking' }),
+    );
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Check trip status' }),
+    );
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'I understand the gap' }),
+    );
+
+    expect(lifecycle.count('requestOrRetryTracking')).toBe(1);
+    expect(lifecycle.count('retryReconcile')).toBe(1);
+    expect(lifecycle.count('acknowledgeDroppedSamples')).toBe(1);
+    // The list is untouched by any of it.
+    expect(api.list).toHaveBeenCalledTimes(1);
   });
 
   it('renders no token material', async () => {

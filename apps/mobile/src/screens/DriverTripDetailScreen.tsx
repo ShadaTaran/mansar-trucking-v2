@@ -12,6 +12,8 @@ import {
 import type { DriverExpensesApi } from '../expenses/driver-expenses-api';
 import { ExpenseDetailView } from '../expenses/ExpenseDetailView';
 import { TripExpensesSection } from '../expenses/TripExpensesSection';
+import { useLocationLifecycle } from '../location/location-context';
+import { TrackingStatusSection } from '../location/TrackingStatusSection';
 import type { DriverReceiptsApi } from '../receipts/driver-receipts-api';
 import {
   driverTripMessage,
@@ -41,9 +43,49 @@ interface Action {
   readonly question: string;
   readonly confirmLabel: string;
   readonly keepLabel: string;
-  readonly outcome: string;
+  readonly outcome: (trip: Trip) => string;
   readonly fallback: string;
   readonly run: (tripId: string) => Promise<Trip>;
+}
+
+/**
+ * What the driver is told after a mutation, derived from the authoritative
+ * trip rather than from which button was pressed.
+ */
+function startOutcome(trip: Trip): string {
+  return trip.status === 'IN_PROGRESS'
+    ? 'Trip started.'
+    : 'This trip is not in progress.';
+}
+
+function completeOutcome(trip: Trip): string {
+  if (trip.status === 'IN_PROGRESS') {
+    return 'This trip is still in progress.';
+  }
+  return trip.status === 'COMPLETED' ||
+    trip.status === 'VERIFIED' ||
+    trip.status === 'CLOSED'
+    ? 'Trip completed.'
+    : 'This trip can no longer be completed.';
+}
+
+/** Shown when tracking could not be paused, so the trip was not completed. */
+export const TRACKING_BLOCKED_MESSAGE =
+  'Tracking could not be paused, so this trip was not completed. Try again.';
+
+/**
+ * A lifecycle refusal, recognised by name rather than by `instanceof`.
+ *
+ * Importing the orchestrator here would pull the native module into every
+ * render of this screen — and into every test of it — for one error check.
+ * The class sets its own `name`, so the check is exact without the coupling.
+ */
+function isTrackingLifecycleError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { name?: unknown }).name === 'TrackingLifecycleError'
+  );
 }
 
 /** What a status with no driver action has to say for itself. */
@@ -83,6 +125,7 @@ export function DriverTripDetailScreen({
   receiptsApi,
   onBack,
 }: Props) {
+  const location = useLocationLifecycle();
   const [state, setState] = useState<LoadState>({ kind: 'loading' });
   const [attempt, setAttempt] = useState(0);
   // Expense navigation is local to this screen, exactly as trip selection is
@@ -143,9 +186,13 @@ export function DriverTripDetailScreen({
             question: 'Start this trip?',
             confirmLabel: 'Confirm start',
             keepLabel: 'Keep trip assigned',
-            outcome: 'Trip started.',
+            outcome: startOutcome,
             fallback: TRIP_FALLBACK.start,
-            run: (id) => api.start(id),
+            // Through the orchestrator, not `api.start`: the server must
+            // answer before any capture begins, and a lost response has to be
+            // reconciled before the lifecycle decides anything. Calling the
+            // API here would let a screen bypass that order.
+            run: (id) => location.startTrip(id),
           }
         : trip.status === 'IN_PROGRESS'
           ? {
@@ -153,9 +200,11 @@ export function DriverTripDetailScreen({
               question: 'Complete this trip?',
               confirmLabel: 'Confirm completion',
               keepLabel: 'Keep trip in progress',
-              outcome: 'Trip completed.',
+              outcome: completeOutcome,
               fallback: TRIP_FALLBACK.complete,
-              run: (id) => api.complete(id),
+              // Pause, drain one batch, then complete — the whole sequence
+              // belongs to orchestration, so the screen cannot skip a step.
+              run: (id) => location.completeTrip(id),
             }
           : null;
 
@@ -171,15 +220,22 @@ export function DriverTripDetailScreen({
       if (!mounted.current) {
         return;
       }
-      // The response is the authority on the new state.
+      // The response is the authority on the new state, and on what the
+      // driver is told: a completion the server refused still returns a trip,
+      // and saying "Trip completed." over an authoritative IN_PROGRESS would
+      // be the one message a driver must never be given.
       setState({ kind: 'ready', trip: updated });
-      setOutcome(action.outcome);
+      setOutcome(action.outcome(updated));
     } catch (error) {
       if (!mounted.current) {
         return;
       }
       // The last authoritative trip is kept exactly as it was.
-      setActionError(driverTripMessage(error, action.fallback));
+      setActionError(
+        isTrackingLifecycleError(error)
+          ? TRACKING_BLOCKED_MESSAGE
+          : driverTripMessage(error, action.fallback),
+      );
     }
     setBusy(false);
     setConfirming(false);
@@ -288,6 +344,19 @@ export function DriverTripDetailScreen({
         onOpenExpense={setSelectedExpenseId}
         tripId={tripId}
         tripStatus={state.trip.status}
+      />
+
+      <TrackingStatusSection
+        onAcknowledgeGap={() => {
+          void location.acknowledgeDroppedSamples();
+        }}
+        onEnableTracking={() => {
+          void location.requestOrRetryTracking();
+        }}
+        onRetry={() => {
+          void location.retryReconcile();
+        }}
+        state={location.state}
       />
 
       {action && !confirming ? (

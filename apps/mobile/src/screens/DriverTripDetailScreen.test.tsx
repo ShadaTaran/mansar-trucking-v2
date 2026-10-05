@@ -10,9 +10,17 @@ import {
 import type { Expense, Page, Receipt } from '@mansar/types';
 
 import type { DriverExpensesApi } from '../expenses/driver-expenses-api';
+import { LocationProvider } from '../location/location-context';
+import type {
+  TrackingProjection,
+  TripLocationOrchestrator,
+} from '../location/trip-location-orchestrator';
 import type { DriverReceiptsApi } from '../receipts/driver-receipts-api';
 import type { DriverTripsApi } from '../trips/driver-trips-api';
-import { DriverTripDetailScreen } from './DriverTripDetailScreen';
+import {
+  DriverTripDetailScreen,
+  TRACKING_BLOCKED_MESSAGE,
+} from './DriverTripDetailScreen';
 
 const TRIP_ID = '019a0000-0000-7000-8000-00000000001a';
 
@@ -105,20 +113,87 @@ function fakeReceiptsApi(
   };
 }
 
+const PROJECTION: TrackingProjection = {
+  phase: 'inactive',
+  tripId: null,
+  permission: 'precise',
+  locationServicesEnabled: true,
+  playServicesAvailable: true,
+  notificationsEnabled: true,
+  pendingCount: 0,
+  droppedCount: 0,
+  nativeErrorCode: null,
+  drainOutcome: null,
+  completionUnknown: false,
+  problem: null,
+  signingOut: false,
+  busy: false,
+};
+
+/**
+ * A lifecycle double whose mutations end up where the real one's do.
+ *
+ * By default `startTrip` and `completeTrip` call the same trips API the
+ * orchestrator would, so every existing refusal, race and idempotence
+ * assertion below still describes the request the server receives. Tests
+ * that care about *who* called it override the method instead.
+ */
+function fakeLifecycle(
+  api: DriverTripsApi,
+  projection: Partial<TrackingProjection> = {},
+  over: Partial<
+    Pick<TripLocationOrchestrator, 'startTrip' | 'completeTrip'>
+  > = {},
+) {
+  const calls: string[] = [];
+  const state = { ...PROJECTION, ...projection };
+  const note = (name: string) => {
+    calls.push(name);
+  };
+  const orchestrator: TripLocationOrchestrator = {
+    state: () => state,
+    initialize: async () => note('initialize'),
+    // The call is recorded here, before the answer is produced, so an
+    // overridden answer still proves who the screen asked.
+    startTrip: (tripId) => {
+      note('startTrip');
+      return (over.startTrip ?? ((id: string) => api.start(id)))(tripId);
+    },
+    completeTrip: (tripId) => {
+      note('completeTrip');
+      return (over.completeTrip ?? ((id: string) => api.complete(id)))(tripId);
+    },
+    signOut: async () => note('signOut'),
+    retryReconcile: async () => note('retryReconcile'),
+    requestOrRetryTracking: async () => note('requestOrRetryTracking'),
+    acknowledgeDroppedSamples: async () => note('acknowledgeDroppedSamples'),
+    onForeground: async () => note('onForeground'),
+    dispose: () => note('dispose'),
+  };
+  return {
+    orchestrator,
+    calls,
+    count: (name: string) => calls.filter((one) => one === name).length,
+  };
+}
+
 async function renderDetail(
   api: DriverTripsApi,
   onBack = jest.fn(),
   expensesApi: DriverExpensesApi = fakeExpensesApi(),
   receiptsApi: DriverReceiptsApi = fakeReceiptsApi(),
+  lifecycle = fakeLifecycle(api),
 ) {
   await render(
-    <DriverTripDetailScreen
-      api={api}
-      expensesApi={expensesApi}
-      onBack={onBack}
-      receiptsApi={receiptsApi}
-      tripId={TRIP_ID}
-    />,
+    <LocationProvider create={() => lifecycle.orchestrator}>
+      <DriverTripDetailScreen
+        api={api}
+        expensesApi={expensesApi}
+        onBack={onBack}
+        receiptsApi={receiptsApi}
+        tripId={TRIP_ID}
+      />
+    </LocationProvider>,
   );
   return onBack;
 }
@@ -891,5 +966,210 @@ describe('DriverTripDetailScreen expense integration', () => {
     const shown = renderedText();
     expect(shown).not.toContain('019a0000-0000-7000-8000-00000000000d');
     expect(shown).not.toMatch(/objectKey|bucket|x-amz|signature|policy/i);
+  });
+});
+
+describe('DriverTripDetailScreen lifecycle delegation', () => {
+  const started = trip('IN_PROGRESS', {
+    startedAt: '2026-09-24T01:00:00.000Z',
+  });
+  const completed = trip('COMPLETED', {
+    startedAt: '2026-09-24T01:00:00.000Z',
+    completedAt: '2026-09-24T05:00:00.000Z',
+  });
+
+  /** Presses the action button and then its confirmation. */
+  async function confirm(label: string, confirmLabel: string): Promise<void> {
+    await fireEvent.press(screen.getByRole('button', { name: label }));
+    await fireEvent.press(screen.getByRole('button', { name: confirmLabel }));
+  }
+
+  it('starts the trip through the lifecycle, not through the API itself', async () => {
+    // `api.start` rejects unless a test scripts it, so a screen that called it
+    // directly would fail here rather than quietly bypass orchestration.
+    const api = fakeApi({ get: () => Promise.resolve(trip('ASSIGNED')) });
+    const lifecycle = fakeLifecycle(
+      api,
+      {},
+      {
+        startTrip: () => Promise.resolve(started),
+      },
+    );
+    await renderDetail(
+      api,
+      jest.fn(),
+      fakeExpensesApi(),
+      fakeReceiptsApi(),
+      lifecycle,
+    );
+    await screen.findByText('Status: ASSIGNED');
+
+    await confirm('Start trip', 'Confirm start');
+
+    expect(await screen.findByText('Trip started.')).toBeOnTheScreen();
+    expect(lifecycle.count('startTrip')).toBe(1);
+    expect(api.start).not.toHaveBeenCalled();
+    // The authoritative trip the lifecycle returned became the rendered state.
+    expect(screen.getByText('Status: IN_PROGRESS')).toBeOnTheScreen();
+    expect(
+      screen.getByRole('button', { name: 'Complete trip' }),
+    ).toBeOnTheScreen();
+  });
+
+  it('completes the trip through the lifecycle, not through the API itself', async () => {
+    const api = fakeApi({ get: () => Promise.resolve(trip('IN_PROGRESS')) });
+    const lifecycle = fakeLifecycle(
+      api,
+      {},
+      {
+        completeTrip: () => Promise.resolve(completed),
+      },
+    );
+    await renderDetail(
+      api,
+      jest.fn(),
+      fakeExpensesApi(),
+      fakeReceiptsApi(),
+      lifecycle,
+    );
+    await screen.findByText('Status: IN_PROGRESS');
+
+    await confirm('Complete trip', 'Confirm completion');
+
+    expect(await screen.findByText('Trip completed.')).toBeOnTheScreen();
+    expect(lifecycle.count('completeTrip')).toBe(1);
+    expect(api.complete).not.toHaveBeenCalled();
+    expect(screen.getByText('Status: COMPLETED')).toBeOnTheScreen();
+  });
+
+  it('does not complete the trip when tracking cannot be paused', async () => {
+    const api = fakeApi({ get: () => Promise.resolve(trip('IN_PROGRESS')) });
+    const lifecycle = fakeLifecycle(
+      api,
+      {},
+      {
+        completeTrip: () =>
+          Promise.reject(
+            Object.assign(new Error('refused'), {
+              name: 'TrackingLifecycleError',
+              problem: 'tracking_unavailable',
+            }),
+          ),
+      },
+    );
+    await renderDetail(
+      api,
+      jest.fn(),
+      fakeExpensesApi(),
+      fakeReceiptsApi(),
+      lifecycle,
+    );
+    await screen.findByText('Status: IN_PROGRESS');
+
+    await confirm('Complete trip', 'Confirm completion');
+
+    // A refusal is said in the driver's terms, and the trip is untouched: a
+    // completion over still-running capture would keep collecting positions
+    // for a journey the server considers over.
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      TRACKING_BLOCKED_MESSAGE,
+    );
+    expect(api.complete).not.toHaveBeenCalled();
+    expect(screen.getByText('Status: IN_PROGRESS')).toBeOnTheScreen();
+    expect(
+      screen.getByRole('button', { name: 'Complete trip' }),
+    ).toBeOnTheScreen();
+    expect(screen.queryByText('Trip completed.')).toBeNull();
+    expect(renderedText()).not.toContain('tracking_unavailable');
+  });
+
+  it.each([
+    ['IN_PROGRESS', 'This trip is still in progress.'],
+    ['CANCELLED', 'This trip can no longer be completed.'],
+  ] as const)(
+    'never claims a completion the server reported as %s',
+    async (status, message) => {
+      const api = fakeApi({
+        get: () => Promise.resolve(trip('IN_PROGRESS')),
+        complete: () => Promise.resolve(trip(status)),
+      });
+      await renderDetail(api);
+      await screen.findByText('Status: IN_PROGRESS');
+
+      await confirm('Complete trip', 'Confirm completion');
+
+      // The message follows the returned trip, not the button pressed.
+      expect(await screen.findByText(message)).toBeOnTheScreen();
+      expect(screen.queryByText('Trip completed.')).toBeNull();
+    },
+  );
+
+  it('never claims a start the server did not apply', async () => {
+    const api = fakeApi({
+      get: () => Promise.resolve(trip('ASSIGNED')),
+      complete: () => Promise.reject(new Error('not used')),
+      start: () => Promise.resolve(trip('ASSIGNED')),
+    });
+    await renderDetail(api);
+    await screen.findByText('Status: ASSIGNED');
+
+    await confirm('Start trip', 'Confirm start');
+
+    expect(
+      await screen.findByText('This trip is not in progress.'),
+    ).toBeOnTheScreen();
+    expect(screen.queryByText('Trip started.')).toBeNull();
+  });
+
+  it('shows tracking state and routes its controls to the lifecycle', async () => {
+    const api = fakeApi({ get: () => Promise.resolve(trip('IN_PROGRESS')) });
+    const lifecycle = fakeLifecycle(api, {
+      phase: 'unavailable',
+      permission: 'none',
+      problem: 'lookup_failed',
+      droppedCount: 1,
+      pendingCount: 4,
+    });
+    await renderDetail(
+      api,
+      jest.fn(),
+      fakeExpensesApi(),
+      fakeReceiptsApi(),
+      lifecycle,
+    );
+    await screen.findByText('Status: IN_PROGRESS');
+
+    expect(screen.getByText('Trip tracking')).toBeOnTheScreen();
+    expect(screen.getByText('Tracking unavailable')).toBeOnTheScreen();
+    expect(
+      screen.getByText(/4 recorded positions waiting to upload/),
+    ).toBeOnTheScreen();
+
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Enable tracking' }),
+    );
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Check trip status' }),
+    );
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'I understand the gap' }),
+    );
+
+    expect(lifecycle.count('requestOrRetryTracking')).toBe(1);
+    expect(lifecycle.count('retryReconcile')).toBe(1);
+    expect(lifecycle.count('acknowledgeDroppedSamples')).toBe(1);
+  });
+
+  it('keeps Back working with tracking on screen', async () => {
+    const api = fakeApi({ get: () => Promise.resolve(trip('IN_PROGRESS')) });
+    const onBack = await renderDetail(api);
+    await screen.findByText('Status: IN_PROGRESS');
+
+    await fireEvent.press(
+      screen.getByRole('button', { name: 'Back to trips' }),
+    );
+
+    expect(onBack).toHaveBeenCalledTimes(1);
+    expect(api.complete).not.toHaveBeenCalled();
   });
 });

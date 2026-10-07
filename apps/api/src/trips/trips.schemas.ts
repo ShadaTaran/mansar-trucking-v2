@@ -55,6 +55,8 @@ function entityId(field: string, subject: string) {
 }
 
 export const tripIdSchema = entityId('id', 'trip');
+/** The same identity under its sub-resource name, as `:tripId`. */
+export const tripIdParamSchema = entityId('tripId', 'trip');
 
 /**
  * A timezone-qualified ISO 8601 instant, parsed to a Date only once the
@@ -173,6 +175,31 @@ export const listDriverTripsSchema = z.strictObject({
     .optional(),
 });
 export type ListDriverTripsQuery = z.infer<typeof listDriverTripsSchema>;
+
+/**
+ * The admin location-history query (Stage 8D.1).
+ *
+ * Deliberately not `listTripsSchema`: the trip is the route, so `status`,
+ * `driverId`, `vehicleId` and free-text search have nothing to select here
+ * and are unknown keys. Paging is the only thing a caller may ask for, and
+ * it is the same page/pageSize convention every other listing uses — there
+ * is no second pagination style in this API.
+ *
+ * Ordering is not a parameter either. History is returned in capture order
+ * (`recordedAt`, then `id`) because that is the journey; a sort control
+ * would only offer ways to misread it.
+ */
+export const listLocationSamplesSchema = z.strictObject({
+  page: positiveIntegerQuery('page', 9).optional(),
+  pageSize: positiveIntegerQuery('pageSize', 3)
+    .refine((value) => value <= MAX_PAGE_SIZE, {
+      error: `pageSize must be at most ${MAX_PAGE_SIZE}`,
+    })
+    .optional(),
+});
+export type ListLocationSamplesQuery = z.infer<
+  typeof listLocationSamplesSchema
+>;
 
 /** The frozen Stage 8 batch window: one sample at minimum, 100 at most. */
 export const MIN_LOCATION_SAMPLES = 1;

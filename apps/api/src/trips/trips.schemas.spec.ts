@@ -7,12 +7,14 @@ import {
   DESTINATION_MAX_LENGTH,
   ingestLocationSamplesSchema,
   listDriverTripsSchema,
+  listLocationSamplesSchema,
   listTripsSchema,
   MAX_LOCATION_SAMPLES,
   MIN_LOCATION_SAMPLES,
   NOTES_MAX_LENGTH,
   ORIGIN_MAX_LENGTH,
   SEARCH_MAX_LENGTH,
+  tripIdParamSchema,
   tripIdSchema,
   updateTripSchema,
 } from './trips.schemas.js';
@@ -666,5 +668,85 @@ describe('ingestLocationSamplesSchema', () => {
       expect(result.success).toBe(false);
       expect(firstError(result)).toContain('recordedAt');
     });
+  });
+});
+
+describe('listLocationSamplesSchema', () => {
+  it('accepts an empty query and defaults nothing itself', () => {
+    // The defaults live in the service, as they do for every other listing.
+    expect(listLocationSamplesSchema.safeParse({}).data).toEqual({});
+  });
+
+  it('parses page only, pageSize only, and both', () => {
+    expect(listLocationSamplesSchema.safeParse({ page: '2' }).data).toEqual({
+      page: 2,
+    });
+    expect(
+      listLocationSamplesSchema.safeParse({ pageSize: '50' }).data,
+    ).toEqual({ pageSize: 50 });
+    expect(
+      listLocationSamplesSchema.safeParse({ page: '3', pageSize: '10' }).data,
+    ).toEqual({ page: 3, pageSize: 10 });
+  });
+
+  it('accepts the page-size boundaries', () => {
+    expect(
+      listLocationSamplesSchema.safeParse({ pageSize: '1' }).data?.pageSize,
+    ).toBe(1);
+    expect(
+      listLocationSamplesSchema.safeParse({ pageSize: '100' }).data?.pageSize,
+    ).toBe(100);
+  });
+
+  it.each([
+    ['page zero', { page: '0' }],
+    ['a negative page', { page: '-1' }],
+    ['a fractional page', { page: '1.5' }],
+    ['a non-numeric page', { page: 'two' }],
+    ['an exponent page', { page: '1e2' }],
+    ['a padded page', { page: '01' }],
+    ['page size zero', { pageSize: '0' }],
+    ['a negative page size', { pageSize: '-1' }],
+    ['a fractional page size', { pageSize: '1.5' }],
+    ['a non-numeric page size', { pageSize: 'ten' }],
+    ['an exponent page size', { pageSize: '1e2' }],
+    ['a page size above the maximum', { pageSize: '101' }],
+    ['a page size of four digits', { pageSize: '1000' }],
+  ])('rejects %s', (_label, query) => {
+    expect(listLocationSamplesSchema.safeParse(query).success).toBe(false);
+  });
+
+  it.each([
+    ['a status filter', { status: 'IN_PROGRESS' }],
+    ['a driver filter', { driverId: DRIVER_ID }],
+    ['a vehicle filter', { vehicleId: VEHICLE_ID }],
+    ['free-text search', { q: 'manila' }],
+    ['a date range', { from: START, to: END }],
+    ['a sort control', { sort: 'recordedAt' }],
+    ['an order control', { order: 'desc' }],
+    ['a trip id in the query', { tripId: TRIP_ID }],
+    ['any unknown key', { anything: '1' }],
+  ])('refuses %s: the trip is the route and order is frozen', (_l, query) => {
+    expect(listLocationSamplesSchema.safeParse(query).success).toBe(false);
+  });
+
+  it('reports the maximum without repeating the submitted value', () => {
+    const result = listLocationSamplesSchema.safeParse({ pageSize: '4096' });
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result.error?.issues)).not.toContain('4096');
+  });
+});
+
+describe('tripIdParamSchema', () => {
+  it('accepts a UUID v7 and names the sub-resource parameter', () => {
+    expect(tripIdParamSchema.safeParse(TRIP_ID).data).toBe(TRIP_ID);
+    const result = tripIdParamSchema.safeParse(UUID_V4);
+    expect(result.success).toBe(false);
+    expect(firstError(result)).toContain('tripId');
+  });
+
+  it('never repeats the rejected identifier', () => {
+    const result = tripIdParamSchema.safeParse(UUID_V4);
+    expect(JSON.stringify(result.error?.issues)).not.toContain(UUID_V4);
   });
 });

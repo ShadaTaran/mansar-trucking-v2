@@ -145,6 +145,11 @@ describe('TripsService', () => {
       findFirst: ReturnType<typeof vi.fn>;
     };
     driver: { findUnique: ReturnType<typeof vi.fn> };
+    tripLocationSample: {
+      findFirst: ReturnType<typeof vi.fn>;
+      findMany: ReturnType<typeof vi.fn>;
+      count: ReturnType<typeof vi.fn>;
+    };
   };
   let audit: { record: ReturnType<typeof vi.fn> };
   let service: TripsService;
@@ -178,6 +183,11 @@ describe('TripsService', () => {
         findFirst: vi.fn(),
       },
       driver: { findUnique: vi.fn() },
+      tripLocationSample: {
+        findFirst: vi.fn(),
+        findMany: vi.fn(),
+        count: vi.fn(),
+      },
     };
     audit = { record: vi.fn().mockResolvedValue(undefined) };
     service = new TripsService(
@@ -1397,6 +1407,237 @@ describe('TripsService', () => {
       audit.record.mockRejectedValue(new Error('synthetic audit failure'));
 
       await expect(complete()).rejects.toThrow('synthetic audit failure');
+    });
+  });
+
+  describe('latestLocation', () => {
+    const SAMPLE_ID = '019a0000-0000-7000-8000-0000000000a1';
+    const RECORDED = new Date('2027-01-04T09:30:00.123Z');
+    const RECEIVED = new Date('2027-01-04T11:00:00.456Z');
+
+    function sampleRow(overrides: Record<string, unknown> = {}) {
+      return {
+        id: '019a0000-0000-7000-8000-0000000000b1',
+        tripId: TRIP_ID,
+        sampleId: SAMPLE_ID,
+        latitude: 14.5995,
+        longitude: 120.9842,
+        accuracy: 12.5,
+        recordedAt: RECORDED,
+        receivedAt: RECEIVED,
+        ...overrides,
+      };
+    }
+
+    it('returns the newest observation, mapped to the wire shape', async () => {
+      prisma.trip.findUnique.mockResolvedValue({ id: TRIP_ID });
+      prisma.tripLocationSample.findFirst.mockResolvedValue(sampleRow());
+
+      const sample = await service.latestLocation(TRIP_ID);
+
+      expect(sample).toEqual({
+        id: '019a0000-0000-7000-8000-0000000000b1',
+        tripId: TRIP_ID,
+        sampleId: SAMPLE_ID,
+        latitude: 14.5995,
+        longitude: 120.9842,
+        accuracy: 12.5,
+        recordedAt: '2027-01-04T09:30:00.123Z',
+        receivedAt: '2027-01-04T11:00:00.456Z',
+      });
+    });
+
+    it('orders by recordedAt then id, both descending, and selects the eight columns', async () => {
+      prisma.trip.findUnique.mockResolvedValue({ id: TRIP_ID });
+      prisma.tripLocationSample.findFirst.mockResolvedValue(sampleRow());
+
+      await service.latestLocation(TRIP_ID);
+
+      const call = prisma.tripLocationSample.findFirst.mock.calls[0]![0];
+      expect(call).toMatchObject({
+        where: { tripId: TRIP_ID },
+        orderBy: [{ recordedAt: 'desc' }, { id: 'desc' }],
+      });
+      // The ordering names recordedAt and id, and nothing else. Never
+      // receivedAt: a queued sample delivered late would otherwise outrank a
+      // newer one delivered on time.
+      const ordering = JSON.stringify((call as { orderBy: unknown }).orderBy);
+      expect(ordering).not.toContain('receivedAt');
+      expect(ordering).not.toContain('sampleId');
+      expect(ordering).toBe('[{"recordedAt":"desc"},{"id":"desc"}]');
+      expect(Object.keys((call as { select: object }).select)).toEqual([
+        'id',
+        'tripId',
+        'sampleId',
+        'latitude',
+        'longitude',
+        'accuracy',
+        'recordedAt',
+        'receivedAt',
+      ]);
+    });
+
+    it('preserves a null accuracy rather than reporting a perfect fix', async () => {
+      prisma.trip.findUnique.mockResolvedValue({ id: TRIP_ID });
+      prisma.tripLocationSample.findFirst.mockResolvedValue(
+        sampleRow({ accuracy: null }),
+      );
+
+      const sample = await service.latestLocation(TRIP_ID);
+
+      expect(sample.accuracy).toBeNull();
+    });
+
+    it('answers trip_location_unknown for a trip with nothing recorded', async () => {
+      prisma.trip.findUnique.mockResolvedValue({ id: TRIP_ID });
+      prisma.tripLocationSample.findFirst.mockResolvedValue(null);
+
+      await expect(service.latestLocation(TRIP_ID)).rejects.toMatchObject({
+        status: 404,
+        message: TRIP_ERROR.tripLocationUnknown,
+      });
+    });
+
+    it('answers trip_not_found for a trip that does not exist, without reading samples', async () => {
+      prisma.trip.findUnique.mockResolvedValue(null);
+
+      await expect(service.latestLocation(TRIP_ID)).rejects.toMatchObject({
+        status: 404,
+        message: TRIP_ERROR.tripNotFound,
+      });
+      // A missing trip must never collapse into the zero-sample answer.
+      expect(prisma.tripLocationSample.findFirst).not.toHaveBeenCalled();
+    });
+
+    it('reads the trip unscoped by driver: an admin may read any trip', async () => {
+      prisma.trip.findUnique.mockResolvedValue({ id: TRIP_ID });
+      prisma.tripLocationSample.findFirst.mockResolvedValue(sampleRow());
+
+      await service.latestLocation(TRIP_ID);
+
+      expect(prisma.trip.findUnique.mock.calls[0]![0]).toEqual({
+        where: { id: TRIP_ID },
+        select: { id: true },
+      });
+      expect(prisma.driver.findUnique).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('listLocationSamples', () => {
+    const row = (overrides: Record<string, unknown> = {}) => ({
+      id: '019a0000-0000-7000-8000-0000000000b1',
+      tripId: TRIP_ID,
+      sampleId: '019a0000-0000-7000-8000-0000000000a1',
+      latitude: 14.5995,
+      longitude: 120.9842,
+      accuracy: null,
+      recordedAt: new Date('2027-01-04T09:30:00.000Z'),
+      receivedAt: new Date('2027-01-04T09:30:01.000Z'),
+      ...overrides,
+    });
+
+    const listed = (query: Record<string, number> = {}) =>
+      service.listLocationSamples({ tripId: TRIP_ID, query });
+
+    it('applies the page defaults and the frozen ascending order', async () => {
+      prisma.trip.findUnique.mockResolvedValue({ id: TRIP_ID });
+      prisma.tripLocationSample.findMany.mockResolvedValue([row()]);
+      prisma.tripLocationSample.count.mockResolvedValue(1);
+
+      const page = await listed();
+
+      expect(page).toMatchObject({ page: 1, pageSize: 25, total: 1 });
+      expect(page.items[0]).toMatchObject({
+        tripId: TRIP_ID,
+        recordedAt: '2027-01-04T09:30:00.000Z',
+        accuracy: null,
+      });
+      expect(
+        prisma.tripLocationSample.findMany.mock.calls[0]![0],
+      ).toMatchObject({
+        where: { tripId: TRIP_ID },
+        orderBy: [{ recordedAt: 'asc' }, { id: 'asc' }],
+        skip: 0,
+        take: 25,
+      });
+    });
+
+    it('honours an explicit page and page size, with the right window', async () => {
+      prisma.trip.findUnique.mockResolvedValue({ id: TRIP_ID });
+      prisma.tripLocationSample.findMany.mockResolvedValue([]);
+      prisma.tripLocationSample.count.mockResolvedValue(97);
+
+      const page = await listed({ page: 4, pageSize: 10 });
+
+      expect(page).toMatchObject({ page: 4, pageSize: 10, total: 97 });
+      expect(
+        prisma.tripLocationSample.findMany.mock.calls[0]![0],
+      ).toMatchObject({ skip: 30, take: 10 });
+    });
+
+    it('counts the same trip scope it reads', async () => {
+      prisma.trip.findUnique.mockResolvedValue({ id: TRIP_ID });
+      prisma.tripLocationSample.findMany.mockResolvedValue([]);
+      prisma.tripLocationSample.count.mockResolvedValue(0);
+
+      await listed();
+
+      expect(prisma.tripLocationSample.count.mock.calls[0]![0]).toEqual({
+        where: { tripId: TRIP_ID },
+      });
+      // One round trip for the window and its total.
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns an empty page for a trip with nothing recorded', async () => {
+      prisma.trip.findUnique.mockResolvedValue({ id: TRIP_ID });
+      prisma.tripLocationSample.findMany.mockResolvedValue([]);
+      prisma.tripLocationSample.count.mockResolvedValue(0);
+
+      // A legitimate question about a trip that exists: "none" is the answer,
+      // not a refusal.
+      await expect(listed()).resolves.toEqual({
+        items: [],
+        page: 1,
+        pageSize: 25,
+        total: 0,
+      });
+    });
+
+    it('answers trip_not_found for a trip that does not exist, without paging', async () => {
+      prisma.trip.findUnique.mockResolvedValue(null);
+
+      await expect(listed()).rejects.toMatchObject({
+        status: 404,
+        message: TRIP_ERROR.tripNotFound,
+      });
+      expect(prisma.tripLocationSample.findMany).not.toHaveBeenCalled();
+      expect(prisma.tripLocationSample.count).not.toHaveBeenCalled();
+    });
+
+    it('maps every row through the wire shape, with no extra key', async () => {
+      prisma.trip.findUnique.mockResolvedValue({ id: TRIP_ID });
+      prisma.tripLocationSample.findMany.mockResolvedValue([
+        row({ accuracy: 5 }),
+        row({ id: '019a0000-0000-7000-8000-0000000000b2' }),
+      ]);
+      prisma.tripLocationSample.count.mockResolvedValue(2);
+
+      const page = await listed();
+
+      expect(page.items).toHaveLength(2);
+      for (const item of page.items) {
+        expect(Object.keys(item).sort()).toEqual([
+          'accuracy',
+          'id',
+          'latitude',
+          'longitude',
+          'receivedAt',
+          'recordedAt',
+          'sampleId',
+          'tripId',
+        ]);
+      }
     });
   });
 });

@@ -46,6 +46,17 @@ export const TRIP_ERROR = {
    * to upload against a trip that has no trackable window.
    */
   tripNotTrackable: 'trip_not_trackable',
+  /**
+   * Stage 8D.1: the trip exists and holds no stored location sample, so
+   * there is no latest position to return.
+   *
+   * Deliberately distinct from `trip_not_found`, which answers a trip that
+   * does not exist: an admin learns that this trip has nothing recorded
+   * rather than that it is absent, and no coordinate — not a zero pair, not
+   * the origin, not another trip's last position — is invented to stand in
+   * for one.
+   */
+  tripLocationUnknown: 'trip_location_unknown',
 } as const;
 
 export type TripErrorCode = (typeof TRIP_ERROR)[keyof typeof TRIP_ERROR];

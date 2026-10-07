@@ -1,4 +1,4 @@
-import type { Page, Trip } from '@mansar/types';
+import type { Page, Trip, TripLocationSample } from '@mansar/types';
 import {
   ConflictException,
   Injectable,
@@ -25,6 +25,7 @@ import {
   DEFAULT_PAGE_SIZE,
   type IngestLocationSamplesBody,
   type ListDriverTripsQuery,
+  type ListLocationSamplesQuery,
   type ListTripsQuery,
   type LocationSampleInput,
   type UpdateTripBody,
@@ -136,6 +137,49 @@ type TripRow = Prisma.TripGetPayload<{ select: typeof TRIP_SELECT }>;
 
 const iso = (value: Date | null): string | null =>
   value === null ? null : value.toISOString();
+
+/**
+ * The eight stored columns, which are also the whole wire contract.
+ *
+ * Explicit rather than a bare row, like every other select here: there is
+ * nothing else on this table to leak today, and the select is what keeps
+ * that true if a column is ever added.
+ */
+const LOCATION_SAMPLE_SELECT = {
+  id: true,
+  tripId: true,
+  sampleId: true,
+  latitude: true,
+  longitude: true,
+  accuracy: true,
+  recordedAt: true,
+  receivedAt: true,
+} satisfies Prisma.TripLocationSampleSelect;
+
+type LocationSampleRow = Prisma.TripLocationSampleGetPayload<{
+  select: typeof LOCATION_SAMPLE_SELECT;
+}>;
+
+/**
+ * Prisma row → wire shape.
+ *
+ * Both instants become ISO 8601 UTC strings, as everywhere else in this
+ * API. The coordinates and the accuracy stay JSON numbers and a null
+ * accuracy stays null: "the device reported none" is a fact, and 0 would
+ * claim a perfect fix.
+ */
+function toLocationSample(row: LocationSampleRow): TripLocationSample {
+  return {
+    id: row.id,
+    tripId: row.tripId,
+    sampleId: row.sampleId,
+    latitude: row.latitude,
+    longitude: row.longitude,
+    accuracy: row.accuracy,
+    recordedAt: row.recordedAt.toISOString(),
+    receivedAt: row.receivedAt.toISOString(),
+  };
+}
 
 /** Prisma row → wire shape; every instant becomes an ISO 8601 UTC string. */
 function toTrip(row: TripRow): Trip {
@@ -802,6 +846,84 @@ export class TripsService {
    * `trip.completed` already bracket the only interval in which capture is
    * legitimate.
    */
+  /**
+   * The latest position stored for this trip (Stage 8D.1, ADMIN).
+   *
+   * "Latest" is the newest *observation*, ordered by the device's
+   * `recordedAt` and broken by `id` — never by `receivedAt`, which is only
+   * when a queued sample happened to arrive and would promote a stale fix
+   * delivered late above a newer one delivered on time.
+   *
+   * It is history, not a live fix: nothing here claims the device is online,
+   * and a trip that never recorded anything says exactly that.
+   */
+  async latestLocation(tripId: string): Promise<TripLocationSample> {
+    // Existence first, so a trip that does not exist can never be reported
+    // as one that simply has no history.
+    await this.requireTrip(tripId);
+    const row = await this.prisma.tripLocationSample.findFirst({
+      where: { tripId },
+      // A backwards scan of trip_location_samples_trip_id_recorded_at_id_idx.
+      orderBy: [{ recordedAt: 'desc' }, { id: 'desc' }],
+      select: LOCATION_SAMPLE_SELECT,
+    });
+    if (!row) {
+      throw new NotFoundException(TRIP_ERROR.tripLocationUnknown);
+    }
+    return toLocationSample(row);
+  }
+
+  /**
+   * This trip's stored location history, paged (Stage 8D.1, ADMIN).
+   *
+   * Capture order, always: `recordedAt` ascending with `id` as the
+   * tie-breaker, which is the index's own column order, so the page is an
+   * index scan and two samples sharing an instant cannot swap places
+   * between adjacent pages. A trip with nothing recorded is an empty page
+   * rather than a refusal — an admin asked a legitimate question about a
+   * trip that exists, and "none" is the answer.
+   */
+  async listLocationSamples(input: {
+    readonly tripId: string;
+    readonly query: ListLocationSamplesQuery;
+  }): Promise<Page<TripLocationSample>> {
+    const page = input.query.page ?? DEFAULT_PAGE;
+    const pageSize = input.query.pageSize ?? DEFAULT_PAGE_SIZE;
+    await this.requireTrip(input.tripId);
+
+    const where: Prisma.TripLocationSampleWhereInput = {
+      tripId: input.tripId,
+    };
+    const [rows, total] = await this.prisma.$transaction([
+      this.prisma.tripLocationSample.findMany({
+        where,
+        select: LOCATION_SAMPLE_SELECT,
+        orderBy: [{ recordedAt: 'asc' }, { id: 'asc' }],
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      }),
+      this.prisma.tripLocationSample.count({ where }),
+    ]);
+
+    return { items: rows.map(toLocationSample), page, pageSize, total };
+  }
+
+  /**
+   * Proves the trip exists, for the admin reads above.
+   *
+   * Unscoped on purpose: an admin reads any trip's history, so there is no
+   * driver linkage here — that belongs to the driver-side write path.
+   */
+  private async requireTrip(tripId: string): Promise<void> {
+    const row = await this.prisma.trip.findUnique({
+      where: { id: tripId },
+      select: { id: true },
+    });
+    if (!row) {
+      throw new NotFoundException(TRIP_ERROR.tripNotFound);
+    }
+  }
+
   async ingestLocationSamples(input: {
     readonly actor: TripActor;
     readonly tripId: string;

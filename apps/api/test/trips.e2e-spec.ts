@@ -1,4 +1,4 @@
-import type { Trip } from '@mansar/types';
+import type { Trip, TripLocationSample } from '@mansar/types';
 import {
   ConflictException,
   type INestApplication,
@@ -55,6 +55,17 @@ const TRIP: Trip = {
   updatedAt: '2026-09-02T00:00:00.000Z',
 };
 
+const SAMPLE: TripLocationSample = {
+  id: '019a0000-0000-7000-8000-0000000000b1',
+  tripId: TRIP_ID,
+  sampleId: '019a0000-0000-7000-8000-0000000000a1',
+  latitude: 14.5995,
+  longitude: 120.9842,
+  accuracy: null,
+  recordedAt: '2027-01-04T09:30:00.000Z',
+  receivedAt: '2027-01-04T09:30:01.000Z',
+};
+
 function makeTripsStub() {
   return {
     list: vi.fn(),
@@ -65,6 +76,8 @@ function makeTripsStub() {
     cancel: vi.fn(),
     verify: vi.fn(),
     close: vi.fn(),
+    latestLocation: vi.fn(),
+    listLocationSamples: vi.fn(),
   };
 }
 
@@ -117,6 +130,8 @@ describe('trips HTTP contracts (e2e, DB-free)', () => {
       ['post', `/trips/${TRIP_ID}/cancel`],
       ['post', `/trips/${TRIP_ID}/verify`],
       ['post', `/trips/${TRIP_ID}/close`],
+      ['get', `/trips/${TRIP_ID}/location`],
+      ['get', `/trips/${TRIP_ID}/location-samples`],
     ] as const;
 
     it.each(routes)('%s %s needs a bearer', async (method, path) => {
@@ -520,6 +535,228 @@ describe('trips HTTP contracts (e2e, DB-free)', () => {
         .set('Authorization', adminBearer)
         .expect(400);
       expect(trips[action]).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('GET /trips/:tripId/location', () => {
+    const path = `/trips/${TRIP_ID}/location`;
+
+    it('returns the latest sample to an ADMIN', async () => {
+      trips.latestLocation.mockResolvedValue(SAMPLE);
+
+      const res = await http()
+        .get(path)
+        .set('Authorization', adminBearer)
+        .expect(200);
+
+      expect(res.body).toEqual(SAMPLE);
+      expect(trips.latestLocation).toHaveBeenCalledWith(TRIP_ID);
+    });
+
+    it('exposes the eight contract fields and nothing else', async () => {
+      trips.latestLocation.mockResolvedValue(SAMPLE);
+
+      const res = await http()
+        .get(path)
+        .set('Authorization', adminBearer)
+        .expect(200);
+
+      expect(Object.keys(res.body).sort()).toEqual([
+        'accuracy',
+        'id',
+        'latitude',
+        'longitude',
+        'receivedAt',
+        'recordedAt',
+        'sampleId',
+        'tripId',
+      ]);
+      // No wrapper, and nothing about the driver, the device or the queue.
+      const body = JSON.stringify(res.body);
+      for (const forbidden of [
+        'driver',
+        'vehicle',
+        'user',
+        'owner',
+        'device',
+        'attempt',
+        'dropped',
+        'online',
+        'status',
+      ]) {
+        expect(body).not.toContain(forbidden);
+      }
+    });
+
+    it('passes a null accuracy through as null', async () => {
+      trips.latestLocation.mockResolvedValue({ ...SAMPLE, accuracy: null });
+
+      const res = await http()
+        .get(path)
+        .set('Authorization', adminBearer)
+        .expect(200);
+
+      expect(res.body.accuracy).toBeNull();
+    });
+
+    it('maps a trip with nothing recorded to trip_location_unknown', async () => {
+      trips.latestLocation.mockRejectedValue(
+        new NotFoundException(TRIP_ERROR.tripLocationUnknown),
+      );
+
+      const res = await http()
+        .get(path)
+        .set('Authorization', adminBearer)
+        .expect(404);
+
+      expect(res.body).toMatchObject({
+        statusCode: 404,
+        message: TRIP_ERROR.tripLocationUnknown,
+      });
+    });
+
+    it('maps an unknown trip to trip_not_found, which is a different answer', async () => {
+      trips.latestLocation.mockRejectedValue(
+        new NotFoundException(TRIP_ERROR.tripNotFound),
+      );
+
+      const res = await http()
+        .get(path)
+        .set('Authorization', adminBearer)
+        .expect(404);
+
+      expect(res.body.message).toBe(TRIP_ERROR.tripNotFound);
+      expect(res.body.message).not.toBe(TRIP_ERROR.tripLocationUnknown);
+    });
+
+    it('rejects a malformed trip id with 400 before the service', async () => {
+      const res = await http()
+        .get(`/trips/${UUID_V4}/location`)
+        .set('Authorization', adminBearer)
+        .expect(400);
+
+      expect(JSON.stringify(res.body)).not.toContain(UUID_V4);
+      noneCalled();
+    });
+
+    it('takes no query parameters', async () => {
+      trips.latestLocation.mockResolvedValue(SAMPLE);
+
+      // The route has no query schema, so a stray parameter is simply
+      // ignored rather than becoming a second way to ask the question.
+      await http()
+        .get(`${path}?page=2`)
+        .set('Authorization', adminBearer)
+        .expect(200);
+      expect(trips.latestLocation).toHaveBeenCalledWith(TRIP_ID);
+    });
+  });
+
+  describe('GET /trips/:tripId/location-samples', () => {
+    const path = `/trips/${TRIP_ID}/location-samples`;
+    const page = {
+      items: [SAMPLE],
+      page: 1,
+      pageSize: 25,
+      total: 1,
+    };
+
+    it('returns the page and forwards the parsed query', async () => {
+      trips.listLocationSamples.mockResolvedValue({
+        ...page,
+        page: 2,
+        pageSize: 10,
+        total: 11,
+      });
+
+      const res = await http()
+        .get(`${path}?page=2&pageSize=10`)
+        .set('Authorization', adminBearer)
+        .expect(200);
+
+      expect(res.body).toMatchObject({ page: 2, pageSize: 10, total: 11 });
+      expect(trips.listLocationSamples).toHaveBeenCalledWith({
+        tripId: TRIP_ID,
+        query: { page: 2, pageSize: 10 },
+      });
+    });
+
+    it('forwards an empty query, leaving the defaults to the service', async () => {
+      trips.listLocationSamples.mockResolvedValue(page);
+
+      await http().get(path).set('Authorization', adminBearer).expect(200);
+
+      expect(trips.listLocationSamples).toHaveBeenCalledWith({
+        tripId: TRIP_ID,
+        query: {},
+      });
+    });
+
+    it('returns an empty page for a trip with nothing recorded', async () => {
+      trips.listLocationSamples.mockResolvedValue({
+        items: [],
+        page: 1,
+        pageSize: 25,
+        total: 0,
+      });
+
+      const res = await http()
+        .get(path)
+        .set('Authorization', adminBearer)
+        .expect(200);
+
+      expect(res.body).toEqual({
+        items: [],
+        page: 1,
+        pageSize: 25,
+        total: 0,
+      });
+    });
+
+    it('maps an unknown trip to trip_not_found', async () => {
+      trips.listLocationSamples.mockRejectedValue(
+        new NotFoundException(TRIP_ERROR.tripNotFound),
+      );
+
+      const res = await http()
+        .get(path)
+        .set('Authorization', adminBearer)
+        .expect(404);
+
+      expect(res.body).toMatchObject({
+        statusCode: 404,
+        message: TRIP_ERROR.tripNotFound,
+      });
+    });
+
+    it.each([
+      ['page zero', 'page=0'],
+      ['a negative page', 'page=-1'],
+      ['a fractional page', 'page=1.5'],
+      ['a non-numeric page', 'page=two'],
+      ['an exponent page', 'page=1e2'],
+      ['page size zero', 'pageSize=0'],
+      ['a page size above the maximum', 'pageSize=101'],
+      ['a non-numeric page size', 'pageSize=ten'],
+      ['an unknown query key', 'status=IN_PROGRESS'],
+      ['a driver filter', 'driverId=019a0000-0000-7000-8000-00000000000d'],
+      ['a sort control', 'sort=recordedAt'],
+    ])('rejects %s with 400 before the service', async (_label, query) => {
+      await http()
+        .get(`${path}?${query}`)
+        .set('Authorization', adminBearer)
+        .expect(400);
+      noneCalled();
+    });
+
+    it('rejects a malformed trip id with 400 before the service', async () => {
+      const res = await http()
+        .get(`/trips/${UUID_V4}/location-samples`)
+        .set('Authorization', adminBearer)
+        .expect(400);
+
+      expect(JSON.stringify(res.body)).not.toContain(UUID_V4);
+      noneCalled();
     });
   });
 });

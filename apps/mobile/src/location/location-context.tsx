@@ -79,16 +79,33 @@ export function LocationProvider({ create, children }: LocationProviderProps) {
   useEffect(() => {
     // No seeding setState: until the first projection is published, the
     // render below reads the orchestrator's own initial state.
-    void orchestrator.initialize();
+    //
+    // The order of the three steps below is load-bearing.
     const onChange = (next: AppStateStatus) => {
       if (next === 'active') {
         // A recovery trigger, not the tracking mechanism: the foreground
         // service keeps capturing through Home, an app switch and a screen
         // lock, and nothing here stops or pauses it for backgrounding.
         void orchestrator.onForeground();
+      } else {
+        // Everything that is not `active` — `background`, `inactive`, and
+        // whatever a future platform adds — hands drain opportunities to the
+        // native kick. Treating only a known list as background would leave an
+        // unrecognised state believing it still owned foreground timers.
+        orchestrator.onBackground();
       }
     };
+    // 1. The listener is registered first, so a transition that happens while
+    //    this effect is still running is delivered rather than missed.
     const subscription = AppState.addEventListener('change', onChange);
+    // 2. Then the real initial state. Mounting is not evidence of being in
+    //    front of the driver: bootstrap is asynchronous, so this provider can
+    //    mount while the app is already away. `currentState` is null until the
+    //    first native read, and an unknown state is taken as background,
+    //    which is the direction that fails safe.
+    orchestrator.syncAppForeground(AppState.currentState === 'active');
+    // 3. Only then initialize, which now knows whether it owns the foreground.
+    void orchestrator.initialize();
     return () => {
       subscription.remove();
       orchestrator.dispose();

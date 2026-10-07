@@ -12,6 +12,7 @@ import {
   type DrainOutcome,
   type DrainScheduler,
   type LocationDrain,
+  LOCATION_DRAIN_PASS_DEADLINE_MS,
   type LocationQueueAccess,
   RETRY_DELAYS_MS,
 } from './location-drain';
@@ -122,6 +123,8 @@ function createFakeQueue(initial: QueuedLocationSample[]) {
 interface IngestCall {
   readonly tripId: string;
   readonly samples: readonly IngestibleLocationSample[];
+  /** The handle the pass gave this request, if any. */
+  readonly signal?: { readonly aborted: boolean };
 }
 
 /** Answers every ingestion the same way, unless a queued answer is set. */
@@ -130,13 +133,23 @@ function createFakeApi(
 ) {
   const calls: IngestCall[] = [];
   let thrown: unknown = null;
+  let holdNext = false;
+  let held: ((results: readonly LocationSampleResult[]) => void) | null = null;
   const api: DriverLocationApi = {
-    ingest: async (tripId, samples) => {
-      calls.push({ tripId, samples: [...samples] });
+    ingest: async (tripId, samples, signal) => {
+      calls.push({ tripId, samples: [...samples], signal });
       if (thrown !== null) {
         const error = thrown;
         thrown = null;
         throw error;
+      }
+      if (holdNext) {
+        holdNext = false;
+        // Models a request that never comes back: a dead socket, or a pass
+        // sitting behind a refresh rotation that has not finished.
+        return new Promise<readonly LocationSampleResult[]>((resolve) => {
+          held = resolve;
+        });
       }
       return answer({ tripId, samples });
     },
@@ -147,38 +160,87 @@ function createFakeApi(
     throwNext: (error: unknown) => {
       thrown = error;
     },
+    /** The next ingestion hangs until [releaseHeld]. */
+    hangNext: () => {
+      holdNext = true;
+    },
+    /** Answers a held request late, as a recovered connection would. */
+    releaseHeld: (results: readonly LocationSampleResult[]) => {
+      const resolve = held;
+      held = null;
+      resolve?.(results);
+    },
+    get isHolding(): boolean {
+      return held !== null;
+    },
   };
 }
 
 const allAccepted = (call: IngestCall): readonly LocationSampleResult[] =>
   call.samples.map((one) => ({ sampleId: one.sampleId, outcome: 'accepted' }));
 
+interface Scheduled {
+  readonly task: () => void;
+  readonly deadline: boolean;
+}
+
+/**
+ * The injected clock, which also separates the drain's two kinds of timer.
+ *
+ * A pass arms its own request deadline *while it is in flight*; the retry
+ * ladder and the immediate continuation are only ever armed once a pass has
+ * settled. That — not a delay's value — is what tells them apart here, so
+ * `delays` keeps meaning "the ladder" however either side changes.
+ */
 function createManualScheduler() {
   const delays: number[] = [];
-  let pending: Array<{ readonly task: () => void }> = [];
+  const deadlines: number[] = [];
+  let inPass: () => boolean = () => false;
+  let pending: Scheduled[] = [];
   const scheduler: DrainScheduler = {
     schedule: (delayMs, task) => {
-      delays.push(delayMs);
-      const entry = { task };
+      const deadline = inPass();
+      (deadline ? deadlines : delays).push(delayMs);
+      const entry: Scheduled = { task, deadline };
       pending.push(entry);
       return () => {
         pending = pending.filter((one) => one !== entry);
       };
     },
   };
+  const take = (deadline: boolean): Scheduled => {
+    const next = pending.find((one) => one.deadline === deadline);
+    if (next === undefined) {
+      throw new Error(
+        deadline ? 'no pass deadline to fire' : 'no scheduled task to fire',
+      );
+    }
+    pending = pending.filter((one) => one !== next);
+    return next;
+  };
   return {
     scheduler,
+    /** Retry-ladder and continuation delays, in order. */
     delays,
+    /** Per-pass request deadlines, in order. */
+    deadlines,
+    /** Wired by the harness once the drain exists. */
+    observe: (busy: () => boolean): void => {
+      inPass = busy;
+    },
     get pendingCount(): number {
-      return pending.length;
+      return pending.filter((one) => !one.deadline).length;
+    },
+    get deadlineCount(): number {
+      return pending.filter((one) => one.deadline).length;
     },
     /** Fires the oldest scheduled task, as the platform timer would. */
     fire: (): void => {
-      const next = pending.shift();
-      if (next === undefined) {
-        throw new Error('no scheduled task to fire');
-      }
-      next.task();
+      take(false).task();
+    },
+    /** Fires the pass deadline, as a ten-second timer would. */
+    fireDeadline: (): void => {
+      take(true).task();
     },
   };
 }
@@ -218,6 +280,7 @@ function harness(
     scheduler: timers.scheduler,
     onOutcome: (outcome) => outcomes.push(outcome),
   });
+  timers.observe(() => drain.state().busy);
   return { drain, queue, api, timers, outcomes };
 }
 
@@ -905,5 +968,155 @@ describe('retry coordinator', () => {
     expect(h.drain.state().lastOutcome).toBeNull();
     await h.drain.drainOneBatch();
     expect(h.drain.state().lastOutcome).toMatchObject({ kind: 'progress' });
+  });
+});
+
+describe('per-pass deadline', () => {
+  it('is the frozen ten seconds', () => {
+    expect(LOCATION_DRAIN_PASS_DEADLINE_MS).toBe(10_000);
+  });
+
+  it('arms one deadline per pass, through the injected scheduler', async () => {
+    const h = harness([row('a1')]);
+    await h.drain.drainOneBatch();
+    // Requested as a delay, so no test has to wait ten seconds to observe it.
+    expect(h.timers.deadlines).toEqual([10_000]);
+    // And it is not a step in the retry ladder.
+    expect(h.timers.delays).toEqual([]);
+  });
+
+  it('cancels the deadline when the request answers in time', async () => {
+    const h = harness([row('a1')]);
+    const outcome = await h.drain.drainOneBatch();
+
+    expect(outcome.kind).toBe('progress');
+    expect(h.timers.deadlineCount).toBe(0);
+    expect(h.api.calls[0]!.signal!.aborted).toBe(false);
+  });
+
+  it('cancels the deadline on a blocked outcome too', async () => {
+    const h = harness([row('a1')]);
+    h.api.throwNext(new LocationBatchError('duplicate_sample_id'));
+    await h.drain.drainOneBatch();
+
+    // Every exit from a pass clears its own timer; a deadline left armed
+    // would abort a request belonging to the pass after it.
+    expect(h.timers.deadlineCount).toBe(0);
+  });
+
+  it('aborts the ingest request when the deadline passes first', async () => {
+    const h = harness([row('a1')]);
+    h.api.hangNext();
+    const pass = h.drain.drainOneBatch();
+    await flush();
+
+    expect(h.api.calls).toHaveLength(1);
+    expect(h.api.calls[0]!.signal!.aborted).toBe(false);
+
+    h.timers.fireDeadline();
+    await pass;
+
+    // Genuinely aborted, not merely abandoned: the request is cancelled so a
+    // response arriving later cannot be acted on.
+    expect(h.api.calls[0]!.signal!.aborted).toBe(true);
+  });
+
+  it('reports retryable and deletes nothing when the deadline passes', async () => {
+    const h = harness([row('a1'), row('a2')]);
+    h.api.hangNext();
+    const pass = h.drain.drainOneBatch();
+    await flush();
+    h.timers.fireDeadline();
+    const outcome = await pass;
+
+    // A deadline says "this took too long", not "this was refused", so the
+    // batch is retried and every row stays exactly where it was.
+    expect(outcome).toEqual({ kind: 'retryable' });
+    expect(h.queue.methods()).toEqual(['read', 'increment']);
+    expect(h.queue.remaining).toHaveLength(2);
+  });
+
+  it('counts the attempt, because the batch did reach the transport', async () => {
+    const h = harness([row('a1')]);
+    h.api.hangNext();
+    const pass = h.drain.drainOneBatch();
+    await flush();
+    h.timers.fireDeadline();
+    await pass;
+
+    expect(h.queue.calls).toContainEqual(
+      expect.objectContaining({ method: 'increment', owner: OWNER }),
+    );
+  });
+
+  it('settles and clears in-flight, so a later call issues a fresh request', async () => {
+    const h = harness([row('a1')]);
+    h.api.hangNext();
+    const pass = h.drain.drainOneBatch();
+    await flush();
+    h.timers.fireDeadline();
+    await pass;
+
+    // The pass that gave up must not leave `inFlight` pending forever: in the
+    // background the next opportunity is a native kick, and a drain that
+    // believes it is busy would join a promise that never settles.
+    expect(h.drain.state().busy).toBe(false);
+
+    const second = await h.drain.drainOneBatch();
+
+    expect(second.kind).toBe('progress');
+    expect(h.api.calls).toHaveLength(2);
+    expect(h.api.calls[1]!.signal!.aborted).toBe(false);
+    expect(h.api.calls[1]!.signal).not.toBe(h.api.calls[0]!.signal);
+  });
+
+  it('stops waiting for a late refresh without cancelling it', async () => {
+    const h = harness([row('a1')]);
+    h.api.hangNext();
+    const pass = h.drain.drainOneBatch();
+    await flush();
+    h.timers.fireDeadline();
+    const outcome = await pass;
+
+    expect(outcome).toEqual({ kind: 'retryable' });
+    // The request was never answered, and nothing here reached in to end it:
+    // a rotation behind it is free to commit, which is the whole reason the
+    // deadline races the request instead of only aborting it.
+    expect(h.api.isHolding).toBe(true);
+
+    h.api.releaseHeld([{ sampleId: 'a1', outcome: 'accepted' }]);
+    await flush();
+
+    // And a late answer to an abandoned pass changes nothing: the row is
+    // still queued, because this pass already decided it had not been told.
+    expect(h.queue.remaining).toHaveLength(1);
+    expect(h.queue.methods()).toEqual(['read', 'increment']);
+  });
+
+  it('treats a resubmitted sample the server already has as permanently done', async () => {
+    // The safety net behind every abandoned pass: the first attempt may well
+    // have been stored server-side, and `sampleId` is what makes asking again
+    // harmless. A duplicate verdict is as final as an accepted one.
+    const h = harness([row('a1')], (call) =>
+      call.samples.map((one) => ({
+        sampleId: one.sampleId,
+        outcome: 'duplicate' as const,
+      })),
+    );
+    const outcome = await h.drain.drainOneBatch();
+
+    expect(outcome).toMatchObject({ kind: 'progress', deletedCount: 1 });
+    expect(h.queue.remaining).toHaveLength(0);
+  });
+
+  it('keeps a blocked verdict blocked rather than calling it a timeout', async () => {
+    const h = harness([row('a1')]);
+    h.api.throwNext(new NotAuthenticatedError());
+    const outcome = await h.drain.drainOneBatch();
+
+    // The deadline must not blur the difference: an auth failure needs a
+    // session, not another minute.
+    expect(outcome).toEqual({ kind: 'blocked-auth' });
+    expect(h.queue.methods()).toEqual(['read']);
   });
 });

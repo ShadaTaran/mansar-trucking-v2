@@ -101,8 +101,39 @@ export type DrainOutcome =
  */
 export const RETRY_DELAYS_MS = [5_000, 15_000, 60_000, 300_000] as const;
 
+/**
+ * How long one pass may wait for its upload before giving up on it.
+ *
+ * A maximal batch is 100 samples of small JSON, so ten seconds is already
+ * generous on a poor mobile link. The point is not speed: without a
+ * deadline a single hung request leaves this drain's `inFlight` pending
+ * forever, and in the background — where a JS timer may never fire and the
+ * only retry opportunity is the next native kick — that is the difference
+ * between a queue that drains and one that stops.
+ *
+ * It bounds the *pass*, not every operation underneath it. The ingest
+ * request is genuinely aborted; a refresh rotation already in flight is
+ * deliberately left to finish (see `PassDeadlineError`).
+ */
+export const LOCATION_DRAIN_PASS_DEADLINE_MS = 10_000;
+
 /** Immediate continuation after real progress; not a retry. */
 const CONTINUE_DELAY_MS = 0;
+
+/**
+ * Raised inside a pass when its own deadline passed first.
+ *
+ * Not an `ApiError`: `classify` would read an unrecognised error as a
+ * protocol defect and stop retrying, which is the opposite of the truth.
+ * A deadline says only "this took too long", so it maps to `retryable` and
+ * every row stays queued.
+ */
+class PassDeadlineError extends Error {
+  constructor() {
+    super('location drain pass deadline');
+    this.name = 'PassDeadlineError';
+  }
+}
 
 /**
  * Deferred execution, injectable so tests never wait.
@@ -356,10 +387,36 @@ export function createLocationDrain(
     const moreLikely =
       batch.length < rows.length || rows.length === MAX_INGEST_SAMPLES;
 
+    // The deadline is armed through the injected scheduler, so a test reads
+    // it as a requested delay instead of living through it.
+    const controller = new AbortController();
+    let overdue!: (reason: unknown) => void;
+    const expired = new Promise<never>((_resolve, reject) => {
+      overdue = reject;
+    });
+    const cancelDeadline = scheduler.schedule(
+      LOCATION_DRAIN_PASS_DEADLINE_MS,
+      () => {
+        // Abort first. A retry that has not been sent yet then fails at
+        // once on the already-aborted signal rather than reaching the
+        // network after this pass gave up on it.
+        controller.abort();
+        overdue(new PassDeadlineError());
+      },
+    );
+
     let results: readonly LocationSampleResult[];
     try {
-      results = await api.ingest(tripId, batch.map(toIngestible));
+      // Racing the deadline rather than only aborting: an abort settles a
+      // request, but a pass waiting on a refresh rotation has no request to
+      // abort, and that rotation must be allowed to finish.
+      results = await Promise.race([
+        api.ingest(tripId, batch.map(toIngestible), controller.signal),
+        expired,
+      ]);
+      cancelDeadline();
     } catch (error) {
+      cancelDeadline();
       if (error instanceof NotAuthenticatedError) {
         // Nothing was sent, so no attempt is counted: `attempts` would
         // otherwise climb while the driver was simply signed out.
@@ -370,7 +427,10 @@ export function createLocationDrain(
         // and like a whole-batch 400 it is not retried automatically.
         return { kind: 'blocked-protocol' };
       }
-      const outcome = classify(error, tripId);
+      const outcome: DrainOutcome =
+        error instanceof PassDeadlineError
+          ? { kind: 'retryable' }
+          : classify(error, tripId);
       return (await recordAttempt(submittedIds))
         ? { kind: 'queue-error' }
         : outcome;

@@ -29,6 +29,18 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!--
+      Required by React Native's HeadlessJsTaskService, which acquires a
+      PARTIAL_WAKE_LOCK for the lifetime of every task it runs (Stage 8E.R1).
+      Without it the background drain task throws on start, and background
+      uploading is exactly what it exists to do.
+
+      A normal permission: granted at install, with no runtime prompt and no
+      Play Console declaration. It keeps the CPU awake for the seconds a drain
+      takes; it does not keep the screen on and it grants no new data access.
+    -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <application
       android:name=".MainApplication"
       android:label="@string/app_name"
@@ -61,5 +73,20 @@
         android:name=".location.TripLocationService"
         android:exported="false"
         android:foregroundServiceType="location" />
+
+      <!--
+        The background drain errand (Stage 8E.R1). Started by the capture
+        service above, roughly once a minute, to run the JavaScript that
+        uploads queued samples while the activity is away.
+
+        Not exported, like the capture service: nothing outside this app may
+        start it, and its only Intent extra is an owner id. Deliberately *not*
+        a foreground service and with no foregroundServiceType — it shows no
+        notification of its own and holds nothing between invocations, so it
+        has nothing to promote.
+      -->
+      <service
+        android:name=".location.TripLocationDrainService"
+        android:exported="false" />
     </application>
 </manifest>

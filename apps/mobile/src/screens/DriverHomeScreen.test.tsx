@@ -123,7 +123,13 @@ function fakeLifecycle(
     retryReconcile: async () => note('retryReconcile'),
     requestOrRetryTracking: async () => note('requestOrRetryTracking'),
     acknowledgeDroppedSamples: async () => note('acknowledgeDroppedSamples'),
+    // Provider-driven lifecycle plumbing, not anything a screen does.
+    // Deliberately unrecorded: the provider calls these on mount and on every
+    // AppState change, so counting them would add noise to the `calls` list
+    // that every assertion in this file reads.
+    syncAppForeground: () => undefined,
     onForeground: async () => note('onForeground'),
+    onBackground: () => undefined,
     dispose: () => note('dispose'),
   };
   return {

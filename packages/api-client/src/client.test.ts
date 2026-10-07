@@ -221,4 +221,49 @@ describe('requestCreated', () => {
       requestNoContent(config(204, ''), { method: 'POST', path: '/x' }),
     ).resolves.toBeUndefined();
   });
+
+  it('forwards an AbortSignal to the transport when the caller has one', async () => {
+    const fetch = vi.fn(async () => reply(204));
+    const config = createApiClientConfig('https://api.example.test', { fetch });
+    const controller = new AbortController();
+    await requestNoContent(config, {
+      method: 'POST',
+      path: '/ping',
+      signal: controller.signal,
+    });
+    expect(fetch).toHaveBeenCalledWith(
+      'https://api.example.test/ping',
+      expect.objectContaining({ signal: controller.signal }),
+    );
+  });
+
+  it('omits the key entirely when the caller has no signal', async () => {
+    const fetch = vi.fn(async () => reply(204));
+    const config = createApiClientConfig('https://api.example.test', { fetch });
+    await requestNoContent(config, { method: 'POST', path: '/ping' });
+    // Absent rather than undefined: a transport that does not understand the
+    // key must not receive it at all.
+    const init = fetch.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect('signal' in init).toBe(false);
+  });
+
+  it('surfaces an aborted request as a network error', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const fetch = vi.fn(() =>
+      Promise.reject(
+        Object.assign(new Error('The operation was aborted.'), {
+          name: 'AbortError',
+        }),
+      ),
+    );
+    const config = createApiClientConfig('https://api.example.test', { fetch });
+    const error = (await requestNoContent(config, {
+      method: 'POST',
+      path: '/ping',
+      signal: controller.signal,
+    }).catch((e: unknown) => e)) as ApiError;
+    // Honest: nothing is known about whether the server acted on it.
+    expect(error.kind).toBe('network');
+  });
 });

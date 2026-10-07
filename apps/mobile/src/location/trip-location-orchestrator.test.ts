@@ -140,6 +140,10 @@ function createFakeNative(order: string[], initial = status()) {
     },
     stopTracking: async () => {
       order.push('stopTracking');
+      // Held *before* the outcome is decided, so a test can let a session
+      // end, a different driver sign in, or the provider unmount while a stop
+      // is still in flight.
+      await wait('stopTracking');
       take('stopTracking');
       current = {
         ...current,
@@ -287,6 +291,40 @@ function createFakeDrain(order: string[]) {
   };
 }
 
+/**
+ * The process-wide background-drain fence, as the orchestrator sees it.
+ *
+ * Records every transition and mints a fresh epoch for each, exactly as
+ * `src/runtime/location-runtime` does, so a test can assert that a reopen is
+ * not a restore.
+ */
+function createFakeFence(order: string[]) {
+  let epoch = 0;
+  let owner: string | null = null;
+  const events: Array<{
+    readonly kind: 'open' | 'close';
+    readonly epoch: number;
+  }> = [];
+  return {
+    fence: {
+      open: (ownerUserId: string) => {
+        epoch += 1;
+        owner = ownerUserId;
+        order.push('fence.open');
+        events.push({ kind: 'open', epoch });
+      },
+      close: () => {
+        epoch += 1;
+        owner = null;
+        order.push('fence.close');
+        events.push({ kind: 'close', epoch });
+      },
+    },
+    events,
+    state: () => ({ epoch, owner }),
+  };
+}
+
 interface TripScript {
   readonly list?: DriverTripsApi['list'];
   readonly get?: DriverTripsApi['get'];
@@ -347,6 +385,16 @@ function createFakeSession(order: string[]) {
         listener();
       }
     },
+    /** A different driver on the same device. */
+    signInAs: (id: string) => {
+      state = {
+        status: 'authenticated',
+        user: { id, email: 'other@example.test', role: 'DRIVER' },
+      };
+      for (const listener of [...listeners]) {
+        listener();
+      }
+    },
     get listenerCount() {
       return listeners.size;
     },
@@ -401,15 +449,28 @@ interface Harness {
   readonly trips: DriverTripsApi;
   readonly session: ReturnType<typeof createFakeSession>;
   readonly timers: ReturnType<typeof createManualScheduler>;
+  readonly fence: ReturnType<typeof createFakeFence>;
 }
 
-function harness(script: TripScript = {}, initialStatus = status()): Harness {
+/**
+ * [foreground] is declared rather than assumed, because the orchestrator no
+ * longer assumes it either: being constructed says nothing about whether the
+ * app is in front of the driver, so the provider reports the real `AppState`
+ * before initializing. True is the ordinary case these tests model — the app
+ * was opened — and the background cases say so explicitly.
+ */
+function harness(
+  script: TripScript = {},
+  initialStatus = status(),
+  { foreground = true }: { readonly foreground?: boolean } = {},
+): Harness {
   const order: string[] = [];
   const native = createFakeNative(order, initialStatus);
   const drain = createFakeDrain(order);
   const trips = createFakeTrips(order, script);
   const session = createFakeSession(order);
   const timers = createManualScheduler();
+  const fence = createFakeFence(order);
   const orchestrator = createTripLocationOrchestrator({
     ownerUserId: OWNER,
     trips,
@@ -417,9 +478,20 @@ function harness(script: TripScript = {}, initialStatus = status()): Harness {
     drain: drain.drain,
     permissions: createFakePermissions(order),
     session: session.session,
+    backgroundDrain: fence.fence,
     scheduler: timers.scheduler,
   });
-  return { orchestrator, order, native, drain, trips, session, timers };
+  orchestrator.syncAppForeground(foreground);
+  return {
+    orchestrator,
+    order,
+    native,
+    drain,
+    trips,
+    session,
+    timers,
+    fence,
+  };
 }
 
 /** Every outcome that must stop the heartbeat rather than be retried. */
@@ -443,9 +515,12 @@ describe('initialization', () => {
     const h = harness({ list: () => Promise.resolve(page([])) });
     await h.orchestrator.initialize();
 
-    // The drain outlives every trip: preserved rows from an earlier trip are
-    // the reason an owner has one at all.
-    expect(h.order[0]).toBe('drain.start');
+    // The owner's background fence opens first, so a native kick dispatched
+    // during initialization can already find it open; the drain then starts
+    // before any authority is read, because it outlives every trip and
+    // preserved rows from an earlier one are the reason an owner has one.
+    expect(h.order[0]).toBe('fence.open');
+    expect(h.order[1]).toBe('drain.start');
     expect(h.orchestrator.state().phase).toBe('inactive');
     expect(h.orchestrator.state().tripId).toBeNull();
     expect(h.order).toContain('stopTracking');
@@ -1253,12 +1328,17 @@ describe('stop discipline', () => {
     expect(h.order).not.toContain('session.logout');
     expect(h.order).not.toContain('drainOneBatch');
     expect(h.order).not.toContain('drain.stop');
-    // The driver is not stranded: the button comes back.
+    // The driver is not stranded: the button comes back, and the refusal is
+    // what they are told.
     expect(h.orchestrator.state()).toMatchObject({
       signingOut: false,
-      busy: false,
       problem: 'tracking_unavailable',
     });
+    // They are also still signed in, so the foreground ownership the
+    // sign-out was about to give up is owed straight back and a restoration
+    // has already begun. It settles rather than leaving the UI busy.
+    await flush();
+    expect(h.orchestrator.state().busy).toBe(false);
   });
 
   it('carries no native message out of a refused sign-out', async () => {
@@ -2051,5 +2131,429 @@ describe('a failed reconciliation leaves no trip behind', () => {
       tripId: TRIP_A,
       problem: null,
     });
+  });
+});
+
+describe('initial AppState handshake', () => {
+  const running = () =>
+    status({ running: true, ownerUserId: OWNER, tripId: TRIP_A });
+
+  it('records the state without acting on it', async () => {
+    const h = harness({}, status(), { foreground: false });
+    h.orchestrator.syncAppForeground(true);
+
+    // A pure recording: no fence, no drain, no native call, no reconciliation.
+    expect(h.order).toEqual([]);
+  });
+
+  it('opens the owner fence when it initializes in the background', async () => {
+    const h = harness({}, running(), { foreground: false });
+
+    await h.orchestrator.initialize();
+
+    // Backgrounded is exactly when background uploading has to work, so the
+    // fence is the one thing an initialization in the background still does.
+    expect(h.fence.state()).toEqual({ epoch: 1, owner: OWNER });
+  });
+
+  it('takes no foreground ownership when it initializes in the background', async () => {
+    const h = harness({}, running(), { foreground: false });
+
+    await h.orchestrator.initialize();
+    await flush();
+
+    expect(h.order).toEqual(['fence.open']);
+    expect(h.drain.drain.state().automatic).toBe(false);
+    // No timers either: a suspended runtime would not fire them.
+    expect(h.timers.delays).toEqual([]);
+  });
+
+  it('leaves native capture running when it initializes in the background', async () => {
+    const h = harness({}, running(), { foreground: false });
+
+    await h.orchestrator.initialize();
+    await flush();
+
+    // The service keeps capturing; nothing here pauses, stops or reconciles
+    // it, because reconciling against server authority is a decision for a
+    // driver who is looking at the screen.
+    expect(h.order).not.toContain('stopTracking');
+    expect(h.order).not.toContain('pauseTracking');
+    expect(h.order).not.toContain('startTracking');
+    expect(h.order).not.toContain('list');
+    expect(h.native.current.running).toBe(true);
+  });
+
+  it('takes full ownership when it initializes in the foreground', async () => {
+    const h = harness(
+      { list: () => Promise.resolve(page([trip('IN_PROGRESS')])) },
+      status(),
+    );
+
+    await h.orchestrator.initialize();
+    await flush();
+
+    expect(h.fence.state()).toEqual({ epoch: 1, owner: OWNER });
+    expect(h.drain.drain.state().automatic).toBe(true);
+    expect(h.order).toContain('list');
+    expect(h.timers.delays).toContain(IDLE_DRAIN_POKE_MS);
+  });
+
+  it('restores everything on the first active event after a background start', async () => {
+    const h = harness(
+      { list: () => Promise.resolve(page([trip('IN_PROGRESS')])) },
+      status({ running: true, ownerUserId: OWNER, tripId: TRIP_A }),
+      { foreground: false },
+    );
+    await h.orchestrator.initialize();
+    expect(h.order).toEqual(['fence.open']);
+
+    await h.orchestrator.onForeground();
+    await flush();
+
+    // The frozen restoration order: drain first, then authority, then a poke,
+    // then the heartbeat.
+    expect(h.order.indexOf('drain.start')).toBeGreaterThan(
+      h.order.indexOf('fence.open'),
+    );
+    expect(h.order.indexOf('getStatus')).toBeGreaterThan(
+      h.order.indexOf('drain.start'),
+    );
+    expect(h.order.indexOf('list')).toBeGreaterThan(
+      h.order.indexOf('getStatus'),
+    );
+    expect(h.order.indexOf('drain.poke')).toBeGreaterThan(
+      h.order.indexOf('list'),
+    );
+    expect(h.timers.delays).toContain(IDLE_DRAIN_POKE_MS);
+  });
+});
+
+describe('foreground and background ownership', () => {
+  const inProgress: TripScript = {
+    list: () => Promise.resolve(page([trip('IN_PROGRESS')])),
+    complete: () => Promise.resolve(trip('COMPLETED')),
+  };
+  const running = () =>
+    status({ running: true, ownerUserId: OWNER, tripId: TRIP_A });
+
+  /**
+   * Starts a business operation and holds it open inside the native call.
+   *
+   * Capture is cleared first, so the reconciliation has to establish it again
+   * and the held `startTracking` keeps exactly one operation in flight for as
+   * long as the test needs. The rejection handler is attached at creation,
+   * not later: an operation that failed between two awaits would otherwise
+   * surface as an unhandled rejection rather than as the test's own concern.
+   */
+  function holdOperation(h: Harness) {
+    h.native.set({
+      running: false,
+      paused: false,
+      ownerUserId: null,
+      tripId: null,
+    });
+    const release = h.native.holdNext('startTracking');
+    const done = h.orchestrator.retryReconcile().catch(() => undefined);
+    return { release, done };
+  }
+
+  it('hands drain opportunities to native when the activity leaves', async () => {
+    const h = harness(inProgress, running());
+    await h.orchestrator.initialize();
+    await flush();
+    expect(h.drain.drain.state().automatic).toBe(true);
+
+    h.orchestrator.onBackground();
+
+    // Automatic draining is what stops: the retry ladder and the heartbeat
+    // would not fire in a suspended runtime anyway.
+    expect(h.drain.drain.state().automatic).toBe(false);
+  });
+
+  it('stops nothing else when the activity leaves', async () => {
+    const h = harness(inProgress, running());
+    await h.orchestrator.initialize();
+    await flush();
+    const before = [...h.order];
+    const state = h.orchestrator.state();
+
+    h.orchestrator.onBackground();
+
+    const after = h.order.slice(before.length);
+    // Only the drain is told. No capture stop or pause, no trip transition,
+    // no queue deletion, and the fence stays open for this owner.
+    expect(after).toEqual(['drain.stop']);
+    expect(h.native.current.running).toBe(true);
+    expect(h.fence.state()).toEqual({ epoch: 1, owner: OWNER });
+    expect(h.orchestrator.state().tripId).toBe(state.tripId);
+    expect(h.orchestrator.state().phase).toBe(state.phase);
+  });
+
+  it('restores ownership when the activity returns', async () => {
+    const h = harness(inProgress, running());
+    await h.orchestrator.initialize();
+    await flush();
+    h.orchestrator.onBackground();
+
+    await h.orchestrator.onForeground();
+    await flush();
+
+    expect(h.drain.drain.state().automatic).toBe(true);
+  });
+
+  it('defers a foreground event that lands during a business operation', async () => {
+    const h = harness(inProgress, running());
+    await h.orchestrator.initialize();
+    await flush();
+    h.orchestrator.onBackground();
+    const { release, done } = holdOperation(h);
+    await flush();
+
+    const foreground = h.orchestrator.onForeground();
+    await flush();
+
+    // Absorbed, not run: the operation in progress is already authoritative.
+    expect(h.drain.drain.state().automatic).toBe(false);
+
+    release();
+    await done;
+    await foreground;
+    await flush();
+
+    // And paid back once the operation finished.
+    expect(h.drain.drain.state().automatic).toBe(true);
+  });
+
+  it('restores exactly once for several active events', async () => {
+    const h = harness(inProgress, running());
+    await h.orchestrator.initialize();
+    await flush();
+    h.orchestrator.onBackground();
+    const { release, done } = holdOperation(h);
+    await flush();
+
+    void h.orchestrator.onForeground();
+    void h.orchestrator.onForeground();
+    void h.orchestrator.onForeground();
+    await flush();
+    release();
+    await done;
+    await flush();
+
+    const starts = h.order.filter((one) => one === 'drain.start');
+    // One restoration for any number of events: they all ask for the same
+    // thing, so the debt is a flag and not a count. The first start was the
+    // initialization.
+    expect(starts).toHaveLength(2);
+  });
+
+  it('clears the owed restoration when the activity leaves again', async () => {
+    const h = harness(inProgress, running());
+    await h.orchestrator.initialize();
+    await flush();
+    h.orchestrator.onBackground();
+    const { release, done } = holdOperation(h);
+    await flush();
+    void h.orchestrator.onForeground();
+    await flush();
+
+    // Away again before the operation finished: the debt is cancelled rather
+    // than replayed into a background that cannot use it.
+    h.orchestrator.onBackground();
+    release();
+    await done;
+    await flush();
+
+    expect(h.drain.drain.state().automatic).toBe(false);
+  });
+
+  it('leaves no stale debt when ownership never actually left', async () => {
+    const h = harness(inProgress, running());
+    await h.orchestrator.initialize();
+    await flush();
+    const first = holdOperation(h);
+    await flush();
+    // Automatic ownership is still active throughout, so the absorbed event
+    // asks for something that is already true.
+    void h.orchestrator.onForeground();
+    await flush();
+    first.release();
+    await first.done;
+    await flush();
+    const starts = h.order.filter((one) => one === 'drain.start').length;
+
+    // No second restoration now, and none left owed for a later operation to
+    // discover either.
+    const second = holdOperation(h);
+    await flush();
+    second.release();
+    await second.done;
+    await flush();
+
+    expect(h.order.filter((one) => one === 'drain.start')).toHaveLength(starts);
+  });
+
+  it('ignores a foreground event once disposed', async () => {
+    const h = harness(inProgress, running());
+    await h.orchestrator.initialize();
+    await flush();
+    h.orchestrator.dispose();
+    const before = h.order.length;
+
+    await h.orchestrator.onForeground();
+    await flush();
+
+    expect(h.order).toHaveLength(before);
+  });
+});
+
+describe('sign-out and the background fence', () => {
+  const running = () =>
+    status({ running: true, ownerUserId: OWNER, tripId: TRIP_A });
+
+  it('closes the fence before it tries to prove the stop', async () => {
+    const h = harness({}, running());
+
+    await h.orchestrator.signOut();
+
+    // A kick dispatched while the stop is being proven must not begin a batch
+    // behind a sign-out that is already underway.
+    expect(h.order.indexOf('fence.close')).toBeLessThan(
+      h.order.indexOf('stopTracking'),
+    );
+  });
+
+  it('never reopens the fence after a successful logout', async () => {
+    const h = harness({}, running());
+
+    await h.orchestrator.signOut();
+    await flush();
+
+    expect(h.fence.events).toEqual([{ kind: 'close', epoch: 1 }]);
+    expect(h.fence.state()).toEqual({ epoch: 1, owner: null });
+  });
+
+  it('reopens on a brand-new epoch when the stop cannot be proven', async () => {
+    const h = harness({}, running());
+    h.native.failNext('stopTracking', nativeError('location_queue_error'));
+
+    await expect(h.orchestrator.signOut()).rejects.toBeInstanceOf(
+      TrackingLifecycleError,
+    );
+    await flush();
+
+    // Open again for the same owner, who is still signed in — but never on
+    // the epoch a task dispatched before the close is still holding.
+    expect(h.fence.events).toEqual([
+      { kind: 'close', epoch: 1 },
+      { kind: 'open', epoch: 2 },
+    ]);
+    expect(h.fence.state()).toEqual({ epoch: 2, owner: OWNER });
+  });
+
+  it('restores automatic ownership once after a foreground failure', async () => {
+    const h = harness({}, running(), { foreground: false });
+    await h.orchestrator.initialize();
+    // Background start, so ownership is genuinely not held.
+    expect(h.drain.drain.state().automatic).toBe(false);
+    h.orchestrator.syncAppForeground(true);
+    h.native.failNext('stopTracking', nativeError('location_queue_error'));
+
+    await expect(h.orchestrator.signOut()).rejects.toBeInstanceOf(
+      TrackingLifecycleError,
+    );
+    await flush();
+
+    expect(h.drain.drain.state().automatic).toBe(true);
+    expect(h.order.filter((one) => one === 'drain.start')).toHaveLength(1);
+  });
+
+  it('starts no automatic ownership after a background failure', async () => {
+    const h = harness({}, running(), { foreground: false });
+    await h.orchestrator.initialize();
+    h.native.failNext('stopTracking', nativeError('location_queue_error'));
+
+    await expect(h.orchestrator.signOut()).rejects.toBeInstanceOf(
+      TrackingLifecycleError,
+    );
+    await flush();
+
+    // The fence is open again — initialize opened it, the sign-out closed it,
+    // the rollback opened a third — because the queue still has to reach the
+    // server. The JavaScript ladder is not, because nothing would fire it.
+    expect(h.fence.state()).toEqual({ epoch: 3, owner: OWNER });
+    expect(h.drain.drain.state().automatic).toBe(false);
+    expect(h.order).not.toContain('drain.start');
+  });
+
+  it('does not reopen for a session that ended during the attempt', async () => {
+    const h = harness({}, running());
+    const release = h.native.holdNext('stopTracking');
+    h.native.failNext('stopTracking', nativeError('location_queue_error'));
+    const pending = h.orchestrator.signOut();
+    await flush();
+    // The session ends while the stop is still in flight.
+    h.session.expire();
+    release();
+
+    await expect(pending).rejects.toBeInstanceOf(TrackingLifecycleError);
+    await flush();
+
+    // There is no authenticated owner to reopen for, so the fence stays shut.
+    expect(h.fence.events).toEqual([{ kind: 'close', epoch: 1 }]);
+    expect(h.fence.state().owner).toBeNull();
+  });
+
+  it('does not reopen for a different driver who signed in meanwhile', async () => {
+    const h = harness({}, running());
+    const release = h.native.holdNext('stopTracking');
+    h.native.failNext('stopTracking', nativeError('location_queue_error'));
+    const pending = h.orchestrator.signOut();
+    await flush();
+    h.session.signInAs('019a0000-0000-7000-8000-0000000000c9');
+    release();
+
+    await expect(pending).rejects.toBeInstanceOf(TrackingLifecycleError);
+    await flush();
+
+    // Reopening for the old owner would let a stale task read rows under a
+    // session that is not theirs.
+    expect(h.fence.state().owner).toBeNull();
+  });
+
+  it('does not reopen for a disposed lifecycle', async () => {
+    const h = harness({}, running());
+    const release = h.native.holdNext('stopTracking');
+    h.native.failNext('stopTracking', nativeError('location_queue_error'));
+    const pending = h.orchestrator.signOut();
+    await flush();
+    // The provider unmounts while the stop is still in flight.
+    h.orchestrator.dispose();
+    release();
+
+    await expect(pending).rejects.toBeInstanceOf(TrackingLifecycleError);
+    await flush();
+
+    expect(h.fence.state().owner).toBeNull();
+  });
+
+  it('closes another fresh epoch when the sign-out is retried', async () => {
+    const h = harness({}, running());
+    h.native.failNext('stopTracking', nativeError('location_queue_error'));
+    await expect(h.orchestrator.signOut()).rejects.toBeInstanceOf(
+      TrackingLifecycleError,
+    );
+    await flush();
+
+    await h.orchestrator.signOut();
+    await flush();
+
+    expect(h.fence.events).toEqual([
+      { kind: 'close', epoch: 1 },
+      { kind: 'open', epoch: 2 },
+      { kind: 'close', epoch: 3 },
+    ]);
+    expect(h.order).toContain('session.logout');
   });
 });

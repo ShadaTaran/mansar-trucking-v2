@@ -150,6 +150,19 @@ export interface TripLocationOrchestratorDeps {
     subscribe(listener: () => void): () => void;
     logout(): Promise<void>;
   };
+  /**
+   * The process-wide background-drain fence.
+   *
+   * Injected rather than imported so this module stays framework- and
+   * process-free, and so a test can watch the epoch move. The orchestrator is
+   * the only thing that may open or close it: a fence is a statement about
+   * which owner's rows a Headless task may touch, and that is a lifecycle
+   * decision, not a transport one.
+   */
+  readonly backgroundDrain: {
+    open(ownerUserId: string): void;
+    close(): void;
+  };
   readonly scheduler?: DrainScheduler;
   readonly onChange?: (projection: TrackingProjection) => void;
 }
@@ -175,8 +188,18 @@ export interface TripLocationOrchestrator {
   requestOrRetryTracking(): Promise<void>;
   /** The only path that may clear a dropped-sample count. */
   acknowledgeDroppedSamples(): Promise<void>;
+  /**
+   * Records whether the Activity is in the foreground. Nothing else.
+   *
+   * Called before [initialize] with the real initial `AppState`, because
+   * construction is not evidence of being foregrounded: bootstrap is
+   * asynchronous, so the provider can mount while the app is already away.
+   */
+  syncAppForeground(foreground: boolean): void;
   /** App returned to the foreground: refresh, re-establish authority, poke. */
   onForeground(): Promise<void>;
+  /** Activity left the foreground: hands drain opportunities to native. */
+  onBackground(): void;
   /** Idempotent: fences late work, cancels timers, unsubscribes. */
   dispose(): void;
 }
@@ -272,6 +295,21 @@ export function createTripLocationOrchestrator(
   let unsubscribe: (() => void) | null = null;
 
   /**
+   * Whether the Activity is in the foreground, and whether a restoration is
+   * owed.
+   *
+   * Both start false, and that is a decision rather than an initial value:
+   * nothing about being constructed says the app is in front of the driver.
+   * The provider reports the real `AppState` through [syncAppForeground]
+   * before initializing, and an unknown state is treated as background —
+   * failing safe here means handing drain opportunities to the native kick,
+   * which works either way, instead of arming foreground timers that a
+   * suspended runtime would never fire.
+   */
+  let appForeground = false;
+  let foregroundPending = false;
+
+  /**
    * The lifecycle fence.
    *
    * Every operation reads it on entry and must still hold it when it is about
@@ -301,6 +339,9 @@ export function createTripLocationOrchestrator(
       return await run();
     } finally {
       operations -= 1;
+      // The absorbed foreground event is paid back here, where the operation
+      // that absorbed it has definitely finished — including when it threw.
+      maybeReplayForeground();
     }
   }
 
@@ -876,8 +917,28 @@ export function createTripLocationOrchestrator(
   // Public operations
   // -------------------------------------------------------------------
 
+  /**
+   * Opens the owner's fence, then takes foreground ownership if we have it.
+   *
+   * The fence opens either way. A native kick can be dispatched the moment
+   * capture is admitted, and a Headless task that finds no open fence for this
+   * owner reads nothing — so an initialization that skipped this would make
+   * background uploading impossible for exactly the session that needs it.
+   *
+   * What the app does *not* do when it initializes in the background is take
+   * foreground ownership. No automatic drain, no reconciliation, no capture
+   * transition: timers would not fire reliably, and reconciling against server
+   * authority is a decision that belongs to a driver who is looking at the
+   * screen. Capture already running natively is left alone, the native kick
+   * plus the bounded Headless task drain the queue, and the first `active`
+   * event performs the full restoration.
+   */
   const initialize = async (): Promise<void> => {
     if (disposed) {
+      return;
+    }
+    deps.backgroundDrain.open(owner);
+    if (!appForeground) {
       return;
     }
     await exclusive(async () => {
@@ -1035,6 +1096,37 @@ export function createTripLocationOrchestrator(
   };
 
   /**
+   * Reopens the owner's fence after a sign-out that could not prove the stop.
+   *
+   * A *new* epoch, never the old one: a Headless task dispatched before the
+   * close still carries the epoch it saw then, and reviving that number would
+   * let a task from the wrong side of a sign-out attempt read rows again. The
+   * driver is still signed in, so background uploading has to work again — but
+   * only for a session that is still, right now, exactly this owner's.
+   *
+   * Nothing is reopened for a disposed lifecycle, for a session that ended
+   * while the stop was being attempted, or for a different driver who signed
+   * in in the meantime. Those are the cases where the correct answer to "may
+   * this owner's rows be touched" is still no.
+   */
+  function rollbackFence(): void {
+    const state = session.getState();
+    if (
+      disposed ||
+      state.status !== 'authenticated' ||
+      state.user.id !== owner
+    ) {
+      return;
+    }
+    deps.backgroundDrain.open(owner);
+    if (appForeground) {
+      // Owed, not taken here: this runs inside the failing operation, so the
+      // restoration is replayed by `exclusive`'s own `finally`.
+      foregroundPending = true;
+    }
+  }
+
+  /**
    * Signs the driver out, but only once capture is provably over.
    *
    * The order is the whole point: capture stops first so nothing new is
@@ -1054,10 +1146,16 @@ export function createTripLocationOrchestrator(
       // Fence first: a start or resume already in flight must not come back
       // and re-establish capture behind the sign-out.
       invalidate();
+      // And the background fence before the stop is even attempted. Proving a
+      // stop takes a round trip to native, and a kick dispatched during it
+      // would otherwise begin a batch behind a sign-out that is already
+      // underway.
+      deps.backgroundDrain.close();
       publish({ signingOut: true, busy: true });
 
       if (!(await confirmStop())) {
         signingOut = false;
+        rollbackFence();
         publish({
           phase: 'unavailable',
           problem: 'tracking_unavailable',
@@ -1184,23 +1282,100 @@ export function createTripLocationOrchestrator(
    * operation is already authoritative, and a competing reconciliation could
    * duplicate a native transition.
    */
-  const onForeground = async (): Promise<void> => {
-    if (disposed || signingOut || !authenticated() || operations > 0) {
+  const syncAppForeground = (foreground: boolean): void => {
+    appForeground = foreground;
+  };
+
+  /**
+   * Takes back everything the foreground owns, in one fixed order.
+   *
+   * The drain starts first because it is the only step that does not depend on
+   * an answer: whatever the native status or the server says, queued rows have
+   * to move, and starting here means a reconciliation that ends up blocked
+   * still leaves the queue draining. Authority comes next and is re-read every
+   * time, not only when something already looks wrong — a healthy native
+   * status proves that *this device* is still capturing and says nothing about
+   * whether the server still has an `IN_PROGRESS` trip. A trip completed from
+   * the office while this app was away is exactly the case that would
+   * otherwise keep recording.
+   */
+  async function restoreForegroundOwnership(): Promise<void> {
+    const epoch = generation;
+    await drain.start();
+    await readStatus();
+    if (projection.completionUnknown) {
+      await recoverCompletion(epoch);
+    } else {
+      await reconcile(epoch);
+    }
+    await pokeIfAllowed();
+    if (isCurrent(epoch)) {
+      armIdlePoke();
+    }
+  }
+
+  /**
+   * Pays back a foreground event that arrived during a business operation.
+   *
+   * At most one restoration, however many events were absorbed: they all ask
+   * for the same thing, and the debt is a flag rather than a count for that
+   * reason. It is cleared *before* the replay starts, so a restoration that
+   * itself absorbs nothing cannot schedule a second one, and an operation
+   * still running means this is not the last `finally` — the one that is will
+   * find the same debt.
+   */
+  function maybeReplayForeground(): void {
+    if (operations !== 0 || !foregroundPending) {
       return;
     }
-    await exclusive(async () => {
-      const epoch = generation;
-      await readStatus();
-      if (projection.completionUnknown) {
-        await recoverCompletion(epoch);
-      } else {
-        await reconcile(epoch);
-      }
-      await pokeIfAllowed();
-      if (isCurrent(epoch)) {
-        armIdlePoke();
-      }
+    if (disposed || signingOut || !appForeground || !authenticated()) {
+      return;
+    }
+    if (drain.state().automatic) {
+      // Ownership never actually left — an operation held it throughout — so
+      // the debt is settled by cancelling it, not by restoring twice.
+      foregroundPending = false;
+      return;
+    }
+    foregroundPending = false;
+    void exclusive(restoreForegroundOwnership).catch(() => {
+      // Fire-and-forget by nature: a failed restoration has already published
+      // its own problem, and there is nothing here to log.
     });
+  }
+
+  const onForeground = async (): Promise<void> => {
+    appForeground = true;
+    if (disposed || signingOut || !authenticated()) {
+      return;
+    }
+    if (operations > 0) {
+      // Absorbed, not dropped: the operation in progress is authoritative,
+      // and this event is replayed once it finishes.
+      foregroundPending = true;
+      return;
+    }
+    foregroundPending = false;
+    await exclusive(restoreForegroundOwnership);
+  };
+
+  /**
+   * Hands drain opportunities to native, and does nothing else.
+   *
+   * Capture is a foreground service and keeps running: through Home, through
+   * an app switch, through a locked screen. What stops is the *JavaScript*
+   * ownership — the retry ladder and the idle heartbeat — because a suspended
+   * runtime fires neither, and a drain that believes it has timers pending is
+   * a drain nobody will ever poke again.
+   *
+   * It deliberately does not close the owner's fence. Backgrounding is the
+   * moment background uploading has to start working, not stop.
+   */
+  const onBackground = (): void => {
+    appForeground = false;
+    foregroundPending = false;
+    cancelIdlePoke();
+    drain.stop();
   };
 
   const dispose = (): void => {
@@ -1223,7 +1398,9 @@ export function createTripLocationOrchestrator(
     retryReconcile,
     requestOrRetryTracking,
     acknowledgeDroppedSamples,
+    syncAppForeground,
     onForeground,
+    onBackground,
     dispose,
   };
 }

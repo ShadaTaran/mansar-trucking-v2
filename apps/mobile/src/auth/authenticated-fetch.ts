@@ -9,6 +9,19 @@ import type { SessionManager } from './session-manager';
  * the caller as-is. Nothing here logs, stores or rethrows token material.
  */
 
+/**
+ * The cancellation handle a caller may pass in.
+ *
+ * Structurally identical to the API client's `RequestAbortSignal`, and
+ * declared here rather than imported so that this module keeps depending
+ * only on the session. Both shapes accept a real `AbortSignal`, and TypeScript
+ * treats them as the same type, so an `HttpRequest` built by the client is
+ * assignable to the init below without either side importing the other.
+ */
+export interface RequestAbortSignal {
+  readonly aborted: boolean;
+}
+
 /** Bodies that can be sent twice (retry-once semantics). */
 export type ReplayableBody = string | FormData | null;
 
@@ -16,6 +29,20 @@ export interface AuthenticatedRequestInit {
   readonly method?: string;
   readonly headers?: Readonly<Record<string, string>>;
   readonly body?: ReplayableBody;
+  /**
+   * Cancels both the first attempt and the retry.
+   *
+   * Deliberately does not reach `session.refresh()`. A rotation whose
+   * response is lost leaves the device holding a token the server has
+   * already rotated away, and replaying it is what reuse detection
+   * revokes a session for — so a caller's deadline may abandon a request
+   * but may never abort a rotation.
+   *
+   * Typed as the client's structural handle, not as the platform
+   * `AbortSignal`, so that an `HttpRequest` built by the
+   * transport-neutral client is still assignable to this init.
+   */
+  readonly signal?: RequestAbortSignal;
 }
 
 export type AuthenticatedFetch = (
@@ -43,6 +70,14 @@ export function createAuthenticatedFetch(
         method: init.method ?? 'GET',
         headers: { ...init.headers, authorization: `Bearer ${accessToken}` },
         body: init.body ?? undefined,
+        // The one narrowing in the chain, and the only place it can
+        // happen: the platform `fetch` wants its own `AbortSignal`,
+        // which a package compiled without a DOM lib cannot name. Every
+        // signal that arrives here came from `new AbortController()`, so
+        // this asserts a vocabulary the caller already satisfies.
+        ...(init.signal !== undefined
+          ? { signal: init.signal as AbortSignal }
+          : {}),
       });
 
     const token = session.getAccessToken();

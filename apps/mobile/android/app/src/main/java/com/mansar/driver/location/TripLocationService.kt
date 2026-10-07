@@ -141,6 +141,73 @@ class TripLocationService : Service() {
   private val mainHandler = Handler(Looper.getMainLooper())
 
   /**
+   * The repeating request for a JavaScript drain.
+   *
+   * This is the whole mechanism behind background uploading, and it lives here
+   * rather than in JavaScript because JavaScript is exactly what is not
+   * running: React Native suspends its runtime with the Activity, so a JS
+   * timer set before backgrounding does not fire. Capture carries on — this
+   * service is a foreground service and keeps receiving fixes — and the queue
+   * grows durably, which is precisely why something has to ask for an upload.
+   *
+   * It re-reads admission every time instead of trusting the schedule. A
+   * minute is long enough for the session to have been stopped, paused or
+   * replaced, and a kick for a session this instance no longer owns would hand
+   * JavaScript an owner hint that does not belong to it. When admission has
+   * gone, the chain simply ends: nothing reschedules, and no further kick
+   * exists until the next start or resume.
+   */
+  private val drainKick =
+    object : Runnable {
+      override fun run() {
+        val snapshot = TripLocationRuntime.snapshot()
+        val session = snapshot.session
+        // By reference, like every other ownership question in this file: an
+        // equal-valued successor session is not the one this chain began for.
+        if (session == null || snapshot.paused || ownedSession !== session) {
+          return
+        }
+        try {
+          // `startService`, never `startForegroundService`: the drain service
+          // is an errand with no notification of its own, and promoting it
+          // would owe Android a second persistent notification within five
+          // seconds. A plain start is allowed here because *this* service is
+          // already foreground, which is also why the task is configured as
+          // allowed in the foreground.
+          startService(
+            TripLocationDrainService.intent(
+              this@TripLocationService,
+              session.ownerUserId,
+            ),
+          )
+        } catch (error: IllegalStateException) {
+          // Android refused a service start for this process state. Capture is
+          // unaffected and every fix stays queued durably, so the next kick is
+          // an ordinary retry rather than a recovery.
+          Log.i(TAG, "drain kick refused")
+        }
+        mainHandler.postDelayed(this, DRAIN_KICK_INTERVAL_MILLIS)
+      }
+    }
+
+  /**
+   * Arms the next kick, replacing any already pending.
+   *
+   * Removing first keeps the chain single: a redundant start command, or a
+   * resume following a pause, must not leave two chains ticking a minute apart
+   * and waking JavaScript twice as often.
+   */
+  private fun scheduleDrainKick() {
+    mainHandler.removeCallbacks(drainKick)
+    mainHandler.postDelayed(drainKick, DRAIN_KICK_INTERVAL_MILLIS)
+  }
+
+  /** Cancels the chain. No reboot, alarm or work-manager fallback exists. */
+  private fun cancelDrainKicks() {
+    mainHandler.removeCallbacks(drainKick)
+  }
+
+  /**
    * One resume attempt that has asked the provider and is still waiting.
    *
    * Identity, not a boolean: a registration result arriving later has to be
@@ -247,6 +314,11 @@ class TripLocationService : Service() {
         return START_NOT_STICKY
       }
     }
+    // Only after a start this instance legitimately honoured; every refusal
+    // above returned already, so no kick chain exists for a session that was
+    // never served. The runnable re-checks admission anyway, which is what
+    // makes a redundant start command on a paused session harmless.
+    scheduleDrainKick()
     // Explicitly not sticky: no silent resurrection with a trip that may have
     // ended while the process was dead.
     return START_NOT_STICKY
@@ -263,6 +335,10 @@ class TripLocationService : Service() {
     // used to answer "nothing" and leave a paused session running with its
     // service gone.
     val owned = ownedSession
+    // Nothing of this instance may outlive it, the kick chain included: a
+    // posted runnable holds a reference to a destroyed service and would ask
+    // for a drain on behalf of a session that no longer exists.
+    cancelDrainKicks()
     // A pending resume cannot be left waiting on a provider that is going
     // away with this instance; it is completed honestly first.
     terminatePendingResume()
@@ -377,6 +453,7 @@ class TripLocationService : Service() {
     TripLocationRuntime.endIfOwnedInstance(session) {
       TripLocationRuntime.recordError(code)
       retireCallback(session)
+      cancelDrainKicks()
       stopSelf()
     }
   }
@@ -558,6 +635,9 @@ class TripLocationService : Service() {
           supersedePendingResume(owned)
         }
         retireCallback(owned)
+        // A paused session admits nothing, so there is nothing to upload on
+        // its behalf and no reason to keep waking JavaScript for it.
+        cancelDrainKicks()
         TrackingTransition.Applied
       }
     }
@@ -708,6 +788,8 @@ class TripLocationService : Service() {
       )
       return
     }
+    // Admission is open again, so background uploading has to work again.
+    scheduleDrainKick()
     settle(attempt, TrackingTransition.Applied)
   }
 
@@ -964,6 +1046,19 @@ class TripLocationService : Service() {
 
     /** The raw provider cadence; the emission filter decides what is kept. */
     const val RAW_INTERVAL_MILLIS = 30_000L
+
+    /**
+     * How often a capturing session asks JavaScript to drain the queue.
+     *
+     * A minute against a thirty-second capture cadence means a kick usually
+     * finds one or two new rows, which keeps each errand small; and because
+     * one invocation may upload five batches, a backlog from a long tunnel is
+     * cleared in minutes rather than one row at a time. It is the only source
+     * of background drain opportunities: there is no alarm, no work manager and
+     * no boot receiver behind it, so a killed process simply stops kicking
+     * until the app is opened again.
+     */
+    const val DRAIN_KICK_INTERVAL_MILLIS = 60_000L
 
     /**
      * The live service instance, for same-process pause and resume.

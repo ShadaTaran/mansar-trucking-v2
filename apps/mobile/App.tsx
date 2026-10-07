@@ -1,8 +1,4 @@
-import {
-  type AuthUser,
-  createApiClientConfig,
-  createAuthApi,
-} from '@mansar/api-client';
+import { type AuthUser } from '@mansar/api-client';
 import { useEffect, useMemo, useState } from 'react';
 
 import { createAuthenticatedFetch } from './src/auth/authenticated-fetch';
@@ -11,20 +7,20 @@ import {
   useAuthState,
   useSession,
 } from './src/auth/auth-context';
-import { createKeychainSecretStore } from './src/auth/auth-secret-store';
-import {
-  createSessionManager,
-  type SessionManager,
-} from './src/auth/session-manager';
+import type { SessionManager } from './src/auth/session-manager';
 import { getApiBaseUrl } from './src/config/api';
 import { createDriverExpensesApi } from './src/expenses/driver-expenses-api';
-import { createDriverLocationApi } from './src/location/driver-location-api';
 import { LocationProvider } from './src/location/location-context';
-import { createLocationDrain } from './src/location/location-drain';
 import { createLocationPermissions } from './src/location/location-permissions';
-import { createNativeTripLocation } from './src/location/native-trip-location';
 import { createTripLocationOrchestrator } from './src/location/trip-location-orchestrator';
 import { createDriverReceiptsApi } from './src/receipts/driver-receipts-api';
+import {
+  closeBackgroundDrain,
+  getOwnerLocationDrain,
+  getTripLocationNative,
+  openBackgroundDrain,
+} from './src/runtime/location-runtime';
+import { getProcessSessionManager } from './src/runtime/session-runtime';
 import {
   BootstrapErrorScreen,
   BootstrapScreen,
@@ -36,30 +32,21 @@ import { UnconfiguredBuildScreen } from './src/screens/UnconfiguredBuildScreen';
 import { createDriverTripsApi } from './src/trips/driver-trips-api';
 
 /**
- * Driver app root: one session manager for the process, one screen per
- * authentication state. Nothing renders as authenticated until the API has
- * confirmed a DRIVER identity (login response or `/auth/me` after restore).
+ * Driver app root: one screen per authentication state. Nothing renders as
+ * authenticated until the API has confirmed a DRIVER identity (login response
+ * or `/auth/me` after restore).
  *
- * The API endpoint is fixed by the Android build type. A build without a
- * usable endpoint (release, until a production endpoint is approved) gets
- * no session manager and no API client at all: it fails closed.
+ * It no longer *owns* the session manager, the native boundary or the drain.
+ * Those are process-wide now (`src/runtime/`), because the Headless
+ * location-drain task needs the same instances and runs with no React tree at
+ * all. A second session manager would mean two rotations over one refresh
+ * token; a second drain would mean two readers of one queue. This component
+ * consumes them.
+ *
+ * The API endpoint is still fixed by the Android build type, and a build
+ * without a usable endpoint (release, until a production endpoint is approved)
+ * gets no session manager and no API client at all: it fails closed.
  */
-
-let defaultSession: SessionManager | null | undefined;
-
-function getDefaultSession(): SessionManager | null {
-  if (defaultSession === undefined) {
-    const apiBaseUrl = getApiBaseUrl();
-    defaultSession =
-      apiBaseUrl === null
-        ? null
-        : createSessionManager({
-            authApi: createAuthApi(createApiClientConfig(apiBaseUrl)),
-            secretStore: createKeychainSecretStore(),
-          });
-  }
-  return defaultSession;
-}
 
 /**
  * The signed-in driver flow: the trip list, or one trip.
@@ -89,15 +76,15 @@ function AuthenticatedFlow({ user }: { readonly user: AuthUser }) {
     }
     const authenticatedFetch = createAuthenticatedFetch(session);
     const trips = createDriverTripsApi(apiBaseUrl, authenticatedFetch);
-    const native = createNativeTripLocation();
+    const native = getTripLocationNative();
     // The drain is owner-scoped, not trip-scoped: rows preserved from a trip
     // that ended days ago still have to reach the server, so it outlives every
-    // trip and is built once per signed-in driver.
-    const drain = createLocationDrain({
-      ownerUserId: user.id,
-      queue: native,
-      api: createDriverLocationApi(apiBaseUrl, authenticatedFetch),
-    });
+    // trip — and now every mount, because the Headless task has to find this
+    // same object when no React tree exists.
+    const drain = getOwnerLocationDrain(user.id);
+    if (drain === null) {
+      return null;
+    }
     return {
       trips,
       expenses: createDriverExpensesApi(apiBaseUrl, authenticatedFetch),
@@ -114,6 +101,11 @@ function AuthenticatedFlow({ user }: { readonly user: AuthUser }) {
           drain,
           permissions: createLocationPermissions(),
           session,
+          // The lifecycle owns the fence; the runtime only holds it.
+          backgroundDrain: {
+            open: openBackgroundDrain,
+            close: closeBackgroundDrain,
+          },
           onChange,
         }),
     };
@@ -172,16 +164,11 @@ function ConfiguredApp({ session }: { readonly session: SessionManager }) {
 }
 
 function App({ session }: { readonly session?: SessionManager }) {
-  const active = session ?? getDefaultSession();
+  const active = session ?? getProcessSessionManager();
   if (active === null) {
     return <UnconfiguredBuildScreen />;
   }
   return <ConfiguredApp session={active} />;
-}
-
-/** Test hook: forget the lazily created default session. */
-export function resetDefaultSessionForTests(): void {
-  defaultSession = undefined;
 }
 
 export default App;

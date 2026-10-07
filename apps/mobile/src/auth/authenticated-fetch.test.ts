@@ -31,6 +31,13 @@ interface Sent {
 let api: FakeAuthApi;
 let session: SessionManager;
 let sent: Sent[];
+/**
+ * What each attempt was given as a signal, recorded beside `sent` rather than
+ * inside it so the exact-shape assertions above stay exact.
+ */
+let signals: Array<AbortSignal | null | undefined>;
+/** Whether the key was present at all on each attempt. */
+let signalKeys: boolean[];
 let responder: (request: Sent) => Promise<Response> | Response;
 
 function response(status: number): Response {
@@ -46,12 +53,16 @@ const rawFetch: typeof fetch = async (input, init) => {
     body: init?.body,
   };
   sent.push(request);
+  signals.push(init?.signal);
+  signalKeys.push(init !== undefined && 'signal' in init);
   return responder(request);
 };
 
 beforeEach(async () => {
   keychain.reset();
   sent = [];
+  signals = [];
+  signalKeys = [];
   responder = () => response(200);
   api = createFakeAuthApi();
   session = createSessionManager({
@@ -214,5 +225,100 @@ describe('createAuthenticatedFetch', () => {
     const [request] = sent;
     expect(request!.url).not.toContain('synthetic');
     expect(String(request!.body)).not.toContain('synthetic');
+  });
+
+  it('forwards the caller signal to the first attempt', async () => {
+    const authenticatedFetch = createAuthenticatedFetch(session, rawFetch);
+    const controller = new AbortController();
+
+    await authenticatedFetch('https://api.example.test/trips', {
+      signal: controller.signal,
+    });
+
+    expect(signals).toEqual([controller.signal]);
+  });
+
+  it('forwards the same signal to the retry after a refresh', async () => {
+    const authenticatedFetch = createAuthenticatedFetch(session, rawFetch);
+    api.refresh.mockResolvedValueOnce(tokens(2));
+    responder = (request) =>
+      response(
+        request.authorization === 'Bearer synthetic.access.2' ? 200 : 401,
+      );
+    const controller = new AbortController();
+
+    const result = await authenticatedFetch('https://api.example.test/trips', {
+      signal: controller.signal,
+    });
+
+    expect(result.status).toBe(200);
+    // Both attempts, or a caller's deadline would stop applying the moment a
+    // token happened to expire.
+    expect(signals).toEqual([controller.signal, controller.signal]);
+  });
+
+  it('omits the signal key when the caller has no deadline', async () => {
+    const authenticatedFetch = createAuthenticatedFetch(session, rawFetch);
+    await authenticatedFetch('https://api.example.test/trips');
+    expect(signalKeys).toEqual([false]);
+  });
+
+  it('never hands the caller signal to the refresh rotation', async () => {
+    const authenticatedFetch = createAuthenticatedFetch(session, rawFetch);
+    const refresh = jest.spyOn(session, 'refresh');
+    api.refresh.mockResolvedValueOnce(tokens(2));
+    responder = (request) =>
+      response(
+        request.authorization === 'Bearer synthetic.access.2' ? 200 : 401,
+      );
+    const controller = new AbortController();
+    // Already aborted: the request half is over before the rotation starts.
+    controller.abort();
+
+    const result = await authenticatedFetch('https://api.example.test/trips', {
+      signal: controller.signal,
+    });
+
+    // `refresh()` takes nothing, and that is the contract being asserted: a
+    // rotation whose response is lost leaves the device holding a token the
+    // server has already rotated away, and replaying it is what reuse
+    // detection revokes a token family for.
+    expect(refresh).toHaveBeenCalledWith();
+    expect(api.refresh).toHaveBeenCalledTimes(1);
+    // The rotation committed and the retry used its result.
+    expect(result.status).toBe(200);
+    expect(sent.map((r) => r.authorization)).toEqual([
+      'Bearer synthetic.access.1',
+      'Bearer synthetic.access.2',
+    ]);
+    expect(session.getState().status).toBe('authenticated');
+  });
+
+  it('lets a rotation finish even when the caller aborted mid-flight', async () => {
+    const authenticatedFetch = createAuthenticatedFetch(session, rawFetch);
+    const rotation = deferred<ReturnType<typeof tokens>>();
+    api.refresh.mockReturnValueOnce(rotation.promise);
+    responder = (request) =>
+      response(
+        request.authorization === 'Bearer synthetic.access.2' ? 200 : 401,
+      );
+    const controller = new AbortController();
+
+    const pending = authenticatedFetch('https://api.example.test/trips', {
+      signal: controller.signal,
+    });
+    await flush();
+    // The caller gives up here. Nothing about that may reach the rotation.
+    controller.abort();
+    await flush();
+    expect(api.refresh).toHaveBeenCalledTimes(1);
+
+    rotation.resolve(tokens(2));
+    const result = await pending;
+
+    expect(result.status).toBe(200);
+    expect(session.getState().status).toBe('authenticated');
+    // One stored refresh token, rotated exactly once.
+    expect(keychain.entries.size).toBe(1);
   });
 });

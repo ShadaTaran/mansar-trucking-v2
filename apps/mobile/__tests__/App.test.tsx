@@ -4,8 +4,9 @@ import {
   screen,
   waitFor,
 } from '@testing-library/react-native';
+import { AppState, type AppStateStatus } from 'react-native';
 
-import App, { resetDefaultSessionForTests } from '../App';
+import App from '../App';
 import {
   createKeychainSecretStore,
   REFRESH_TOKEN_SERVICE,
@@ -14,6 +15,11 @@ import {
   createSessionManager,
   type SessionManager,
 } from '../src/auth/session-manager';
+import { resetLocationRuntimeForTests } from '../src/runtime/location-runtime';
+import {
+  getProcessSessionManager,
+  resetProcessSessionManagerForTests,
+} from '../src/runtime/session-runtime';
 import {
   ADMIN,
   createFakeAuthApi,
@@ -108,10 +114,18 @@ function renderedText(): string {
 }
 
 beforeEach(() => {
+  // A mounted, visible app reports 'active'. The React Native jest preset
+  // mocks `currentState` as a `jest.fn()`, and the location provider now
+  // reads it before initializing, so the fixture has to say what the device
+  // would: anything other than 'active' is treated as backgrounded.
+  (AppState as { currentState: AppStateStatus | null }).currentState = 'active';
   keychain.reset();
   nativeConfig.reset();
   tripLocation.reset();
-  resetDefaultSessionForTests();
+  // Session manager, native wrapper, owner drains and the background fence
+  // are process-wide now, so each test starts from a cold process.
+  resetProcessSessionManagerForTests();
+  resetLocationRuntimeForTests();
   api = createFakeAuthApi();
   session = newSession();
   stubTripFetch();
@@ -625,5 +639,42 @@ describe('App without an injected session (build configuration)', () => {
       screen.getByText('This build has no API endpoint configured.'),
     ).toBeOnTheScreen();
     expect(keychain.calls).toEqual([]);
+  });
+
+  it('signs in through the one session a background task would also get', async () => {
+    const fetchMock = jest.fn<Promise<Response>, [string, unknown]>(
+      async (input) =>
+        ({
+          status: 200,
+          text: async () =>
+            String(input).endsWith('/auth/login')
+              ? JSON.stringify({
+                  accessToken: 'synthetic.access.1',
+                  accessExpiresIn: 600,
+                  refreshToken: 'synthetic-refresh-1',
+                  refreshExpiresAt: '2026-10-20T00:00:00.000Z',
+                  user: DRIVER,
+                })
+              : JSON.stringify(EMPTY_TRIP_PAGE),
+        }) as unknown as Response,
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      await render(<App />);
+      await screen.findByRole('button', { name: 'Sign in' });
+      await signIn('driver@example.test');
+      await waitFor(() =>
+        expect(screen.queryByRole('button', { name: 'Sign in' })).toBeNull(),
+      );
+
+      // The Headless task reaches the session the same way, with no React
+      // tree: what the driver signed into is what it finds.
+      expect(getProcessSessionManager()!.getState()).toEqual({
+        status: 'authenticated',
+        user: DRIVER,
+      });
+    } finally {
+      delete (globalThis as { fetch?: unknown }).fetch;
+    }
   });
 });

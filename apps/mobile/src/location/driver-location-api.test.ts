@@ -54,6 +54,10 @@ interface Call {
   readonly method: string;
   readonly headers: Readonly<Record<string, string>>;
   readonly body: string | undefined;
+  /** Undefined when the caller passed no deadline. */
+  readonly signal: { readonly aborted: boolean } | undefined;
+  /** Whether the key was present at all. */
+  readonly hasSignalKey: boolean;
 }
 
 const json = (status: number, body: unknown) => ({
@@ -70,6 +74,8 @@ function harness(respond: (url: string) => ReturnType<typeof json>) {
       method: init.method ?? 'GET',
       headers: init.headers ?? {},
       body: typeof init.body === 'string' ? init.body : undefined,
+      signal: init.signal,
+      hasSignalKey: 'signal' in init,
     });
     return Promise.resolve(respond(url) as unknown as Response);
   });
@@ -469,9 +475,51 @@ describe('authentication stays with the injected transport', () => {
     const api = createDriverLocationApi(BASE_URL, () =>
       Promise.resolve(json(200, { results: [] }) as unknown as Response),
     );
-    // Two parameters, the trip and its samples. There is no third, so a token
-    // cannot reach this layer even by accident.
-    expect(api.ingest).toHaveLength(2);
+    // Three parameters: the trip, its samples, and an optional cancellation
+    // handle. Still no credential — a signal carries no identity and names no
+    // user — so a token cannot reach this layer even by accident.
+    expect(api.ingest).toHaveLength(3);
     expect(Object.keys(api)).toEqual(['ingest']);
+  });
+
+  it('forwards an optional signal to the transport', async () => {
+    const { api, calls } = harness(() => json(200, accepted([SAMPLE])));
+    const controller = new AbortController();
+
+    await api.ingest(TRIP_ID, [SAMPLE], controller.signal);
+
+    expect(calls[0]!.signal).toBe(controller.signal);
+  });
+
+  it('omits the signal entirely for a caller without one', async () => {
+    const { api, calls } = harness(() => json(200, accepted([SAMPLE])));
+
+    await api.ingest(TRIP_ID, [SAMPLE]);
+
+    // Absent rather than undefined, so every existing caller's request is
+    // byte-for-byte the one it sent before.
+    expect(calls[0]!.hasSignalKey).toBe(false);
+  });
+
+  it('keeps the signal out of the URL, the headers and the body', async () => {
+    const { api, calls } = harness(() => json(200, accepted([SAMPLE])));
+    const controller = new AbortController();
+
+    await api.ingest(TRIP_ID, [SAMPLE], controller.signal);
+
+    const call = calls[0]!;
+    expect(Object.keys(call.headers).sort()).toEqual([
+      'accept',
+      'content-type',
+    ]);
+    expect(call.url).not.toContain('signal');
+    expect(Object.keys(sentBody(call))).toEqual(['samples']);
+    expect(Object.keys(sentBody(call).samples[0]!).sort()).toEqual([
+      'accuracy',
+      'latitude',
+      'longitude',
+      'recordedAt',
+      'sampleId',
+    ]);
   });
 });

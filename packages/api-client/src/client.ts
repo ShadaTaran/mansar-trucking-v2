@@ -9,10 +9,32 @@
  */
 
 /** Minimal request shape the client sends; a subset of the Fetch `RequestInit`. */
+/**
+ * The cancellation handle a caller may hand to the transport.
+ *
+ * Declared structurally rather than imported from `lib.dom`: this package is
+ * platform-neutral and compiles with `lib: ["ES2022"]`, and nothing here ever
+ * reads the handle — it is forwarded untouched to whichever `fetch` the host
+ * supplied. A real `AbortSignal` satisfies it.
+ */
+export interface RequestAbortSignal {
+  readonly aborted: boolean;
+}
+
 export interface HttpRequest {
   readonly method: string;
   readonly headers: Readonly<Record<string, string>>;
   readonly body?: string;
+  /**
+   * Cancels the request when the caller's deadline passes.
+   *
+   * Optional, and absent for every ordinary call: only a caller that owns
+   * a real deadline — the background location drain — has anything to say
+   * about when a request should stop being waited for. An aborted request
+   * surfaces as `ApiError('network')`, which is the honest classification:
+   * nothing is known about whether the server acted on it.
+   */
+  readonly signal?: RequestAbortSignal;
 }
 
 /** Minimal response shape the client reads; satisfied by the Fetch `Response`. */
@@ -120,6 +142,8 @@ export function isApiError(value: unknown): value is ApiError {
 
 export interface RequestSpec {
   readonly method: 'GET' | 'POST';
+  /** Passed straight to the transport; see `HttpRequest.signal`. */
+  readonly signal?: RequestAbortSignal;
   /** Path relative to the base URL, starting with `/`. */
   readonly path: string;
   /** JSON-serialised as the request body. */
@@ -148,6 +172,9 @@ async function send(
     method: spec.method,
     headers,
     ...(spec.body !== undefined ? { body: JSON.stringify(spec.body) } : {}),
+    // Omitted entirely when the caller has no deadline, so a transport
+    // that does not understand the key never receives it.
+    ...(spec.signal !== undefined ? { signal: spec.signal } : {}),
   };
 
   let response: HttpResponse;

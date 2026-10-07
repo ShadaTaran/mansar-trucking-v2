@@ -116,6 +116,7 @@ export interface DriverLocationApi {
   ingest(
     tripId: string,
     samples: readonly IngestibleLocationSample[],
+    signal?: AbortSignal,
   ): Promise<readonly LocationSampleResult[]>;
 }
 
@@ -288,6 +289,7 @@ async function call<T>(
     readonly method: 'POST';
     readonly path: string;
     readonly body: unknown;
+    readonly signal?: AbortSignal;
   },
   parse: (value: unknown) => T | null,
 ): Promise<T> {
@@ -321,7 +323,7 @@ export function createDriverLocationApi(
   authenticatedFetch: AuthenticatedFetch,
 ): DriverLocationApi {
   return {
-    ingest: async (tripId, samples) => {
+    ingest: async (tripId, samples, signal) => {
       assertSubmittable(tripId, samples);
       const result = await call(
         baseUrl,
@@ -330,6 +332,7 @@ export function createDriverLocationApi(
           method: 'POST',
           path: samplesPath(tripId),
           body: ingestBody(samples),
+          ...(signal === undefined ? {} : { signal }),
         },
         parseLocationIngestionResult,
       );

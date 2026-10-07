@@ -70,8 +70,14 @@ function createFakeOrchestrator(
     acknowledgeDroppedSamples: async () => {
       calls.push('acknowledgeDroppedSamples');
     },
+    syncAppForeground: (foreground: boolean) => {
+      calls.push(`syncAppForeground:${String(foreground)}`);
+    },
     onForeground: async () => {
       calls.push('onForeground');
+    },
+    onBackground: () => {
+      calls.push('onBackground');
     },
     dispose: () => {
       calls.push('dispose');
@@ -95,13 +101,20 @@ function createFakeOrchestrator(
  * that kept delivering after removal would make the teardown proof
  * meaningless.
  */
-function captureAppState() {
+function captureAppState(
+  initial: AppStateStatus | null = 'active',
+  /** Called the moment a listener is added, before the snapshot is read. */
+  onSubscribe?: () => void,
+) {
   interface Entry {
     readonly handler: (state: AppStateStatus) => void;
     readonly remove: jest.Mock;
     removed: boolean;
   }
   const entries: Entry[] = [];
+  // Assigned rather than spied: `currentState` is a plain property on the
+  // platform's AppState, and null is its real value before the first read.
+  (AppState as { currentState: AppStateStatus | null }).currentState = initial;
   jest
     .spyOn(AppState, 'addEventListener')
     .mockImplementation((type, handler) => {
@@ -114,6 +127,7 @@ function captureAppState() {
         removed: false,
       };
       entries.push(entry);
+      onSubscribe?.();
       return { remove: entry.remove } as unknown as ReturnType<
         typeof AppState.addEventListener
       >;
@@ -276,8 +290,8 @@ describe('foreground notification', () => {
 
     await appState.emit('background');
     await appState.emit('inactive');
-    // Backgrounding is not a lifecycle event here: native capture continues,
-    // and nothing is stopped or paused for it.
+    // Backgrounding is a handoff, not a recovery: it reaches `onBackground`,
+    // where native capture continues and nothing is stopped or paused.
     expect(fake.calls).not.toContain('onForeground');
 
     await appState.emit('active');
@@ -362,5 +376,142 @@ describe('useLocationLifecycle outside a provider', () => {
     );
     expect(screen.getByText('caught')).toBeTruthy();
     spy.mockRestore();
+  });
+});
+
+describe('initial AppState handshake', () => {
+  it('registers the listener before it reads the initial state', async () => {
+    const seen: string[] = [];
+    const appState = captureAppState('active', () => {
+      seen.push('listener');
+    });
+    const fake = createFakeOrchestrator();
+    const original = fake.orchestrator.syncAppForeground;
+    fake.orchestrator.syncAppForeground = (foreground: boolean) => {
+      seen.push('sync');
+      original(foreground);
+    };
+
+    await render(
+      <LocationProvider create={() => fake.orchestrator}>
+        <Probe />
+      </LocationProvider>,
+    );
+
+    // A transition that happens between the two would be missed the other way
+    // round, and a missed `active` is a session that never recovers.
+    expect(seen).toEqual(['listener', 'sync']);
+    expect(appState.entries).toHaveLength(1);
+  });
+
+  it('syncs the real initial state before initializing', async () => {
+    captureAppState('active');
+    const fake = createFakeOrchestrator();
+
+    await render(
+      <LocationProvider create={() => fake.orchestrator}>
+        <Probe />
+      </LocationProvider>,
+    );
+
+    // Order, not just presence: initialization decides whether to take
+    // foreground ownership, so it has to be told first.
+    expect(fake.calls).toEqual(['syncAppForeground:true', 'initialize']);
+  });
+
+  it('reports a backgrounded launch as background', async () => {
+    captureAppState('background');
+    const fake = createFakeOrchestrator();
+
+    await render(
+      <LocationProvider create={() => fake.orchestrator}>
+        <Probe />
+      </LocationProvider>,
+    );
+
+    expect(fake.calls).toEqual(['syncAppForeground:false', 'initialize']);
+  });
+
+  it('fails safe to background for an unknown initial state', async () => {
+    captureAppState(null);
+    const fake = createFakeOrchestrator();
+
+    await render(
+      <LocationProvider create={() => fake.orchestrator}>
+        <Probe />
+      </LocationProvider>,
+    );
+
+    // `currentState` is null until the platform has answered once. Guessing
+    // foreground would arm timers a suspended runtime never fires; guessing
+    // background only hands the work to the native kick, which works either
+    // way.
+    expect(fake.calls).toEqual(['syncAppForeground:false', 'initialize']);
+  });
+
+  it('never assumes a foreground launch merely because it mounted', async () => {
+    captureAppState('inactive');
+    const fake = createFakeOrchestrator();
+
+    await render(
+      <LocationProvider create={() => fake.orchestrator}>
+        <Probe />
+      </LocationProvider>,
+    );
+
+    expect(fake.calls).not.toContain('syncAppForeground:true');
+  });
+});
+
+describe('background notification', () => {
+  it('routes every non-active state to onBackground', async () => {
+    const appState = captureAppState();
+    const fake = createFakeOrchestrator();
+    await render(
+      <LocationProvider create={() => fake.orchestrator}>
+        <Probe />
+      </LocationProvider>,
+    );
+
+    await appState.emit('background');
+    await appState.emit('inactive');
+    // Not a known-list check: an unrecognised state must not be left
+    // believing it still owns foreground timers.
+    await appState.emit('unknown' as AppStateStatus);
+
+    expect(fake.count('onBackground')).toBe(3);
+    expect(fake.calls).not.toContain('onForeground');
+  });
+
+  it('routes active to onForeground and nothing else', async () => {
+    const appState = captureAppState();
+    const fake = createFakeOrchestrator();
+    await render(
+      <LocationProvider create={() => fake.orchestrator}>
+        <Probe />
+      </LocationProvider>,
+    );
+
+    await appState.emit('active');
+
+    expect(fake.count('onForeground')).toBe(1);
+    expect(fake.count('onBackground')).toBe(0);
+  });
+
+  it('notifies nothing after unmount', async () => {
+    const appState = captureAppState();
+    const fake = createFakeOrchestrator();
+    const view = await render(
+      <LocationProvider create={() => fake.orchestrator}>
+        <Probe />
+      </LocationProvider>,
+    );
+    await act(async () => {
+      view.unmount();
+    });
+
+    await appState.emit('background');
+
+    expect(fake.calls).not.toContain('onBackground');
   });
 });

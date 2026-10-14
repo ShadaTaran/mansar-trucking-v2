@@ -17,6 +17,7 @@ import {
   type ReceiptUploadAuthorization,
   type Trip,
   TRIP_STATUSES,
+  type TripLocationSample,
   type TripStatus,
   type Vehicle,
   type VehicleStatus,
@@ -127,6 +128,25 @@ function nullableInt(value: unknown): number | null | undefined {
     return null;
   }
   return typeof value === 'number' && Number.isInteger(value)
+    ? value
+    : undefined;
+}
+
+/**
+ * A real number, for the measured quantities that are not whole: coordinates
+ * in decimal degrees and accuracy in metres. `Number.isFinite` rejects `NaN`
+ * and both infinities, which JSON cannot carry but a hand-built body can.
+ */
+function finite(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/** The same, where `null` is a meaning the API sends rather than a refusal. */
+function nullableFinite(value: unknown): number | null | undefined {
+  if (value === null) {
+    return null;
+  }
+  return typeof value === 'number' && Number.isFinite(value)
     ? value
     : undefined;
 }
@@ -614,6 +634,104 @@ export function closeTrip(id: string): Promise<AdminApiResult<Trip>> {
     `/trips/${encodeURIComponent(id)}/close`,
     { method: 'POST' },
     parseTrip,
+  );
+}
+
+/**
+ * Fail-closed location parser (Stage 8D.1 read contract).
+ *
+ * Eight fields, which is the whole contract: a sample identifies the trip it
+ * belongs to and nothing else. There is deliberately no driver, user, vehicle
+ * or device id here, because the API does not send one — a position is
+ * evidence about a *trip*, and attaching an identity to it would be inventing
+ * an authority the system does not have.
+ *
+ * `accuracy` is the only nullable field: `null` is the device reporting that
+ * it did not know, which is different from a value that failed to parse.
+ */
+export function parseTripLocationSample(
+  value: unknown,
+): TripLocationSample | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const id = str(value.id);
+  const tripId = str(value.tripId);
+  const sampleId = str(value.sampleId);
+  const latitude = finite(value.latitude);
+  const longitude = finite(value.longitude);
+  const accuracy = nullableFinite(value.accuracy);
+  const recordedAt = str(value.recordedAt);
+  const receivedAt = str(value.receivedAt);
+  if (
+    id === null ||
+    tripId === null ||
+    sampleId === null ||
+    latitude === null ||
+    longitude === null ||
+    accuracy === undefined ||
+    recordedAt === null ||
+    receivedAt === null
+  ) {
+    return null;
+  }
+  return {
+    id,
+    tripId,
+    sampleId,
+    latitude,
+    longitude,
+    accuracy,
+    recordedAt,
+    receivedAt,
+  };
+}
+
+/**
+ * The latest stored position for one trip.
+ *
+ * Two different 404s can come back and they mean different things:
+ * `trip_location_unknown` is a trip that exists with nothing recorded, and
+ * `trip_not_found` is no such trip. Both reach the caller as the code the
+ * API sent, so the UI can keep them apart.
+ */
+export function getTripLatestLocation(
+  tripId: string,
+): Promise<AdminApiResult<TripLocationSample>> {
+  return request(
+    `/trips/${encodeURIComponent(tripId)}/location`,
+    {},
+    parseTripLocationSample,
+  );
+}
+
+export interface TripLocationSamplesQuery {
+  readonly page?: number;
+  readonly pageSize?: number;
+}
+
+/**
+ * One trip's stored route history, paged.
+ *
+ * The API answers in capture order — `recordedAt` ascending with `id` as the
+ * tie-breaker — and a trip with nothing recorded is an empty page rather than
+ * a refusal, so a zero `total` is an answer and not an error.
+ */
+export function listTripLocationSamples(
+  tripId: string,
+  query: TripLocationSamplesQuery = {},
+): Promise<AdminApiResult<Page<TripLocationSample>>> {
+  const params = new URLSearchParams();
+  if (query.page !== undefined) {
+    params.set('page', String(query.page));
+  }
+  if (query.pageSize !== undefined) {
+    params.set('pageSize', String(query.pageSize));
+  }
+  const search = params.toString();
+  const base = `/trips/${encodeURIComponent(tripId)}/location-samples`;
+  return request(search ? `${base}?${search}` : base, {}, (value) =>
+    parsePage(value, parseTripLocationSample),
   );
 }
 

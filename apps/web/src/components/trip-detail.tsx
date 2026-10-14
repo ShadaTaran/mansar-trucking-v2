@@ -11,6 +11,7 @@ import { TripAssignment } from './trip-assignment';
 import { TripExpenses } from './trip-expenses';
 import { TripForm } from './trip-form';
 import { TripLifecycle } from './trip-lifecycle';
+import { TripLocationSection } from './trip-location';
 
 /** Business text and assignment are only editable while a trip is planned. */
 const PLANNABLE: readonly Trip['status'][] = ['DRAFT', 'ASSIGNED'];
@@ -141,6 +142,10 @@ export function TripDetail({ tripId }: { readonly tripId: string }) {
           before reaching that button. Expense activity never changes the
           trip's own status — only the server's lifecycle transitions do. */}
       <TripExpenses trip={trip} />
+      {/* Reference material, so it sits after the expenses an admin must
+          read and before the lifecycle control they act on. It receives the
+          Trip already loaded here rather than fetching it again. */}
+      <TripLocationSection trip={trip} />
       <TripLifecycle trip={trip} onChanged={setTrip} />
     </main>
   );

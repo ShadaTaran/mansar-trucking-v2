@@ -26,11 +26,13 @@ import {
   getExpenseReceipt,
   getMaintenance,
   getTrip,
+  getTripLatestLocation,
   getVehicle,
   linkDriverUser,
   listDrivers,
   listExpenses,
   listMaintenance,
+  listTripLocationSamples,
   listTrips,
   listVehicles,
   rejectExpense,
@@ -1618,5 +1620,259 @@ describe('maintenance error wording', () => {
         code: 'completedAt must be on or after startedAt',
       }),
     ).toBe('Please check the values you entered.');
+  });
+});
+
+const SAMPLE_ID = '019a0000-0000-7000-8000-00000000005a';
+
+/** The eight wire fields the Stage 8D.1 read contract exposes, and no more. */
+const SAMPLE = {
+  id: SAMPLE_ID,
+  tripId: TRIP_ID,
+  sampleId: '019a0000-0000-7000-8000-00000000005b',
+  latitude: 14.5995123,
+  longitude: 120.9842224,
+  accuracy: 12.5,
+  recordedAt: '2026-09-24T01:00:00.000Z',
+  receivedAt: '2026-09-24T01:00:30.000Z',
+};
+
+describe('trip location sample parsing', () => {
+  it('parses the whole wire shape exactly', async () => {
+    installFetch(() => json(200, SAMPLE));
+    expect(await getTripLatestLocation(TRIP_ID)).toEqual({
+      ok: true,
+      data: SAMPLE,
+    });
+  });
+
+  it('accepts a reported accuracy as a number', async () => {
+    installFetch(() => json(200, { ...SAMPLE, accuracy: 8 }));
+    const result = await getTripLatestLocation(TRIP_ID);
+    expect(result.ok && result.data.accuracy).toBe(8);
+  });
+
+  it('accepts a null accuracy as the device reporting none', async () => {
+    installFetch(() => json(200, { ...SAMPLE, accuracy: null }));
+    const result = await getTripLatestLocation(TRIP_ID);
+    expect(result).toEqual({
+      ok: true,
+      data: { ...SAMPLE, accuracy: null },
+    });
+  });
+
+  it.each([
+    'id',
+    'tripId',
+    'sampleId',
+    'latitude',
+    'longitude',
+    'accuracy',
+    'recordedAt',
+    'receivedAt',
+  ])('rejects a response missing %s', async (field) => {
+    const body: Record<string, unknown> = { ...SAMPLE };
+    delete body[field];
+    installFetch(() => json(200, body));
+    expect(await getTripLatestLocation(TRIP_ID)).toEqual({
+      ok: false,
+      status: 200,
+      code: 'invalid_response',
+    });
+  });
+
+  it.each([
+    ['latitude', '14.6'],
+    ['longitude', null],
+    ['accuracy', '12.5'],
+    ['recordedAt', 1759000000000],
+    ['receivedAt', 1759000000000],
+    ['sampleId', 42],
+  ])('rejects %s of the wrong type', async (field, wrong) => {
+    installFetch(() => json(200, { ...SAMPLE, [field]: wrong }));
+    const result = await getTripLatestLocation(TRIP_ID);
+    expect(result).toEqual({
+      ok: false,
+      status: 200,
+      code: 'invalid_response',
+    });
+  });
+
+  it('rejects a non-finite coordinate, which JSON cannot carry anyway', async () => {
+    installFetch(
+      () =>
+        new Response('{"id":"a","latitude":NaN}', {
+          status: 200,
+        }),
+    );
+    expect(await getTripLatestLocation(TRIP_ID)).toEqual({
+      ok: false,
+      status: 200,
+      code: 'invalid_response',
+    });
+  });
+
+  it('never invents an identity the API did not send', async () => {
+    installFetch(() =>
+      json(200, { ...SAMPLE, driverId: 'd', userId: 'u', deviceId: 'x' }),
+    );
+    const result = await getTripLatestLocation(TRIP_ID);
+    // Extra wire fields are ignored rather than carried through: a position
+    // is evidence about a trip, not about a person or a handset.
+    expect(result.ok && Object.keys(result.data).sort()).toEqual([
+      'accuracy',
+      'id',
+      'latitude',
+      'longitude',
+      'receivedAt',
+      'recordedAt',
+      'sampleId',
+      'tripId',
+    ]);
+  });
+});
+
+describe('getTripLatestLocation', () => {
+  it('requests the trip-scoped latest path, encoded', async () => {
+    const calls = installFetch(() => json(200, SAMPLE));
+    await getTripLatestLocation('a/b');
+    expect(calls[0]?.url).toBe('/api/backend/trips/a%2Fb/location');
+    expect(calls[0]?.method).toBe('GET');
+  });
+
+  it('preserves trip_location_unknown as its own answer', async () => {
+    installFetch(() => json(404, { message: 'trip_location_unknown' }));
+    expect(await getTripLatestLocation(TRIP_ID)).toEqual({
+      ok: false,
+      status: 404,
+      code: 'trip_location_unknown',
+    });
+  });
+
+  it('preserves trip_not_found, which is a different answer', async () => {
+    installFetch(() => json(404, { message: 'trip_not_found' }));
+    const result = await getTripLatestLocation(TRIP_ID);
+    expect(result).toEqual({
+      ok: false,
+      status: 404,
+      code: 'trip_not_found',
+    });
+    expect(result.ok === false && result.code).not.toBe(
+      'trip_location_unknown',
+    );
+  });
+
+  it('preserves a 500', async () => {
+    installFetch(() => json(500, { message: 'boom' }));
+    expect(await getTripLatestLocation(TRIP_ID)).toEqual({
+      ok: false,
+      status: 500,
+      code: 'boom',
+    });
+  });
+
+  it('reports a network failure as status 0', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new TypeError('offline');
+      }),
+    );
+    expect(await getTripLatestLocation(TRIP_ID)).toEqual({
+      ok: false,
+      status: 0,
+      code: 'network_error',
+    });
+  });
+});
+
+describe('listTripLocationSamples', () => {
+  const page = (items: unknown[], total = items.length) => ({
+    items,
+    page: 1,
+    pageSize: 100,
+    total,
+  });
+
+  it('requests the trip-scoped history path, encoded', async () => {
+    const calls = installFetch(() => json(200, page([])));
+    await listTripLocationSamples('a/b');
+    expect(calls[0]?.url).toBe('/api/backend/trips/a%2Fb/location-samples');
+  });
+
+  it('serializes page and pageSize when supplied', async () => {
+    const calls = installFetch(() => json(200, page([])));
+    await listTripLocationSamples(TRIP_ID, { page: 2, pageSize: 100 });
+    expect(calls[0]?.url).toBe(
+      `/api/backend/trips/${TRIP_ID}/location-samples?page=2&pageSize=100`,
+    );
+  });
+
+  it('omits a query value that was not supplied', async () => {
+    const calls = installFetch(() => json(200, page([])));
+    await listTripLocationSamples(TRIP_ID, { pageSize: 100 });
+    expect(calls[0]?.url).toBe(
+      `/api/backend/trips/${TRIP_ID}/location-samples?pageSize=100`,
+    );
+  });
+
+  it('parses a page of samples', async () => {
+    installFetch(() => json(200, page([SAMPLE], 1)));
+    expect(await listTripLocationSamples(TRIP_ID)).toEqual({
+      ok: true,
+      data: { items: [SAMPLE], page: 1, pageSize: 100, total: 1 },
+    });
+  });
+
+  it('answers an empty page for a trip with nothing recorded', async () => {
+    installFetch(() => json(200, page([], 0)));
+    const result = await listTripLocationSamples(TRIP_ID);
+    expect(result).toEqual({
+      ok: true,
+      data: { items: [], page: 1, pageSize: 100, total: 0 },
+    });
+  });
+
+  it('rejects a page whose envelope is malformed', async () => {
+    installFetch(() => json(200, { items: [SAMPLE], page: 1, total: 1 }));
+    expect(await listTripLocationSamples(TRIP_ID)).toEqual({
+      ok: false,
+      status: 200,
+      code: 'invalid_response',
+    });
+  });
+
+  it('rejects a page carrying one malformed item', async () => {
+    installFetch(() =>
+      json(200, page([SAMPLE, { ...SAMPLE, latitude: 'north' }], 2)),
+    );
+    expect(await listTripLocationSamples(TRIP_ID)).toEqual({
+      ok: false,
+      status: 200,
+      code: 'invalid_response',
+    });
+  });
+
+  it('preserves trip_not_found', async () => {
+    installFetch(() => json(404, { message: 'trip_not_found' }));
+    expect(await listTripLocationSamples(TRIP_ID)).toEqual({
+      ok: false,
+      status: 404,
+      code: 'trip_not_found',
+    });
+  });
+
+  it('reports a network failure as status 0', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new TypeError('offline');
+      }),
+    );
+    expect(await listTripLocationSamples(TRIP_ID)).toEqual({
+      ok: false,
+      status: 0,
+      code: 'network_error',
+    });
   });
 });

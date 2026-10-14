@@ -68,6 +68,12 @@ function installFetch(
       if (url.startsWith('/api/backend/expenses?')) {
         return json(200, emptyPage);
       }
+      // The location section asks history first and only asks for a latest
+      // position when the history total is non-zero, so an empty page is
+      // enough to settle it quietly in the tests that are about other things.
+      if (url.includes('/location-samples')) {
+        return json(200, emptyPage);
+      }
       if (
         url.startsWith('/api/backend/drivers/') ||
         url.startsWith('/api/backend/vehicles/')
@@ -289,6 +295,73 @@ describe('TripDetail expenses section', () => {
     expect(
       await screen.findByRole('heading', { level: 3, name: 'Add expense' }),
     ).toBeInTheDocument();
+  });
+});
+
+describe('TripDetail location section', () => {
+  it('renders a Location section on every trip', async () => {
+    installFetch(() => json(200, trip('IN_PROGRESS')));
+    render(<TripDetail tripId={TRIP_ID} />);
+    await screen.findByRole('heading', { level: 1 });
+
+    expect(
+      await screen.findByRole('heading', { level: 2, name: 'Location' }),
+    ).toBeInTheDocument();
+  });
+
+  it('sits between Expenses and Lifecycle', async () => {
+    installFetch(() => json(200, trip('COMPLETED')));
+    render(<TripDetail tripId={TRIP_ID} />);
+    await screen.findByRole('heading', { level: 2, name: 'Lifecycle' });
+
+    const headings = screen
+      .getAllByRole('heading', { level: 2 })
+      .map((node) => node.textContent);
+    expect(headings.indexOf('Expenses')).toBeLessThan(
+      headings.indexOf('Location'),
+    );
+    expect(headings.indexOf('Location')).toBeLessThan(
+      headings.indexOf('Lifecycle'),
+    );
+  });
+
+  it('reads the location of the trip already loaded here, not another', async () => {
+    const urls = installFetch(() => json(200, trip('COMPLETED')));
+    render(<TripDetail tripId={TRIP_ID} />);
+    await screen.findByRole('heading', { level: 2, name: 'Location' });
+
+    await waitFor(() =>
+      expect(urls).toContain(
+        `/api/backend/trips/${TRIP_ID}/location-samples?page=1&pageSize=100`,
+      ),
+    );
+  });
+
+  it('shows the status disclosure for the currently-loaded trip', async () => {
+    installFetch(() => json(200, trip('IN_PROGRESS')));
+    render(<TripDetail tripId={TRIP_ID} />);
+    await screen.findByRole('heading', { level: 2, name: 'Location' });
+
+    // Proof the section received this Trip rather than fetching its own: the
+    // wording is chosen from `trip.status`.
+    expect(
+      screen.getByText(
+        'Positions are recorded by the driver app and may arrive late. Refresh to check for newer positions.',
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it('does not fetch the trip a second time for the location section', async () => {
+    const urls = installFetch(() => json(200, trip('COMPLETED')));
+    render(<TripDetail tripId={TRIP_ID} />);
+    await screen.findByRole('heading', { level: 2, name: 'Location' });
+
+    await waitFor(() =>
+      expect(urls.some((url) => url.includes('/location-samples'))).toBe(true),
+    );
+    expect(
+      urls.filter((url) => url === `/api/backend/trips/${TRIP_ID}`),
+    ).toHaveLength(1);
   });
 
   it.each([

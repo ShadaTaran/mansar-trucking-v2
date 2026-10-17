@@ -321,6 +321,55 @@ Every object above is asserted against a real database by
 `test/maintenance-api.int-spec.ts`. Maintenance rows are never deleted by the
 application — there is no delete route; see [maintenance.md](maintenance.md).
 
+- `trip_location_samples`: one observed position on one trip, append-only.
+  `id` is the server-generated row identity (UUID v7, as everywhere else).
+  `trip_id` is `NOT NULL` and its foreign key
+  `trip_location_samples_trip_id_fkey` is **`ON DELETE RESTRICT ON UPDATE NO
+ACTION`**, so a trip with location history cannot be deleted.
+  `sample_id` is a **device-generated** `UUID` carrying the unique constraint
+  `trip_location_samples_sample_id_key` — unique across the whole table, not
+  per trip. It is the idempotency key, and the API relies on this index rather
+  than a preceding read to arbitrate concurrent uploads of the same sample.
+  `latitude` and `longitude` are `DOUBLE PRECISION NOT NULL` in WGS 84 decimal
+  degrees; `accuracy` is a nullable `DOUBLE PRECISION` horizontal radius in
+  metres, where `NULL` means the device reported none. `recorded_at` is
+  `TIMESTAMPTZ(3) NOT NULL` and is supplied by the device, so it is plausible
+  rather than attested; `received_at` is `TIMESTAMPTZ(3) NOT NULL DEFAULT
+now()` and is the server's own receipt instant, which a queued sample may
+  reach much later
+  ([ADR 0011](adr/0011-location-ingestion-accepts-late-offline-delivery.md)).
+
+One index serves both reads: `trip_location_samples_trip_id_recorded_at_id_idx`
+on `(trip_id, recorded_at, id)`. Forward it is a trip's history in capture
+order with `id` as the deterministic tie-breaker; scanned backwards it is that
+trip's latest position, so **no separate "latest" index exists**.
+
+Three hand-written CHECK constraints (§15) are storage-level invariants, not
+request validation — they hold against any writer, including a direct SQL
+statement:
+
+- `trip_location_samples_latitude_range` — `latitude BETWEEN -90 AND 90`.
+- `trip_location_samples_longitude_range` — `longitude BETWEEN -180 AND 180`.
+  Both bounds are inclusive: `-180` and `180` name the same meridian and a
+  device may report either.
+- `trip_location_samples_accuracy_non_negative` —
+  `accuracy IS NULL OR accuracy >= 0`. A radius is never negative.
+  **Deliberately no upper bound**: how coarse a fix is too coarse to keep is a
+  capture policy the mobile tracker applies, not a persistence invariant.
+
+The range checks also exclude the non-finite doubles PostgreSQL would
+otherwise accept in a `DOUBLE PRECISION` column. `'NaN'` and `'Infinity'` both
+compare false against `BETWEEN`, so neither can be stored in `latitude` or
+`longitude`. Request validation refuses them one layer earlier as well, but
+the column is what makes it an invariant. `accuracy` is bounded only in sign,
+so that constraint does not exclude `'NaN'` by the same mechanism.
+
+Location rows are never deleted by the application: no delete route, no
+scheduled cleanup and no retention policy exists at this commit. Ingestion
+depends on that — a collision whose row has vanished is treated as an
+invariant breach, not a client error. See
+[location-tracking.md](location-tracking.md).
+
 ## 14. Conventions
 
 | Concern            | Rule                                                              |

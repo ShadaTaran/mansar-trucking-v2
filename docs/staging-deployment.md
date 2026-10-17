@@ -901,6 +901,124 @@ Production
 - [x] untouched throughout: the `production` environment has **0 services and
       0 buckets**, verified before and after the run
 
+## 12e. Stage 8 location verification (performed)
+
+The Stage 8 location domain verified against the real staging API, the real
+BFF, the deployed admin web application and an Android emulator running the
+staging build, with synthetic data only and without printing a password,
+token, cookie or Authorization value. The feature itself is
+[location-tracking.md](location-tracking.md).
+
+Stage 8 verification came in two parts. **Stage 8E** is emulator and device
+verification of capture, queueing and background upload against deployed
+staging. **Stage 8F** adds the admin web location UI. Neither part touches
+production.
+
+Accepted artefacts
+
+- [x] Stage 8E implementation commit
+      `239973f2101555af05234d12ba0bbec088c5c0e4`,
+      `feat: add background location uploads`
+- [x] accepted staging APK SHA-256
+      `956436f8086c19a8611f2cc34ed6b21387515951e0473c617706652695ab80b4`,
+      54,547,595 bytes, package `com.mansar.driver.staging`, versionName
+      `1.0-staging`. The APK was frozen for the whole device campaign and its
+      digest was re-checked at every gate
+- [x] Stage 8F admin UI commit
+      `d2ecc61a26239cd3c3abc4a0eeab1d5f152b33f1`,
+      `feat: add admin trip location view` — six files, four modified and two
+      added, 1,317 insertions and no deletions
+
+Stage 8F deployed runtime lineage
+
+- [x] GitHub Actions run #40, run id `38584057807`, with its `database` and
+      `quality` jobs successful — verified during Stage 8F.6. This run was not
+      re-fetched during the Stage 8G.2 documentation pass because the `gh` CLI
+      was unavailable on that machine
+- [x] `mansar-api` deployment `4dced9ef-5fb8-4a15-803a-5dc3bcb29b08` —
+      `SUCCESS`, `RUNNING`, on `d2ecc61a…`, branch `main`
+- [x] `mansar-web` deployment `830b3f78-7102-4fc5-9199-ce3c42c86aae` —
+      `SUCCESS`, `RUNNING`, on the same commit
+- [x] both commit hashes read back from Railway's own deployment metadata,
+      not inferred from timing
+- [x] PostgreSQL deployment `ec7e5cbc-28a3-4cbe-afc8-e4a7df74adb3` unchanged
+
+Stage 8E scenario outcomes
+
+The frozen scenario matrix at Stage 8E closure:
+
+| Scenario | Subject                      | Outcome                             |
+| -------- | ---------------------------- | ----------------------------------- |
+| A        | Foreground start             | CLOSED / PASS                       |
+| B        | Home / app switch            | CLOSED / PASS                       |
+| C        | Screen lock                  | CLOSED / PASS                       |
+| D        | Return / reconciliation      | CLOSED / PASS                       |
+| E        | Network loss / recovery      | CLOSED / PASS                       |
+| F        | Process / lifecycle recovery | CLOSED / PASS                       |
+| G        | Trip completion shutdown     | CLOSED / PASS                       |
+| H        | Logout with queued work      | CLOSED / PASS                       |
+| I        | Login reconciliation         | CLOSED / PASS                       |
+| J        | Owner isolation              | CLOSED / PASS                       |
+| K        | Approximate location         | CLOSED / PASS                       |
+| L        | Task Manager Stop            | CLOSED / PASS — RECOVERED BY R17-R1 |
+
+Historical deviations — preserved, not summarised as passes
+
+- [x] **R8** — procedural stop violation during the screen-lock proof: the
+      gate said to stop on any baseline mismatch and the run continued with a
+      measured value instead. Scenario C is closed on the **R8R** recovery
+      evidence, which adjudicated the drift as explained; the violation stands
+      on the record
+- [x] **R14D** — same-process FGS recreation:
+      **BLOCKED / UNPROVEN DUE ENVIRONMENT LOSS**, _not_ PASS. The proof
+      emulator shut down and destroyed the process the claim was about, and
+      the service state at receipt was never observed. Scenario I is closed by
+      **separate R15F evidence**, not by reinterpreting this one. It must not
+      be rewritten as a pass
+- [x] **R15C-R1** — procedural stop violation: a retry was made after a
+      password-mismatch abort where the gate said to stop. **No product defect
+      inferred** — the aborted attempt created no user, confirmed
+      independently by the link route's own duplicate guard
+- [x] **R17** — procedural deviation: two launcher actions instead of one,
+      because the Quick Settings shade was left holding window focus across
+      the first launch. **Recovered by R17-R1**, a single-launch replay. The
+      original R17 is **not** rewritten as clean
+
+Stage 8F rendered UI evidence
+
+- [x] **Stage 8F.7 — CLOSED / PASS.** The operator supplied rendered staging
+      Trip-page details showing the completed-trip disclosure; latest position
+      with recorded and received timestamps; 112 history rows; Refresh
+      control; completed lifecycle status; and no reported browser console or
+      network errors. This records the evidence supplied for the earlier
+      passing gate; it does not claim the UI was independently re-tested
+      during Stage 8G.2
+- [x] **Separate later attempt during the documentation pass — BLOCKED.** The
+      staging admin session had expired, and the Location section was never
+      reached. This attempt provides no independent rendered-UI verification
+      and does not retract or change the earlier Stage 8F.7 `CLOSED / PASS`
+      record
+- [x] **Stage 8G.2 first-hand verification.** Deployment lineage was read from
+      Railway metadata, and trip `01a124a4-5310-709c-a434-3dfaa7db18a5` was
+      confirmed to contain 112 location samples through the authenticated
+      admin API. This verifies the deployment lineage and API data only, not
+      the rendered UI
+
+Known limitation carried forward
+
+- [x] no `IN_PROGRESS` trip with location history remains in staging — the
+      Stage 8E teardown completed the only one — so the in-progress
+      late-arrival disclosure has unit-test coverage but no rendered staging
+      proof
+- [x] offset pagination can transiently duplicate a boundary row if a late
+      sample is stored between page requests; identified in the Stage 8F.2
+      review, classified MINOR, not fixed at `d2ecc61a…`
+
+Production
+
+- [x] untouched throughout: the `production` environment has **0 service
+      instances**, verified during the Stage 8F gates
+
 ## 13. Not in scope for staging
 
 Config-as-code (`railway.toml`, Dockerfile), custom domains, HA/replicas,

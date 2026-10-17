@@ -33,8 +33,12 @@ assigned.
 | `createdAt`        | `string`         |                                                  |
 | `updatedAt`        | `string`         |                                                  |
 
-There is no trip reference number, no cost, no distance, no location and no
-attachment. Trips are never deleted; `status` is the whole lifecycle.
+The trip record itself carries no reference number, no cost, no distance and
+no attachment. It also carries no location **field** — location is not a
+column on a trip. A trip does have a trip-scoped location history, stored as
+separate append-only samples and added later in Stage 8; see
+[location-tracking.md](location-tracking.md). Trips are never deleted;
+`status` is the whole lifecycle.
 
 ## 2. Lifecycle
 
@@ -287,6 +291,12 @@ the authenticated fetch wrapper (bearer token, one automatic refresh and
 retry on 401), with the refresh token in the Keychain and the access token in
 memory only. No new transport, no new storage.
 
+That description is the Stage 5 driver app. Stage 8 later added device-local
+storage to it — a SQLite queue of unsent location samples — alongside the
+location capture described in
+[location-tracking.md](location-tracking.md). Nothing above is retracted: the
+trip lifecycle still uses no new transport and no new storage.
+
 ## 12. Not in Stage 5
 
 Deliberately **not** implemented here, and not stubbed:
@@ -298,6 +308,12 @@ Deliberately **not** implemented here, and not stubbed:
 - an offline queue or optimistic local mutation
 - React Navigation (the app's screen switching is local state)
 - production deployment
+
+That list is a record of **Stage 5** and is accurate for it. Several entries
+were implemented in later stages: expenses and receipts in Stage 6, and both
+location tracking and the mobile offline queue in Stage 8 — see
+[location-tracking.md](location-tracking.md). The list is not rewritten,
+because it describes what was true when Stage 5 closed.
 
 Staging is the only deployed environment; see
 [staging-deployment.md](staging-deployment.md).

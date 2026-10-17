@@ -19,7 +19,11 @@ and a maintenance section on each vehicle — deliberately independent of the
 vehicle's operational status. A staging environment exists for development
 verification, and both the maintenance API and the deployed admin web
 maintenance screens have been verified against it. Active-trip location
-tracking is not built yet. The system is not deployed to production, is not
+tracking is built: the driver app captures positions while a trip is
+`IN_PROGRESS`, queues them durably on the device when there is no network,
+uploads them in the background, and the admin web shows one trip's latest
+recorded position and its route history, verified on staging only. The
+system is not deployed to production, is not
 production-ready, and is not in live business use.
 
 ## What this is
@@ -107,5 +111,9 @@ the git-ignored `dist/` directories as a side effect; `build` does the same.
 - [Vehicle maintenance](docs/maintenance.md): the maintenance lifecycle and
   fields, its independence from vehicle status, the ADMIN API and database
   invariants, admin web screens, and staging verification
+- [Location tracking](docs/location-tracking.md): trip-scoped capture, the
+  device offline queue and background drain, the ingestion and admin read
+  APIs, `recordedAt` versus `receivedAt`, the admin trip location section,
+  and what the system deliberately does not claim
 - [Staging deployment](docs/staging-deployment.md): Railway staging topology,
   service settings, environment variables, migration order, smoke checklist

@@ -208,16 +208,101 @@ describe('TripLocationSection latest position', () => {
       <TripLocationSection trip={trip('IN_PROGRESS')} />,
     );
     await screen.findByText('Latest position');
-    const text = container.textContent ?? '';
-    for (const forbidden of [
-      'Live',
-      'Online',
-      'Offline',
-      'Last seen',
-      'Currently at',
-    ]) {
-      expect(text).not.toContain(forbidden);
-    }
+    expectNoLiveStatusClaim(container);
+  });
+});
+
+/**
+ * The words this section is not allowed to say, in any state.
+ *
+ * Stage 8 records positions; it maintains no live channel and cannot know
+ * whether a driver is connected. A single check in the ready state used to
+ * carry this rule, which left the states a reader is most likely to
+ * misinterpret — an empty route, a failed load — entirely unguarded.
+ */
+const FORBIDDEN_CLAIMS = [
+  'Live',
+  'Online',
+  'Offline',
+  'Last seen',
+  'Currently at',
+] as const;
+
+function expectNoLiveStatusClaim(container: HTMLElement): void {
+  const text = container.textContent ?? '';
+  for (const forbidden of FORBIDDEN_CLAIMS) {
+    expect(text).not.toContain(forbidden);
+  }
+}
+
+describe('TripLocationSection makes no live-status claim in any state', () => {
+  it('while loading', () => {
+    installFetch(() => new Promise<Response>(() => undefined));
+    const { container } = render(
+      <TripLocationSection trip={trip('IN_PROGRESS')} />,
+    );
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    expectNoLiveStatusClaim(container);
+  });
+
+  it('when the trip has no recorded positions', async () => {
+    installFetch(routed({ history: () => json(200, pageOf([], 0)) }));
+    const { container } = render(
+      <TripLocationSection trip={trip('IN_PROGRESS')} />,
+    );
+    await screen.findByText('No positions recorded for this trip.');
+    expectNoLiveStatusClaim(container);
+  });
+
+  it('when the initial load fails', async () => {
+    installFetch(routed({ history: () => json(500, { message: 'boom' }) }));
+    const { container } = render(
+      <TripLocationSection trip={trip('IN_PROGRESS')} />,
+    );
+    await screen.findByRole('alert');
+    expectNoLiveStatusClaim(container);
+  });
+
+  it('when a trip is in progress and positions are showing', async () => {
+    installFetch(routed({}));
+    const { container } = render(
+      <TripLocationSection trip={trip('IN_PROGRESS')} />,
+    );
+    await screen.findByText('Latest position');
+    expectNoLiveStatusClaim(container);
+  });
+
+  it('when the trip is completed', async () => {
+    installFetch(routed({}));
+    const { container } = render(
+      <TripLocationSection trip={trip('COMPLETED')} />,
+    );
+    await screen.findByText(
+      'This trip is completed. The positions below are its final recorded route.',
+    );
+    expectNoLiveStatusClaim(container);
+  });
+
+  it('when loading more fails', async () => {
+    const first = Array.from({ length: 100 }, (_, index) => sample(index + 1));
+    let historyCalls = 0;
+    installFetch((url) => {
+      if (url.includes(HISTORY)) {
+        historyCalls += 1;
+        return historyCalls === 1
+          ? json(200, pageOf(first, 150, 1))
+          : json(500, { message: 'boom' });
+      }
+      return json(200, LATEST);
+    });
+    const { container } = render(
+      <TripLocationSection trip={trip('COMPLETED')} />,
+    );
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Load more positions' }),
+    );
+    await screen.findByRole('alert');
+    expectNoLiveStatusClaim(container);
   });
 });
 
@@ -392,6 +477,199 @@ describe('TripLocationSection pagination', () => {
     gate.settle(json(200, pageOf(second, 150, 2)));
     await screen.findByText('Showing all 150 recorded positions.');
     expect(pageTwoRequests).toBe(1);
+  });
+});
+
+/**
+ * Offset pagination over a set that can grow in the middle.
+ *
+ * Stage 8E proved a queued sample can be delivered hours after capture, and
+ * history is ordered by `recordedAt`, so such a row is stored *before* rows
+ * already on screen and pushes the page boundary forward. Page two then
+ * repeats a row page one already showed.
+ */
+describe('TripLocationSection history de-duplication', () => {
+  const first = Array.from({ length: 100 }, (_, index) => sample(index + 1));
+
+  /** The last row of page one reappears as the first row of page two. */
+  const overlapping = [
+    first[99]!,
+    ...Array.from({ length: 49 }, (_, i) => sample(i + 101)),
+  ];
+
+  function installPages(secondPage: unknown[], total: number) {
+    return installFetch((url) => {
+      if (url.includes(HISTORY)) {
+        return url.includes('page=2')
+          ? json(200, pageOf(secondPage, total, 2))
+          : json(200, pageOf(first, total, 1));
+      }
+      return json(200, LATEST);
+    });
+  }
+
+  function rowRecordedAt(): string[] {
+    const body = screen.getAllByRole('rowgroup')[1];
+    return Array.from(body?.querySelectorAll('tr') ?? []).map(
+      (row) => row.querySelectorAll('td')[3]?.textContent ?? '',
+    );
+  }
+
+  it('renders a repeated sample once, keeping server order', async () => {
+    const consoleError = vi
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
+    installPages(overlapping, 149);
+    render(<TripLocationSection trip={trip('COMPLETED')} />);
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Load more positions' }),
+    );
+    await screen.findByText('Showing all 149 recorded positions.');
+
+    const stamps = rowRecordedAt();
+    // 100 + 49 genuinely new; the repeat contributed nothing.
+    expect(stamps).toHaveLength(149);
+    expect(new Set(stamps).size).toBe(149);
+    // The repeated row keeps its original position rather than moving.
+    expect(stamps[99]).toBe(first[99]!.recordedAt);
+    expect(stamps[100]).toBe(sample(101).recordedAt);
+    // Ascending by capture time, exactly as the server sent it.
+    expect([...stamps]).toEqual([...stamps].sort());
+
+    expect(
+      consoleError.mock.calls.some((call) =>
+        String(call[0] ?? '').includes('key'),
+      ),
+    ).toBe(false);
+    consoleError.mockRestore();
+  });
+
+  it('appends every row when the next page is entirely new', async () => {
+    const disjoint = Array.from({ length: 50 }, (_, i) => sample(i + 101));
+    installPages(disjoint, 150);
+    render(<TripLocationSection trip={trip('COMPLETED')} />);
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Load more positions' }),
+    );
+    await screen.findByText('Showing all 150 recorded positions.');
+
+    const stamps = rowRecordedAt();
+    expect(stamps).toHaveLength(150);
+    expect(stamps[100]).toBe(disjoint[0]!.recordedAt);
+    expect(stamps[149]).toBe(disjoint[49]!.recordedAt);
+  });
+
+  it('keeps the server total authoritative, not the displayed count', async () => {
+    // The server counts 151 rows; one of them was inserted ahead of the page
+    // boundary and can no longer be reached by paging forward.
+    installPages(overlapping, 151);
+    render(<TripLocationSection trip={trip('COMPLETED')} />);
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Load more positions' }),
+    );
+
+    // 149 displayed against the server's 151 — the count is not revised down
+    // to match what happens to be on screen.
+    expect(
+      await screen.findByText('Showing 149 of 151 recorded positions.'),
+    ).toBeInTheDocument();
+  });
+
+  it('withdraws Load more once the offset window reaches the total', async () => {
+    // Offsets 0-99 and 100-199 cover everything the server counts, so there
+    // is nothing further to request even though one row is unreachable: it
+    // was inserted ahead of the boundary after page one was read.
+    installPages(overlapping, 151);
+    render(<TripLocationSection trip={trip('COMPLETED')} />);
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Load more positions' }),
+    );
+    await screen.findByText('Showing 149 of 151 recorded positions.');
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('button', { name: 'Load more positions' }),
+      ).toBeNull(),
+    );
+    // Still honest about the shortfall; only the control is gone.
+    expect(
+      screen.getByText('Showing 149 of 151 recorded positions.'),
+    ).toBeInTheDocument();
+  });
+
+  it('keeps Load more when a duplicate-only page leaves offsets unread', async () => {
+    // The decisive case: page two is entirely rows already on screen, but
+    // offsets 200-249 have never been read. Treating "contributed nothing
+    // new" as the end would strand fifty rows the server is still counting.
+    const third = Array.from({ length: 50 }, (_, i) => sample(i + 101));
+    const urls = installFetch((url) => {
+      if (url.includes(HISTORY)) {
+        if (url.includes('page=3')) {
+          return json(200, pageOf(third, 250, 3));
+        }
+        // Page two repeats page one in full.
+        return url.includes('page=2')
+          ? json(200, pageOf(first, 250, 2))
+          : json(200, pageOf(first, 250, 1));
+      }
+      return json(200, LATEST);
+    });
+    render(<TripLocationSection trip={trip('COMPLETED')} />);
+
+    // Page 1: 100 unique rows against a server total of 250.
+    const button = await screen.findByRole('button', {
+      name: 'Load more positions',
+    });
+    expect(
+      screen.getByText('Showing 100 of 250 recorded positions.'),
+    ).toBeInTheDocument();
+
+    // Page 2: every id already displayed, so nothing is appended — but the
+    // control must survive, because offsets remain.
+    fireEvent.click(button);
+    await waitFor(() =>
+      expect(urls.some((url) => url.includes('page=2'))).toBe(true),
+    );
+    await waitFor(() => expect(button).toBeEnabled());
+    expect(
+      screen.getByText('Showing 100 of 250 recorded positions.'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: 'Load more positions' }),
+    ).toBeInTheDocument();
+
+    // Page 3: the sequence advanced rather than re-asking for page 2, and the
+    // new rows append once, in server order.
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Load more positions' }),
+    );
+    await screen.findByText('Showing 150 of 250 recorded positions.');
+    expect(urls.some((url) => url.includes('page=3'))).toBe(true);
+
+    const stamps = rowRecordedAt();
+    expect(stamps).toHaveLength(150);
+    expect(new Set(stamps).size).toBe(150);
+    expect(stamps[100]).toBe(third[0]!.recordedAt);
+    expect(stamps[149]).toBe(third[49]!.recordedAt);
+    // The server's count stays authoritative throughout.
+    expect(
+      screen.getByText('Showing 150 of 250 recorded positions.'),
+    ).toBeInTheDocument();
+  });
+});
+
+describe('TripLocationSection route-history table', () => {
+  it('captions the table so it is identifiable without the surrounding text', async () => {
+    installFetch(routed({ history: () => json(200, pageOf([sample(1)], 1)) }));
+    render(<TripLocationSection trip={trip('COMPLETED')} />);
+    await screen.findByText('Route history');
+
+    const table = screen.getByRole('table');
+    const caption = table.querySelector('caption');
+    expect(caption).not.toBeNull();
+    expect(caption).toHaveTextContent('Recorded positions, oldest first');
+    // Accessible name comes from the caption, which is what associates it.
+    expect(table).toHaveAccessibleName('Recorded positions, oldest first');
   });
 });
 

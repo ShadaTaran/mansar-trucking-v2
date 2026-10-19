@@ -29,6 +29,28 @@ type SectionState =
       readonly latest: TripLocationSample;
       readonly items: readonly TripLocationSample[];
       readonly total: number;
+      /**
+       * The next offset page to ask for, counted rather than derived from
+       * `items.length`. De-duplication can make a page contribute fewer rows
+       * than it returned, and a derived page number would then ask for the
+       * same offset again forever.
+       */
+      readonly nextPage: number;
+      /**
+       * Set when the offset window has reached the server's `total`, so no
+       * further page can return a row.
+       *
+       * Decided from the response itself — the offset just read, the page
+       * size and the `total` it reported — never from how many rows survived
+       * de-duplication. A page can be entirely duplicates while later
+       * offsets still hold rows this section has not seen, and treating that
+       * as the end would strand them.
+       *
+       * When it is set and rows are still missing, the count line keeps
+       * saying `n of total`; only the control is withdrawn, so the UI never
+       * implies the route is complete when it is not.
+       */
+      readonly exhausted: boolean;
     }
   | { readonly kind: 'error' };
 
@@ -127,6 +149,8 @@ export function TripLocationSection({ trip }: { readonly trip: Trip }) {
         latest: latest.data,
         items: history.data.items,
         total: history.data.total,
+        nextPage: 2,
+        exhausted: false,
       });
     },
     [applies, tripId],
@@ -164,20 +188,19 @@ export function TripLocationSection({ trip }: { readonly trip: Trip }) {
     if (busy || state.kind !== 'ready') {
       return;
     }
-    const loaded = state.items.length;
-    if (loaded >= state.total) {
+    if (state.exhausted || state.items.length >= state.total) {
       return;
     }
     // A Refresh in flight would have bumped the run already; reusing the
     // current one means a page that arrives after a Refresh is discarded
     // rather than appended to a snapshot it does not belong to.
     const run = runRef.current;
-    const nextPage = Math.floor(loaded / PAGE_SIZE) + 1;
+    const pageToFetch = state.nextPage;
     setBusy(true);
     setFailed(false);
     void (async () => {
       const result = await listTripLocationSamples(tripId, {
-        page: nextPage,
+        page: pageToFetch,
         pageSize: PAGE_SIZE,
       });
       if (!liveRef.current) {
@@ -186,11 +209,42 @@ export function TripLocationSection({ trip }: { readonly trip: Trip }) {
       if (runRef.current === run) {
         if (result.ok) {
           const { items, total } = result.data;
-          setState((current) =>
-            current.kind === 'ready'
-              ? { ...current, items: [...current.items, ...items], total }
-              : current,
-          );
+          setState((current) => {
+            if (current.kind !== 'ready') {
+              return current;
+            }
+            // Offset pagination is taken over a set that can grow in the
+            // middle: a sample delivered late carries an earlier
+            // `recordedAt`, so it is stored before rows already on screen and
+            // shifts the page boundary forward. The next page can therefore
+            // repeat a row this section is already showing. One pass, one
+            // `Set`, so a repeat inside the incoming page is caught too, and
+            // server order is preserved because nothing is re-sorted.
+            const seen = new Set(current.items.map((sample) => sample.id));
+            const added: TripLocationSample[] = [];
+            for (const sample of items) {
+              if (seen.has(sample.id)) {
+                continue;
+              }
+              seen.add(sample.id);
+              added.push(sample);
+            }
+            // Where the offset window now ends. Whether anything is left to
+            // fetch is a fact about offsets and the server's count, not about
+            // how many of these rows were new: a page of pure duplicates
+            // still advances the window, and later offsets may hold rows this
+            // section has never seen.
+            const readThrough = pageToFetch * PAGE_SIZE;
+            return {
+              ...current,
+              items: [...current.items, ...added],
+              // The server's count stays authoritative; de-duplication never
+              // revises it downward to match what is displayed.
+              total,
+              nextPage: current.nextPage + 1,
+              exhausted: items.length === 0 || readThrough >= total,
+            };
+          });
         } else {
           // Already-loaded rows stay exactly where they are.
           setFailed(true);
@@ -245,6 +299,12 @@ export function TripLocationSection({ trip }: { readonly trip: Trip }) {
               : `Showing all ${state.total} recorded positions.`}
           </p>
           <table>
+            {/* Every other table in the admin web captions itself with the
+                server total, but this section already states that directly
+                above in `Showing …`; repeating it would only add noise. The
+                caption names the content and its order instead, which is the
+                fact a reader arriving at the table still needs. */}
+            <caption>Recorded positions, oldest first</caption>
             <thead>
               <tr>
                 <th scope="col">Latitude</th>
@@ -270,7 +330,7 @@ export function TripLocationSection({ trip }: { readonly trip: Trip }) {
             </tbody>
           </table>
           {failed ? <p role="alert">{FAILURE_TEXT}</p> : null}
-          {state.items.length < state.total ? (
+          {!state.exhausted && state.items.length < state.total ? (
             <p>
               <button type="button" onClick={loadMore} disabled={busy}>
                 Load more positions

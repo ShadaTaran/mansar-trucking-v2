@@ -332,6 +332,7 @@ of an arriving sample.
 | loading            | `Loading location…`                                                                                                  |
 | trip `IN_PROGRESS` | `Positions are recorded by the driver app and may arrive late. Refresh to check for newer positions.`                |
 | trip `COMPLETED`   | `This trip is completed. The positions below are its final recorded route.`                                          |
+| table caption      | `Recorded positions, oldest first`                                                                                   |
 | controls           | `Refresh`, `Load more positions`                                                                                     |
 
 **No polling.** There is no timer, no interval and no visibility listener in
@@ -339,16 +340,46 @@ the component. Refresh is explicit, and it is deliberate: a panel that
 refreshed itself would imply a liveness this architecture does not provide,
 and §8 explains why that implication would be false.
 
-**Load more** requests page `Math.floor(loaded / 100) + 1` and appends. The
-backend uses `skip`/`take`, so a non-final page always contains exactly
-`pageSize` rows and the formula always names the correct next page.
+**Load more** keeps an explicit next-page number in state. The first history
+read is page 1, and the section then holds `nextPage = 2`; each later request
+asks for that number. The page is **not** derived from how many rows are on
+screen — de-duplication can make a page contribute fewer rows than it
+returned, and a derived page number would then ask for the same offset again
+indefinitely.
 
-**Known pagination caveat.** Offset pagination is taken over a set that can
-grow _in the middle_. If a late sample with an earlier `recordedAt` is stored
-between the page-1 and page-2 requests, the boundary row shifts forward and
-page 2 can repeat a row already displayed. It is transient and clears on
-Refresh. This was identified in the Stage 8F.2 review, classified MINOR, and
-is **not** fixed at this commit.
+**De-duplication.** Rows arriving from a page are filtered against the
+database `id` values already held, and against ids accepted earlier in the
+same incoming page, so an id is displayed at most once. Server order is
+preserved — new rows are appended as sent and nothing is re-sorted — and the
+server's `total` is carried through unchanged, never revised down to match
+what happens to be displayed.
+
+**Page advance.** A successful response advances `nextPage` whether or not any
+of its rows survived de-duplication. A page of pure duplicates still moves the
+offset window forward, and later offsets may hold rows this section has never
+seen.
+
+**Exhaustion.** Load more is withdrawn when the offset window has reached the
+server's count: the raw response contained no items, or
+`pageToFetch * PAGE_SIZE >= total`, with `PAGE_SIZE = 100`. This is decided
+from the response — the offset just read, the page size and the `total` it
+reported — and never from how many rows were appended.
+
+**Known pagination caveat.** The backend still pages by offset (`skip`/`take`)
+over a set that can grow _in the middle_: a sample delivered late carries an
+earlier `recordedAt` and is stored before rows already on screen, shifting the
+page boundary forward.
+
+Client-side de-duplication prevents such a row from being **displayed twice**,
+which is what the Stage 8F.2 review identified. It does not make the read
+complete: a row inserted behind the boundary after an earlier page was read is
+simply never fetched by paging forward, so the current browsing session can
+omit it. The count line keeps stating `n of total` in that case rather than
+claiming the route is whole, and Refresh starts a new read from page 1.
+Cursor pagination could prevent offset-boundary repeats, but a sample that
+arrives late with a sort key before the current cursor would still be missed
+until Refresh. Cursor pagination remains deferred because it requires an API
+contract change.
 
 **No map.** The route is a table, not a rendered map. No mapping dependency is
 installed and no tile host is contacted; adding one would send trip

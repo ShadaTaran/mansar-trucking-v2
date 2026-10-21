@@ -1010,14 +1010,47 @@ Known limitation carried forward
       Stage 8E teardown completed the only one — so the in-progress
       late-arrival disclosure has unit-test coverage but no rendered staging
       proof
-- [x] offset pagination can transiently duplicate a boundary row if a late
-      sample is stored between page requests; identified in the Stage 8F.2
-      review, classified MINOR, not fixed at `d2ecc61a…`
+- [x] offset pagination over a set that can grow in the middle. The Stage 8F.2
+      finding — a late sample stored between page requests shifts the boundary
+      and the next page **repeats a row already displayed** — was classified
+      MINOR and was not fixed at `d2ecc61a…`. Stage 8I de-duplicates incoming
+      rows by database `id`, so a repeated id is no longer displayed twice.
+      The underlying offset read is unchanged: a row inserted behind the
+      boundary after an earlier page was read is never fetched by paging
+      forward, so **the current browsing session can omit it**. The count line
+      keeps stating `n of total` rather than claiming the route is whole, and
+      Refresh starts a new read. Cursor pagination could prevent
+      offset-boundary repeats, but it would not make a late sample ordered
+      before the current cursor appear in an already-progressed session;
+      Refresh would still be needed. Cursor pagination remains deferred
+      because it requires an API contract change.
+
+Stage 8I — admin location history pagination hardening
+
+- [x] commit `6b767566fb2bdab4a3ceb606471cb2dc76a40e7e`,
+      `fix: harden trip location history pagination`
+- [x] two web files only — `apps/web/src/components/trip-location.tsx` and
+      `apps/web/src/components/trip-location.test.tsx`. **No** API, mobile,
+      database or migration change
+- [x] GitHub Actions run #42, run id `39268590636` — success, with both the
+      `quality` and `database` jobs successful
+- [x] `mansar-web` deployment `7181b03e-71c1-4f3b-adbc-74e4a4650d35` — success
+      on `6b767566…`
+- [x] `mansar-api` deployment `f088ccf5-32da-480e-bd7d-17a93c70fde3` — success
+      on the same commit
+- [x] PostgreSQL unchanged
+- [x] staging services online, zero recent failures, no unresolved warnings or
+      criticals
+- [ ] **no rendered browser smoke test was performed after Stage 8I.** The
+      Stage 8F.7 browser evidence above belongs to `d2ecc61a…` and is **not**
+      evidence for these changes. The de-duplication, page-advance and
+      exhaustion behaviour is covered by the component suite only
 
 Production
 
 - [x] untouched throughout: the `production` environment has **0 service
-      instances**, verified during the Stage 8F gates
+      instances**, verified during the Stage 8F gates, and no production
+      action was taken during Stage 8I
 
 ## 13. Not in scope for staging
 
